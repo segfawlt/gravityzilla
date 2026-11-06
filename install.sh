@@ -88,7 +88,9 @@ mkdir -p "$HOME/.config/rtk"
 mkdir -p "$HOME/.agents/memories"
 mkdir -p "$HOME/.agents/advisor"
 mkdir -p "$HOME/.agents/diagnostics"
-mkdir -p "$HOME/.agents/ledger"
+
+# Cleanup obsolete components (e.g. ledger)
+rm -rf "$HOME/.gemini/config/plugins/ledger" "$HOME/.local/bin/agy-ledger" "$HOME/.agents/ledger"
 
 deploy_file() {
   local src="$1"
@@ -170,7 +172,7 @@ fi
 echo "==> Verifying installation..."
 
 # Verify python syntax for helper scripts
-for py_bin in agy-advisor agy-diagnostics agy-ledger agy-stats agy-statusline agent-memory; do
+for py_bin in agy-advisor agy-diagnostics agy-stats agy-statusline agent-memory; do
   if [[ -f "$HOME/.local/bin/$py_bin" ]]; then
     python3 -m py_compile "$HOME/.local/bin/$py_bin" >/dev/null 2>&1 && \
       echo "    [PASS] $py_bin syntax OK" || \

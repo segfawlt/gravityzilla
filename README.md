@@ -9,7 +9,6 @@ Portable, standalone configuration and tool suite for Antigravity on Linux.
 2. **Plugins (`config/plugins/`)**:
    - `advisor`: Persistent Advisor subagent system.
    - `diagnostics`: Instant post-edit syntax checks.
-   - `ledger`: Multi-session same-file edit collision ledger.
    - `memory`: Cross-session memory integration.
    - `playwright`: UI testing / MCP automation plugin.
    - `rtk`: Command output compressor and token condenser.
@@ -19,7 +18,7 @@ Portable, standalone configuration and tool suite for Antigravity on Linux.
 4. **Custom Subagents (`config/agents/`)**:
    - `advisor-core.md`.
 5. **Helper Binaries & Scripts (`bin/`)**:
-   - `agent-memory`, `agy-advisor`, `agy-diagnostics`, `agy-ledger`, `agy-stats`, `agy-statusline`, `git-wt-sync`, `rtk`.
+   - `agent-memory`, `agy-advisor`, `agy-diagnostics`, `agy-stats`, `agy-statusline`, `git-wt-sync`, `rtk`.
 6. **Tool Configs (`config-extra/`)**:
    - `agy-stats/config.json`, `rtk/config.toml`, `rtk/filters.toml`.
 7. **Settings Template (`templates/settings.json.template`)**:
