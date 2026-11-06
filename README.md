@@ -1,6 +1,10 @@
 # gravityzilla
 
-Portable, standalone configuration and tool suite for Antigravity on Linux.
+Antigravity setup with taste
+
+## Note
+
+I have advisor disabled most of the time, only have it on when I want to burn some token.
 
 ## What is included
 
