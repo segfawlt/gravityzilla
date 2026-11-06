@@ -32,8 +32,8 @@ I have advisor disabled most of the time, only have it on when I want to burn so
 
 ```bash
 # 1. Clone your repo
-git clone https://github.com/segfawlt/gravityzilla.git ~/Projects/gravityzilla
-cd ~/Projects/gravityzilla
+git clone https://github.com/segfawlt/gravityzilla.git ~/gravityzilla
+cd ~/gravityzilla
 
 # 2. Run the installer (defaults to symlinks so git pull updates immediately)
 ./install.sh
