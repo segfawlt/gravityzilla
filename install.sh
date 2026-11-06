@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Antigravity Standalone Linux Setup & Installer
+# gravityzilla: Antigravity Standalone Linux Setup & Installer
 # Packages all global rules, plugins, skills, configs, and helper binaries.
 # ==============================================================================
 

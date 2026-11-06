@@ -1,4 +1,4 @@
-# Antigravity Setup
+# gravityzilla
 
 Portable, standalone configuration and tool suite for Antigravity on Linux.
 
@@ -29,8 +29,8 @@ Portable, standalone configuration and tool suite for Antigravity on Linux.
 
 ```bash
 # 1. Clone your repo
-git clone <your-repo-url> ~/Projects/antigravity-setup
-cd ~/Projects/antigravity-setup
+git clone https://github.com/segfawlt/gravityzilla.git ~/Projects/gravityzilla
+cd ~/Projects/gravityzilla
 
 # 2. Run the installer (defaults to symlinks so git pull updates immediately)
 ./install.sh
@@ -44,3 +44,4 @@ cd ~/Projects/antigravity-setup
 - Python >= 3.11
 - `git`, `curl`
 - `agy` CLI binary in `~/.local/bin` or your `$PATH`
+
