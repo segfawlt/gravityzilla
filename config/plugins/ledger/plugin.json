@@ -1,0 +1,12 @@
+{
+  "name": "ledger",
+  "displayName": "Same-File Edit Ledger",
+  "version": "1.0.0",
+  "description": "Pauses once when two active sessions edit the exact same file on disk within 30 minutes so the second session re-reads the file before editing.",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "/ledger status",
+    "/ledger logs",
+    "/ledger clear"
+  ]
+}

@@ -1,0 +1,377 @@
+#!/usr/bin/env python3
+"""
+agy-ledger: Multi-Session Same-File Edit Collision Guard for Antigravity (`agy`).
+
+Architecture:
+1. `PreToolUse` (`edit_file|write_file`, <1ms, zero subprocesses):
+   - Resolves `real_path` (`Path(raw_path).expanduser().resolve(strict=False)`).
+   - If the exact same file on disk (`real_path`) was edited by another session within the
+     30-min window, returns `{"decision": "deny", ...}` ONCE per `(session, real_path, other_edit_ts)`
+     so the agent re-reads the file before editing; the retry goes straight through.
+2. `PostToolUse` (`edit_file|write_file`, <1ms, zero subprocesses):
+   - Records the edit under `fcntl.flock` in `~/.agents/ledger/edits.json`.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import datetime as dt
+import fcntl
+import json
+import os
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+LEDGER_HOME = Path(os.environ.get("AGY_LEDGER_HOME") or (Path.home() / ".agents" / "ledger")).expanduser()
+STATE_FILE = LEDGER_HOME / "state.json"
+EDITS_FILE = LEDGER_HOME / "edits.json"
+LOCK_FILE = LEDGER_HOME / ".ledger.lock"
+LOG_FILE = LEDGER_HOME / "ledger.log"
+
+DEFAULT_WINDOW_SEC = 30 * 60  # 30 minutes
+MAX_LOG_BYTES = 256 * 1024
+
+DEFAULT_STATE: dict[str, Any] = {
+    "enabled": True,
+    "window_sec": DEFAULT_WINDOW_SEC,
+    "pauses_triggered": 0,
+}
+
+
+@contextlib.contextmanager
+def ledger_lock():
+    LEDGER_HOME.mkdir(parents=True, exist_ok=True)
+    fd = open(LOCK_FILE, "w", encoding="utf-8")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        with contextlib.suppress(Exception):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        fd.close()
+
+
+def load_json(path: Path, default: dict[str, Any]) -> dict[str, Any]:
+    out = dict(default)
+    if not path.is_file():
+        return out
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            out.update(data)
+    except Exception:
+        pass
+    return out
+
+
+def save_json_atomic(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def load_state() -> dict[str, Any]:
+    return load_json(STATE_FILE, DEFAULT_STATE)
+
+
+def save_state(state: dict[str, Any]) -> None:
+    save_json_atomic(STATE_FILE, state)
+
+
+def load_store() -> dict[str, Any]:
+    base = {"real_paths": {}, "paused": {}}
+    data = load_json(EDITS_FILE, base)
+    for key in ("real_paths", "paused"):
+        if not isinstance(data.get(key), dict):
+            data[key] = {}
+    return data
+
+
+def prune_store(store: dict[str, Any], now: float, window_sec: int) -> None:
+    rp = store.get("real_paths") or {}
+    store["real_paths"] = {
+        k: v
+        for k, v in rp.items()
+        if isinstance(v, dict) and (now - float(v.get("at", 0.0)) < window_sec)
+    }
+    store["paused"] = {
+        k: float(ts)
+        for k, ts in (store.get("paused") or {}).items()
+        if now - float(ts) < window_sec
+    }
+    store.pop("notified_wt", None)
+
+
+def log_event(line: str) -> None:
+    try:
+        LEDGER_HOME.mkdir(parents=True, exist_ok=True)
+        if LOG_FILE.is_file() and LOG_FILE.stat().st_size > MAX_LOG_BYTES:
+            tail = LOG_FILE.read_bytes()[-MAX_LOG_BYTES // 2 :]
+            LOG_FILE.write_bytes(tail)
+        stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        with LOG_FILE.open("a", encoding="utf-8") as f:
+            f.write(f"[{stamp}] {line}\n")
+    except Exception:
+        pass
+
+
+def resolve_real_path(raw_path: str) -> str:
+    return str(Path(raw_path).expanduser().resolve(strict=False))
+
+
+def extract_tool_path(payload: dict[str, Any]) -> str:
+    tcall = payload.get("toolCall") or {}
+    tname = str(tcall.get("name") or "")
+    if tname not in {"edit_file", "write_file"}:
+        return ""
+    targs = tcall.get("args") or {}
+    return str(
+        targs.get("Path")
+        or targs.get("AbsolutePath")
+        or targs.get("TargetFile")
+        or targs.get("file_path")
+        or ""
+    ).strip()
+
+
+def default_pre_decision(real_path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Preserve workspace boundary prompts when ledger does not block an edit."""
+    target = Path(real_path)
+    allowed_roots: list[Path] = []
+
+    wpaths = payload.get("workspacePaths")
+    has_workspace = isinstance(wpaths, list) and len(wpaths) > 0
+    if has_workspace:
+        for wp in wpaths:
+            if wp:
+                allowed_roots.append(Path(str(wp)).expanduser().resolve(strict=False))
+        art = payload.get("artifactDirectoryPath")
+        if art:
+            allowed_roots.append(Path(str(art)).expanduser().resolve(strict=False))
+        allowed_roots.append((Path.home() / ".gemini" / "antigravity-cli" / "scratch").resolve(strict=False))
+    else:
+        allowed_roots.append(Path.home().resolve(strict=False))
+        allowed_roots.append(Path("/tmp").resolve(strict=False))
+
+    for root in allowed_roots:
+        if target == root or root in target.parents:
+            return {"decision": "allow"}
+
+    return {
+        "decision": "ask",
+        "reason": f"Confirm file write outside active workspace: {real_path}",
+    }
+
+
+def format_ago(seconds: float) -> str:
+    mins = max(1, round(seconds / 60.0))
+    return f"{mins} min ago"
+
+
+def cmd_pre_tool_hook(_args: argparse.Namespace) -> int:
+    if os.environ.get("AGY_HOOK_INTERNAL") == "1":
+        print(json.dumps({"decision": "allow"}))
+        return 0
+
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+    except Exception:
+        print(json.dumps({"decision": "allow"}))
+        return 0
+
+    raw_path = extract_tool_path(payload)
+    cid = str(payload.get("conversationId") or "").strip()
+    if not raw_path:
+        print(json.dumps({"decision": "allow"}))
+        return 0
+
+    real_path = resolve_real_path(raw_path)
+    fallback = default_pre_decision(real_path, payload)
+    if not cid:
+        print(json.dumps(fallback))
+        return 0
+
+    try:
+        with ledger_lock():
+            state = load_state()
+            if not state.get("enabled", True):
+                print(json.dumps(fallback))
+                return 0
+
+            window_sec = int(state.get("window_sec") or DEFAULT_WINDOW_SEC)
+            now = time.time()
+            store = load_store()
+            prune_store(store, now, window_sec)
+
+            hit = store["real_paths"].get(real_path)
+            if isinstance(hit, dict):
+                other_cid = str(hit.get("session") or "")
+                hit_at = float(hit.get("at") or 0.0)
+                pause_key = f"{cid}::{real_path}"
+                paused_at = float(store["paused"].get(pause_key) or 0.0)
+
+                if other_cid and other_cid != cid and (now - hit_at < window_sec) and paused_at < hit_at:
+                    ago = format_ago(now - hit_at)
+                    label = Path(real_path).name or raw_path
+                    store["paused"][pause_key] = hit_at
+                    save_json_atomic(EDITS_FILE, store)
+
+                    state["pauses_triggered"] = int(state.get("pauses_triggered", 0)) + 1
+                    save_state(state)
+
+                    log_event(f"[PAUSE] cid={cid[:8]} other={other_cid[:8]} file={real_path}")
+                    print(
+                        json.dumps(
+                            {
+                                "decision": "deny",
+                                "reason": (
+                                    f"ledger: `{label}` was edited by another active session {ago}. "
+                                    f"Re-read `{raw_path}` first so you do not overwrite its changes; "
+                                    f"your next edit will go through. When committing, stage only your own hunks."
+                                ),
+                            }
+                        )
+                    )
+                    return 0
+
+            save_json_atomic(EDITS_FILE, store)
+    except Exception as exc:
+        log_event(f"[ERROR] pre-tool: {exc}")
+
+    print(json.dumps(fallback))
+    return 0
+
+
+def cmd_post_tool_hook(_args: argparse.Namespace) -> int:
+    if os.environ.get("AGY_HOOK_INTERNAL") == "1":
+        print("{}")
+        return 0
+
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+    except Exception:
+        print("{}")
+        return 0
+
+    if payload.get("error"):
+        print("{}")
+        return 0
+
+    raw_path = extract_tool_path(payload)
+    cid = str(payload.get("conversationId") or "").strip()
+    if not raw_path or not cid:
+        print("{}")
+        return 0
+
+    real_path = resolve_real_path(raw_path)
+
+    try:
+        with ledger_lock():
+            state = load_state()
+            if not state.get("enabled", True):
+                print("{}")
+                return 0
+
+            window_sec = int(state.get("window_sec") or DEFAULT_WINDOW_SEC)
+            now = time.time()
+            store = load_store()
+            prune_store(store, now, window_sec)
+
+            store["real_paths"][real_path] = {
+                "session": cid,
+                "at": now,
+            }
+            save_json_atomic(EDITS_FILE, store)
+    except Exception as exc:
+        log_event(f"[ERROR] post-tool: {exc}")
+
+    print("{}")
+    return 0
+
+
+def cmd_status(_args: argparse.Namespace) -> int:
+    with ledger_lock():
+        state = load_state()
+        now = time.time()
+        window_sec = int(state.get("window_sec") or DEFAULT_WINDOW_SEC)
+        store = load_store()
+        prune_store(store, now, window_sec)
+        save_json_atomic(EDITS_FILE, store)
+
+    active = store["real_paths"]
+    print("Multi-Session Same-File Edit Ledger (~/.agents/ledger)")
+    print(f"  Enabled            : {'ON' if state.get('enabled', True) else 'OFF'}")
+    print(f"  Collision window   : {window_sec // 60} min")
+    print(f"  Active file locks  : {len(active)}")
+    print(f"  Same-file pauses   : {state.get('pauses_triggered', 0)}")
+    for path, meta in sorted(active.items(), key=lambda kv: float(kv[1].get("at", 0.0)), reverse=True)[:10]:
+        ago = format_ago(now - float(meta.get("at", 0.0)))
+        sid = str(meta.get("session") or "")[:8]
+        print(f"    - {path} (session {sid}, {ago})")
+    return 0
+
+
+def cmd_logs(args: argparse.Namespace) -> int:
+    if not LOG_FILE.is_file():
+        print("No ledger logs yet.")
+        return 0
+    lines = LOG_FILE.read_text(encoding="utf-8", errors="replace").splitlines()
+    for ln in lines[-args.lines :]:
+        print(ln)
+    return 0
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(prog="agy-ledger", description="Multi-session same-file edit ledger for Antigravity")
+    sub = p.add_subparsers(dest="cmd")
+
+    sub.add_parser("status")
+    sub.add_parser("on")
+    sub.add_parser("off")
+    sub.add_parser("clear")
+
+    plogs = sub.add_parser("logs")
+    plogs.add_argument("-n", "--lines", type=int, default=30)
+
+    sub.add_parser("pre-tool-hook")
+    sub.add_parser("post-tool-hook")
+
+    args = p.parse_args()
+    cmd = args.cmd or "status"
+
+    if cmd == "status":
+        return cmd_status(args)
+    if cmd == "on":
+        with ledger_lock():
+            st = load_state()
+            st["enabled"] = True
+            save_state(st)
+        print("Edit ledger: ON")
+        return 0
+    if cmd == "off":
+        with ledger_lock():
+            st = load_state()
+            st["enabled"] = False
+            save_state(st)
+        print("Edit ledger: OFF")
+        return 0
+    if cmd == "clear":
+        with ledger_lock():
+            save_json_atomic(EDITS_FILE, {"real_paths": {}, "paused": {}})
+        print("Cleared active ledger entries.")
+        return 0
+    if cmd == "logs":
+        return cmd_logs(args)
+    if cmd == "pre-tool-hook":
+        return cmd_pre_tool_hook(args)
+    if cmd == "post-tool-hook":
+        return cmd_post_tool_hook(args)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

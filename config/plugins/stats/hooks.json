@@ -1,0 +1,12 @@
+{
+  "stats": {
+    "enabled": true,
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "python3 ./bin/agy-stats --pre-invocation-hook",
+        "timeout": 10
+      }
+    ]
+  }
+}

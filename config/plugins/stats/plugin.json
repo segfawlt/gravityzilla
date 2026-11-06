@@ -1,0 +1,26 @@
+{
+  "name": "stats",
+  "displayName": "Antigravity Telemetry & Quota (/stats)",
+  "version": "1.4.5",
+  "description": "Zero-LLM instant /stats slash commands (/stats, /stats 5m, /stats 1h, /stats 5h, /stats 24h, /stats today, /stats days), live quota pools, visual activity charts, and Web Dashboard launcher.",
+  "author": {
+    "name": "segfawlt",
+    "url": "https://github.com/segfawlt/agy-stats"
+  },
+  "repository": "https://github.com/segfawlt/agy-stats",
+  "license": "MIT",
+  "keywords": [
+    "telemetry",
+    "quota",
+    "tokens",
+    "stats",
+    "dashboard",
+    "analytics"
+  ],
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "/stats",
+    "/stats 5h",
+    "/stats days"
+  ]
+}
