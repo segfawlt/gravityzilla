@@ -23,7 +23,8 @@ Options:
 
 Targets configured:
   ~/.local/bin/              Helper scripts and tools (agy-advisor, agy-stats, rtk, etc.)
-  ~/.gemini/config/          Global instructions, plugins, skills, custom agents
+  ~/.agents/skills/          Agent skills (repo .agents/skills, linked into Antigravity)
+  ~/.gemini/config/          Global instructions, plugins, custom agents
   ~/.gemini/antigravity-cli/ settings.json with path templating
   ~/.config/agy-stats/       Stats preferences
   ~/.config/rtk/             RTK token condenser configs
@@ -139,8 +140,13 @@ for cfg_item in "$SCRIPT_DIR/config/"*; do
 done
 
 # Ensure discovery symlinks
+# Skills live in the repo at .agents/skills/ (standard agent-skills layout) and are
+# exposed at ~/.agents/skills (read natively by agent tools) and linked into
+# Antigravity's two skill locations.
+ln -sfn "$SCRIPT_DIR/.agents/skills" "$HOME/.agents/skills"
+ln -sfn "$HOME/.agents/skills" "$HOME/.gemini/config/skills"
+ln -sfn "$HOME/.agents/skills" "$HOME/.gemini/antigravity-cli/skills"
 ln -sfn "$HOME/.gemini/config" "$HOME/.gemini/antigravity"
-ln -sfn "$HOME/.gemini/config/skills" "$HOME/.gemini/antigravity-cli/skills"
 
 # 5. Deploy config-extra items (~/.config/agy-stats and ~/.config/rtk)
 echo "==> Deploying extra configs into ~/.config/..."

@@ -17,8 +17,8 @@ I have advisor disabled most of the time, only have it on when I want to burn so
    - `playwright`: UI testing / MCP automation plugin.
    - `rtk`: Command output compressor and token condenser.
    - `stats`: Quota, token usage, and analytics dashboard.
-3. **Skills (`config/skills/`)**:
-   - `audit`, `compound`, `compound-refresh`, `ship`, `systematic-debugging`, `taste-skill`, `ui-demo-prototype`, `worktree-sync`.
+3. **Agent Skills (`.agents/skills/`)** — the standard cross-tool skills path. `install.sh` links this folder to `~/.agents/skills` (read natively by agent tools like ZCode) and into `~/.gemini/config/skills` and `~/.gemini/antigravity-cli/skills` for Antigravity:
+   - `advisor`, `audit`, `avoid-ai-design`, `compound`, `compound-refresh`, `frontend-design`, `hallmark`, `ship`, `stats`, `systematic-debugging`, `taste-skill`, `ui-demo-prototype`, `worktree-sync`.
 4. **Custom Subagents (`config/agents/`)**:
    - `advisor-core.md`.
 5. **Helper Binaries & Scripts (`bin/`)**:
