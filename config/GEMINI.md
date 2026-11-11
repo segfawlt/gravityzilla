@@ -27,6 +27,14 @@ System-level operating contract and Antigravity (`agy`) harness conventions. Pro
 - **When to Use Subagents (`invoke_subagent`):** Reserve subagents (`TypeName: "research"` or `"self"`) for parallelizable workstreams or broad codebase exploration that would flood the main context window. Match model tier to task complexity: use `Model: "flash"` for read-only exploration, file searches, and simple mechanical subtasks; reserve `Model: "pro"` or `"inherit"` for heavy refactors, complex bug root-causing, or multi-file synthesis. Keep one subagent session per workstream (`send_message` with `conversationId`), and always verify touched files/diffs directly before accepting a subagent's claim.
 - **Harness Boundaries:** Do not invoke non-Antigravity tools (`xd://lsp`, `vibe_send`). Use `rg` + repo typecheckers (`pnpm typecheck`, etc.) to trace symbols across barrel exports, and keep git worktrees inside `.worktrees/<slug>` (or `Workspace: "share"`) so paths stay inside the workspace sandbox.
 
+## Verification & Proof
+
+- **Prove it works on the real artifact:** Before declaring done, observe the actual behavior: run the feature, read the real value, inspect the real diff. "It compiles", passing tests that only exercise mocks, file mtimes, and subagent self-reports are proxies, not proof.
+- **Script the check:** Prefer a rerunnable command, test, or small script whose output you paste over a one-time eyeball. If the repo has a `verify-<app>` skill, drive the app through it; if a change has a user-facing surface and no scripted way to drive it exists, suggest `create-verification-skill`.
+- **Suspect the observation first:** When a check contradicts expectations, verify the check itself (wrong port, stale build, cached output, wrong working directory) before changing the system under test.
+- **Label evidence honestly:** Mark claims `Observed` (exercised at runtime) or `Inferred` (code reading only). If a change could not be verified, say "unverified" and name the cheapest check that would settle it — never imply a pass.
+- **Enforce repeated corrections in structure:** When the user corrects the same class of mistake twice, prefer making it impossible (architecture, types, lint, test) over adding prose rules — use the `correct` skill.
+
 ## Global Git Hygiene & Green-Milestone Commits
 
 - **Auto-Commit Every Verified ("Green") Milestone:** Once verification (`test`, `typecheck`, `lint`) passes for a completed task — or a self-contained sub-phase of a multi-phase feature — commit before ending the turn or starting the next phase:
