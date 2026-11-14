@@ -99,9 +99,52 @@ READONLY_CMD_VERBS = frozenset(
         "sqlite3",
     }
 )
+MUTATING_CMD_VERBS = frozenset(
+    {
+        "rm",
+        "mv",
+        "cp",
+        "mkdir",
+        "rmdir",
+        "touch",
+        "chmod",
+        "chown",
+        "ln",
+        "tee",
+        "truncate",
+        "dd",
+        "patch",
+        "install",
+    }
+)
+MUTATING_GIT_SUBS = frozenset(
+    {
+        "add",
+        "commit",
+        "checkout",
+        "switch",
+        "restore",
+        "reset",
+        "revert",
+        "merge",
+        "rebase",
+        "cherry-pick",
+        "stash",
+        "clean",
+        "apply",
+        "am",
+        "mv",
+        "rm",
+        "pull",
+    }
+)
+MUTATING_PKG_SUBS = frozenset({"install", "add", "remove", "uninstall", "update", "fmt", "fix"})
 
 VALID_CID_RE = re.compile(r"^[A-Za-z0-9_-]{4,128}$")
-RTK_PREFIX_RE = re.compile(r"^\s*rtk\s+(?:bypass\s+)?")
+RTK_PREFIX_RE = re.compile(r"^\s*(?:\S*/)?rtk\s+(?:bypass\s+)?")
+QUOTED_STR_RE = re.compile(r"'[^']*'|\"(?:\\.|[^\"])*\"")
+FILE_REDIRECT_RE = re.compile(r"(?<![-=<&\d])>>?\s*(?!/dev/null\b)(?![&\s]*\d)[A-Za-z0-9_./~\"'$]")
+CMD_EXIT_CODE_RE = re.compile(r"Command exited with code\s+(-?\d+)")
 STDIN_PROMPT_RE = re.compile(
     r"(?i)(\[y/n\]|\(y/n\)|\(yes/no\)|password\s*:|passphrase\s*:|enter pin|are you sure\?|press enter to continue)"
 )
@@ -212,6 +255,7 @@ def default_session(cid: str) -> dict[str, Any]:
         "mutation_seq": 0,
         "recent_calls": [],
         "file_hashes": {},
+        "err_cursor_step_idx": -1,
         "consecutive_same_err": {"sig": "", "count": 0, "sample": "", "warned_at": 0},
         "inflight_tools": {},
         "pending_guidance": [],
@@ -396,8 +440,13 @@ def sample_agy_child_shells(agy_pid: int | None) -> tuple[int, list[tuple[int, i
 
     direct_shells: list[tuple[int, int, str]] = []
     total_ticks = 0
+    agy_pgrp = stats_map[agy_pid][1]
     for cpid, cpgrp, ccomm, cticks in children_map.get(agy_pid, ()):
-        if cpid in hook_ancestors or ccomm not in SHELL_COMMS:
+        if cpid in hook_ancestors:
+            continue
+        # Count Setpgid child trees (even when GNU bash -c exec'd python3/cargo/sleep directly)
+        # while ignoring shared-pgrp internal helpers (e.g. agy-statusline) unless shell-named.
+        if cpgrp == agy_pgrp and ccomm not in SHELL_COMMS:
             continue
         direct_shells.append((cpid, cpgrp, ccomm))
         queue = [cpid]
@@ -500,28 +549,55 @@ def normalize_error_sig(err: str) -> str:
     return txt[:160]
 
 
-def is_readonly_command(cmd: str) -> bool:
+def is_mutating_shell_command(cmd: str) -> bool:
+    """Return True only when `cmd` clearly mutates filesystem or git state."""
     stripped = RTK_PREFIX_RE.sub("", (cmd or "").strip())
     if not stripped:
-        return True
-    # Reject redirections, subshells, or mutating commands before verb inspection.
-    if any(tok in stripped for tok in (">", ">>", "sed -i", "tee ", "rm ", "mv ", "cp ", "mkdir ", "chmod ")):
         return False
-    segments = re.split(r"(?:&&|\|\||;|\|)", stripped)
-    for seg in segments:
+    unquoted = QUOTED_STR_RE.sub(" _Q_ ", stripped)
+    if FILE_REDIRECT_RE.search(unquoted):
+        return True
+    for seg in re.split(r"(?:&&|\|\||;|\|)", unquoted):
         tokens = seg.strip().split()
-        while tokens and "=" in tokens[0] and not tokens[0].startswith("-"):
+        while tokens and (
+            ("=" in tokens[0] and not tokens[0].startswith("-"))
+            or Path(tokens[0]).name in {"sudo", "nohup", "time", "nice", "command"}
+        ):
             tokens.pop(0)
         if not tokens:
             continue
         verb = Path(tokens[0]).name
-        if verb == "git":
-            sub = next((t for t in tokens[1:] if not t.startswith("-")), "")
-            if sub not in {"status", "log", "diff"}:
-                return False
-        elif verb not in READONLY_CMD_VERBS:
-            return False
-    return True
+        rest = tokens[1:]
+        if verb in MUTATING_CMD_VERBS or verb.endswith(".sh"):
+            return True
+        if verb in {"sed", "perl"}:
+            if any(t == "--in-place" or (t.startswith("-") and not t.startswith("--") and "i" in t[1:]) for t in rest):
+                return True
+        elif verb == "git":
+            sub = ""
+            skip_next = False
+            for t in rest:
+                if skip_next:
+                    skip_next = False
+                    continue
+                if t in {"-C", "-c", "--git-dir", "--work-tree"}:
+                    skip_next = True
+                    continue
+                if t.startswith("-"):
+                    continue
+                sub = t
+                break
+            if sub in MUTATING_GIT_SUBS:
+                return True
+        elif verb in {"npm", "pnpm", "yarn", "bun", "pip", "pip3", "uv", "cargo", "go"}:
+            sub = next((t for t in rest if not t.startswith("-")), "")
+            if sub in MUTATING_PKG_SUBS:
+                return True
+    return False
+
+
+def is_readonly_command(cmd: str) -> bool:
+    return not is_mutating_shell_command(cmd)
 
 
 def extract_cwd(payload: dict[str, Any]) -> str:
@@ -539,7 +615,7 @@ def compute_ws_sig(mutation_seq: int, cwd: str) -> str:
     if cwd and Path(cwd).is_dir():
         try:
             proc = subprocess.run(
-                ["git", "-C", cwd, "status", "--porcelain", "-uno", "--no-optional-locks"],
+                ["git", "-C", cwd, "status", "--porcelain", "--no-optional-locks"],
                 capture_output=True,
                 timeout=0.08,
             )
@@ -696,6 +772,134 @@ def read_task_log_tail(cid: str, step_idx: int, max_bytes: int = 512) -> tuple[i
         return 0, ""
 
 
+def resolve_transcript_path(cid: str, payload: dict[str, Any] | None = None) -> Path | None:
+    if isinstance(payload, dict):
+        raw_tp = str(payload.get("transcriptPath") or "").strip().strip('"')
+        if raw_tp:
+            p = Path(raw_tp).expanduser()
+            if p.is_file():
+                return p
+    cand = CLI_DATA_DIR / "brain" / cid / ".system_generated" / "logs" / "transcript.jsonl"
+    return cand if cand.is_file() else None
+
+
+def _reset_error_hits(sess: dict[str, Any]) -> None:
+    sess["consecutive_same_err"] = {"sig": "", "count": 0, "sample": "", "warned_at": 0}
+
+
+def _record_error_hit(sess: dict[str, Any], sample_raw: str) -> None:
+    txt = (sample_raw or "").strip()
+    if not txt:
+        return
+    sig = normalize_error_sig(txt)
+    if not sig:
+        sig = "nonzero_exit"
+    err_state = sess.get("consecutive_same_err") or {}
+    if sig == err_state.get("sig"):
+        err_state["count"] = int(err_state.get("count") or 0) + 1
+    else:
+        err_state = {
+            "sig": sig,
+            "count": 1,
+            "sample": txt.splitlines()[0][:180],
+            "warned_at": 0,
+        }
+    sess["consecutive_same_err"] = err_state
+
+
+def _extract_meaningful_error_line(raw_err: str, content: str, exit_rc: int) -> str:
+    if raw_err:
+        first = raw_err.strip().splitlines()[0].strip()
+        if first:
+            return first[:180]
+    skip_prefixes = (
+        "Created At:",
+        "Completed At:",
+        "Command output:",
+        "Command exited with code ",
+        "A pre-tool hook changed",
+        "The tool's output was truncated",
+        "Encountered error in step execution:",
+    )
+    for ln in content.splitlines():
+        s = ln.strip()
+        if not s or s.startswith(skip_prefixes):
+            continue
+        return s[:180]
+    return f"Command exited with code {exit_rc}"
+
+
+def sync_transcript_errors(
+    sess: dict[str, Any],
+    cid: str,
+    payload: dict[str, Any] | None = None,
+    advance_only: bool = False,
+) -> None:
+    """
+    Sync consecutive error streaks from `transcript.jsonl` (`GENERIC` steps), catching
+    non-zero `run_command` exits where `agy` delivers `error=""` to `PostToolUse`.
+    """
+    tpath = resolve_transcript_path(cid, payload)
+    if not tpath or not tpath.is_file():
+        return
+    try:
+        size = tpath.stat().st_size
+        with tpath.open("rb") as fh:
+            if size > 32768:
+                fh.seek(size - 32768)
+                fh.readline()
+            lines = fh.read().decode("utf-8", errors="replace").splitlines()
+    except Exception:
+        return
+
+    parsed: list[dict[str, Any]] = []
+    max_step = -1
+    for raw in lines:
+        if not raw.strip():
+            continue
+        try:
+            d = json.loads(raw)
+        except Exception:
+            continue
+        if isinstance(d, dict) and isinstance(d.get("step_index"), int):
+            parsed.append(d)
+            if int(d["step_index"]) > max_step:
+                max_step = int(d["step_index"])
+
+    if not parsed:
+        return
+
+    if advance_only:
+        cur = int(sess.get("err_cursor_step_idx") or -1)
+        if max_step > cur:
+            sess["err_cursor_step_idx"] = max_step
+        _reset_error_hits(sess)
+        return
+
+    cursor = int(sess.get("err_cursor_step_idx") or -1)
+    for d in parsed:
+        s_idx = int(d["step_index"])
+        if s_idx <= cursor:
+            continue
+        if d.get("type") != "GENERIC":
+            cursor = s_idx
+            continue
+        status = str(d.get("status") or "")
+        content = str(d.get("content") or "")
+        raw_err = str(d.get("error") or "").strip()
+        m_rc = CMD_EXIT_CODE_RE.search(content)
+        exit_rc = int(m_rc.group(1)) if m_rc else 0
+        if status == "ERROR" or exit_rc != 0:
+            sample = _extract_meaningful_error_line(raw_err, content, exit_rc)
+            _record_error_hit(sess, sample)
+        else:
+            _reset_error_hits(sess)
+            if (sess.get("last_alert") or {}).get("kind") == "loop":
+                sess["last_alert"] = None
+        cursor = s_idx
+    sess["err_cursor_step_idx"] = cursor
+
+
 def send_desktop_alert(title: str, body: str) -> None:
     notifier = shutil.which("notify-send")
     if not notifier:
@@ -784,7 +988,6 @@ def cmd_pre_invocation_hook(_args: argparse.Namespace) -> int:
         agy_pid = find_ancestor_agy_pid()
 
         inject_msgs: list[str] = []
-        badges: list[str] = []
         thrash_triggered = False
 
         with file_lock(session_lock_path(cid)):
@@ -798,10 +1001,12 @@ def cmd_pre_invocation_hook(_args: argparse.Namespace) -> int:
                 sess["warned_step_45"] = False
                 sess["recent_calls"] = []
                 sess["file_hashes"] = {}
-                sess["consecutive_same_err"] = {"sig": "", "count": 0, "sample": "", "warned_at": 0}
                 sess["stop_bounced_tasks"] = []
                 if (sess.get("last_alert") or {}).get("kind") != "stall":
                     sess["last_alert"] = None
+                sync_transcript_errors(sess, cid, payload, advance_only=True)
+            else:
+                sync_transcript_errors(sess, cid, payload, advance_only=False)
 
             sess["phase"] = "model"
             sess["model_started_mono_ns"] = mono_ns
@@ -810,7 +1015,6 @@ def cmd_pre_invocation_hook(_args: argparse.Namespace) -> int:
             pending = sess.get("pending_guidance") or []
             if pending:
                 inject_msgs.extend(str(m) for m in pending if m)
-                badges.append(f"watchdog: {len(pending)} notice(s)")
                 sess["pending_guidance"] = []
 
             err_state = sess.get("consecutive_same_err") or {}
@@ -824,7 +1028,6 @@ def cmd_pre_invocation_hook(_args: argparse.Namespace) -> int:
                     f"Thrash Circuit-Breaker ({err_cnt} consecutive identical errors: `{sample}`). "
                     "Stop repeating the failing command/edit; diagnose the underlying root cause before trying again."
                 )
-                badges.append(f"watchdog: thrash breaker ({err_cnt}x error)")
                 sess["last_alert"] = {"kind": "loop", "detail": f"err×{err_cnt}", "ts": now}
                 thrash_triggered = True
 
@@ -834,7 +1037,6 @@ def cmd_pre_invocation_hook(_args: argparse.Namespace) -> int:
                     "Turn step check: 45 tool calls executed in this turn. "
                     "Verify forward progress and avoid unnecessary retry loops."
                 )
-                badges.append("watchdog: 45 tool calls in turn")
 
             save_session(cid, sess)
 
@@ -846,16 +1048,10 @@ def cmd_pre_invocation_hook(_args: argparse.Namespace) -> int:
         ensure_watcher_running()
 
         if inject_msgs:
-            ephemeral = "<watchdog>\n" + "\n".join(f"- {m}" for m in inject_msgs) + "\n</watchdog>"
+            sys_msg = "<watchdog>\n" + "\n".join(f"- {m}" for m in inject_msgs) + "\n</watchdog>"
             out: dict[str, Any] = {
                 "injectSteps": [
-                    {"ephemeralMessage": ephemeral},
-                    {
-                        "systemMessage": {
-                            "systemMessage": "",
-                            "metadata": {"user_markdown": f"`[Watchdog]` {' | '.join(badges)}"},
-                        }
-                    },
+                    {"systemMessage": {"systemMessage": sys_msg}},
                 ]
             }
             print(json.dumps(out))
@@ -1011,20 +1207,16 @@ def cmd_post_tool_hook(_args: argparse.Namespace) -> int:
                 sess["last_alert"] = None
 
             if err:
-                sig = normalize_error_sig(err)
-                err_state = sess.get("consecutive_same_err") or {}
-                if sig == err_state.get("sig"):
-                    err_state["count"] = int(err_state.get("count") or 0) + 1
-                else:
-                    err_state = {
-                        "sig": sig,
-                        "count": 1,
-                        "sample": err.splitlines()[0][:180],
-                        "warned_at": 0,
-                    }
-                sess["consecutive_same_err"] = err_state
+                _record_error_hit(sess, err)
+                if step_idx is not None:
+                    sess["err_cursor_step_idx"] = max(int(sess.get("err_cursor_step_idx") or -1), step_idx)
             else:
-                sess["consecutive_same_err"] = {"sig": "", "count": 0, "sample": "", "warned_at": 0}
+                if tname != "run_command":
+                    _reset_error_hits(sess)
+                    if not inflight and (sess.get("last_alert") or {}).get("kind") == "loop":
+                        sess["last_alert"] = None
+                    if step_idx is not None:
+                        sess["err_cursor_step_idx"] = max(int(sess.get("err_cursor_step_idx") or -1), step_idx)
                 if tname in MUTATING_FILE_TOOLS:
                     sess["mutation_seq"] = int(sess.get("mutation_seq") or 0) + 1
                     fpath = resolve_edited_file_path(targs, cwd)
@@ -1047,7 +1239,7 @@ def cmd_post_tool_hook(_args: argparse.Namespace) -> int:
                                     sess["pending_guidance"] = pending
                 elif tname == "run_command":
                     cmd = str(targs.get("CommandLine") or "")
-                    if not is_readonly_command(cmd):
+                    if is_mutating_shell_command(cmd):
                         sess["mutation_seq"] = int(sess.get("mutation_seq") or 0) + 1
 
             save_session(cid, sess)
@@ -1252,6 +1444,20 @@ def cmd_daemon_loop(_args: argparse.Namespace) -> int:
                             append_event(cid=cid, event="session_closed", status="unlocked")
                             log_line(f"[SESSION-CLOSED] cid={cid[:8]} presence lock released")
                     continue
+
+                presence_exists = (CLI_DATA_DIR / "presence" / f"{cid}.lock").is_file()
+                if not presence_exists:
+                    with file_lock(session_lock_path(cid)):
+                        sess_chk = load_session(cid)
+                        chk_pid = sess_chk.get("agy_pid")
+                        if isinstance(chk_pid, int) and chk_pid > 1 and _read_proc_stat(chk_pid) is None:
+                            if sess_chk.get("phase") != "idle" or sess_chk.get("inflight_tools"):
+                                sess_chk["phase"] = "idle"
+                                sess_chk["inflight_tools"] = {}
+                                save_session(cid, sess_chk)
+                                append_event(cid=cid, event="session_closed", status="pid_gone")
+                                log_line(f"[SESSION-CLOSED] cid={cid[:8]} agy_pid={chk_pid} gone")
+                            continue
 
                 _db_ok, running_idxs, generating_idxs, waiting_idxs = read_db_active_indices(cid)
                 has_waiting = bool(waiting_idxs)

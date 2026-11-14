@@ -272,6 +272,68 @@ class WatchdogTestCase(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertEqual(json.loads(out)["decision"], "allow")
 
+        # Non-mutating test runner commands (not in READONLY_CMD_VERBS) must ALSO trip 3x loop block,
+        # while an intervening mutating command (`mkdir -p`) advances mutation_seq and resets the streak.
+        cid_test = "cid-loop-testcmd"
+        self._run_watch("pre-invocation-hook", {"conversationId": cid_test, "lastUserInput": "Run pytest"})
+        test_cmd = "pytest -q tests/test_sample.py"
+        pytest_decisions = []
+        for idx in range(1, 4):
+            rc, out, _ = self._run_watch(
+                "pre-tool-hook",
+                {
+                    "conversationId": cid_test,
+                    "stepIdx": idx * 2,
+                    "cwd": str(self.tmp),
+                    "toolCall": {"id": f"py-{idx}", "name": "run_command", "args": {"CommandLine": test_cmd}},
+                },
+            )
+            self.assertEqual(rc, 0)
+            resp = json.loads(out)
+            pytest_decisions.append(resp["decision"])
+            if resp["decision"] == "allow":
+                self._run_watch(
+                    "post-tool-hook",
+                    {
+                        "conversationId": cid_test,
+                        "stepIdx": idx * 2,
+                        "cwd": str(self.tmp),
+                        "toolCall": {"id": f"py-{idx}", "name": "run_command", "args": {"CommandLine": test_cmd}},
+                    },
+                )
+        self.assertEqual(pytest_decisions, ["allow", "allow", "deny"])
+
+        # Intervening mutating shell command advances mutation_seq
+        self._run_watch(
+            "pre-tool-hook",
+            {
+                "conversationId": cid_test,
+                "stepIdx": 10,
+                "cwd": str(self.tmp),
+                "toolCall": {"id": "mk-1", "name": "run_command", "args": {"CommandLine": "mkdir -p build"}},
+            },
+        )
+        self._run_watch(
+            "post-tool-hook",
+            {
+                "conversationId": cid_test,
+                "stepIdx": 10,
+                "cwd": str(self.tmp),
+                "toolCall": {"id": "mk-1", "name": "run_command", "args": {"CommandLine": "mkdir -p build"}},
+            },
+        )
+        rc, out, _ = self._run_watch(
+            "pre-tool-hook",
+            {
+                "conversationId": cid_test,
+                "stepIdx": 12,
+                "cwd": str(self.tmp),
+                "toolCall": {"id": "py-4", "name": "run_command", "args": {"CommandLine": test_cmd}},
+            },
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(out)["decision"], "allow")
+
     def test_3_error_thrash_and_abab_hash_flip(self) -> None:
         cid = "cid-thrash-0003"
         self._run_watch("pre-invocation-hook", {"conversationId": cid, "lastUserInput": "Fix broken build"})
@@ -303,8 +365,8 @@ class WatchdogTestCase(unittest.TestCase):
         self.assertEqual(rc, 0)
         parsed = json.loads(out)
         self.assertIn("injectSteps", parsed)
-        ephem = parsed["injectSteps"][0]["ephemeralMessage"]
-        self.assertIn("Thrash Circuit-Breaker", ephem)
+        sys_msg = parsed["injectSteps"][0]["systemMessage"]["systemMessage"]
+        self.assertIn("Thrash Circuit-Breaker", sys_msg)
 
         # ABAB_HASH_FLIP detection on edit_file
         target_file = self.tmp / "sample.py"
@@ -333,7 +395,57 @@ class WatchdogTestCase(unittest.TestCase):
         self.assertEqual(rc, 0)
         parsed = json.loads(out)
         self.assertIn("injectSteps", parsed)
-        self.assertIn("ABAB_HASH_FLIP", parsed["injectSteps"][0]["ephemeralMessage"])
+        self.assertIn("ABAB_HASH_FLIP", parsed["injectSteps"][0]["systemMessage"]["systemMessage"])
+
+        # Sub-check: run_command non-zero exits via transcript.jsonl when PostToolUse receives error=""
+        cid_sh = "cid-thrash-shell"
+        logs_dir = self.cli_dir / "brain" / cid_sh / ".system_generated" / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        tpath = logs_dir / "transcript.jsonl"
+        self._run_watch(
+            "pre-invocation-hook",
+            {"conversationId": cid_sh, "lastUserInput": "Fix pytest fail", "transcriptPath": str(tpath)},
+        )
+        for idx, line_num in enumerate((10, 20, 30), 1):
+            step_idx = idx * 2
+            self._run_watch(
+                "pre-tool-hook",
+                {
+                    "conversationId": cid_sh,
+                    "stepIdx": step_idx,
+                    "toolCall": {"id": f"sh-{idx}", "name": "run_command", "args": {"CommandLine": f"sh -c test_{idx}"}},
+                },
+            )
+            with tpath.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    json.dumps(
+                        {
+                            "step_index": step_idx,
+                            "type": "GENERIC",
+                            "status": "DONE",
+                            "content": f"Command exited with code 1.\n\nCommand output:\nAssertionError: line {line_num}\n",
+                        }
+                    )
+                    + "\n"
+                )
+            self._run_watch(
+                "post-tool-hook",
+                {
+                    "conversationId": cid_sh,
+                    "stepIdx": step_idx,
+                    "error": "",
+                    "toolCall": {"id": f"sh-{idx}", "name": "run_command", "args": {"CommandLine": f"sh -c test_{idx}"}},
+                },
+            )
+
+        rc, out, _ = self._run_watch(
+            "pre-invocation-hook",
+            {"conversationId": cid_sh, "lastUserInput": "Fix pytest fail", "transcriptPath": str(tpath)},
+        )
+        self.assertEqual(rc, 0)
+        parsed_sh = json.loads(out)
+        self.assertIn("injectSteps", parsed_sh)
+        self.assertIn("Thrash Circuit-Breaker", parsed_sh["injectSteps"][0]["systemMessage"]["systemMessage"])
 
     def test_4_stop_hook_stdin_bounce_active_progress_and_timer_exempt(self) -> None:
         (self.wd_home / "state.json").write_text(
@@ -571,6 +683,44 @@ class WatchdogTestCase(unittest.TestCase):
                         else:
                             proc.kill()
                         proc.wait(timeout=2)
+
+        # Sub-test: GNU bash -c single-command optimization execs `sleep` directly (comm != "bash")
+        with self.subTest(bash_exec_single_cmd=True):
+            proc = subprocess.Popen(
+                ["bash", "-c", "sleep 30"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            try:
+                match = None
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline:
+                    _ticks, shells = mod.sample_agy_child_shells(os.getpid())
+                    for cpid, cpgrp, ccomm in shells:
+                        if cpid == proc.pid and ccomm == "sleep":
+                            match = (cpid, cpgrp, ccomm)
+                            break
+                    if match is not None:
+                        break
+                    time.sleep(0.05)
+
+                self.assertIsNotNone(match, f"Expected exec'd sleep {proc.pid} in sample_agy_child_shells")
+                assert match is not None
+                child_pid, child_pgrp, child_comm = match
+                self.assertEqual(child_comm, "sleep")
+                self.assertEqual(child_pgrp, proc.pid)
+                self.assertTrue(mod.kill_child_shell_safely(os.getpid(), child_pid, child_pgrp))
+                rc = proc.wait(timeout=3)
+                self.assertIn(rc, (-signal.SIGTERM, 143))
+            finally:
+                if proc.poll() is None:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    proc.wait(timeout=2)
 
 
 if __name__ == "__main__":
