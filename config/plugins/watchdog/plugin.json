@@ -1,0 +1,12 @@
+{
+  "name": "watchdog",
+  "displayName": "Zero-Token Execution Watchdog",
+  "version": "1.0.0",
+  "description": "Deterministic step timestamping, zero-token retry/error loop circuit-breaker, and silent stdin/hang recovery.",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "agy-watch status",
+    "agy-watch logs",
+    "agy-watch events"
+  ]
+}

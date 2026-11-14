@@ -9,6 +9,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MODE="symlink"
 FORCE=false
+STATUS_ONLY=false
 
 usage() {
   cat <<EOF
@@ -18,17 +19,18 @@ Options:
   --symlink        (Default) Symlink configs and scripts to target locations.
                    Edits in this repository immediately reflect live.
   --copy           Copy configs and scripts directly instead of symlinking.
+  --status         Check symlinks/copies for drift or missing targets without mutating.
   -f, --force      Overwrite existing destination files/symlinks without prompting.
   -h, --help       Show this help message.
 
 Targets configured:
-  ~/.local/bin/              Helper scripts and tools (agy-advisor, agy-stats, rtk, etc.)
+  ~/.local/bin/              Helper scripts and tools (agy-advisor, agy-stats, agy-watch, rtk, etc.)
   ~/.agents/skills/          Agent skills (repo .agents/skills, linked into Antigravity)
   ~/.gemini/config/          Global instructions, plugins, custom agents
   ~/.gemini/antigravity-cli/ settings.json with path templating
   ~/.config/agy-stats/       Stats preferences
   ~/.config/rtk/             RTK token condenser configs
-  ~/.agents/                 Subagent memory and runtime directories
+  ~/.agents/                 Subagent memory, watchdog, and runtime directories
 EOF
   exit 0
 }
@@ -41,6 +43,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --copy)
       MODE="copy"
+      shift
+      ;;
+    --status)
+      STATUS_ONLY=true
       shift
       ;;
     -f|--force)
@@ -56,6 +62,105 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+check_entry() {
+  local src="$1"
+  local dest="$2"
+  local label="$3"
+
+  if [[ ! -e "$dest" && ! -L "$dest" ]]; then
+    echo "  [MISSING] $label"
+    DRIFT_COUNT=$((DRIFT_COUNT + 1))
+    return
+  fi
+
+  if [[ -L "$dest" ]]; then
+    if [[ ! -e "$dest" ]]; then
+      echo "  [DRIFT]   $label (broken symlink -> $(readlink "$dest"))"
+      DRIFT_COUNT=$((DRIFT_COUNT + 1))
+      return
+    fi
+    local src_real dest_real
+    src_real="$(readlink -f "$src")"
+    dest_real="$(readlink -f "$dest")"
+    if [[ "$src_real" == "$dest_real" ]]; then
+      echo "  [OK]      $label"
+    else
+      echo "  [DRIFT]   $label (points to $(readlink "$dest"), expected $src)"
+      DRIFT_COUNT=$((DRIFT_COUNT + 1))
+    fi
+  elif [[ -f "$src" && -f "$dest" ]]; then
+    if cmp -s "$src" "$dest"; then
+      echo "  [OK]      $label (copy)"
+    else
+      echo "  [DRIFT]   $label (regular file differs from $src)"
+      DRIFT_COUNT=$((DRIFT_COUNT + 1))
+    fi
+  elif [[ -d "$src" && -d "$dest" ]]; then
+    if diff -rq "$src" "$dest" >/dev/null 2>&1; then
+      echo "  [OK]      $label (dir copy)"
+    else
+      echo "  [DRIFT]   $label (directory differs from $src)"
+      DRIFT_COUNT=$((DRIFT_COUNT + 1))
+    fi
+  else
+    echo "  [DRIFT]   $label (type mismatch)"
+    DRIFT_COUNT=$((DRIFT_COUNT + 1))
+  fi
+}
+
+run_status() {
+  local DRIFT_COUNT=0
+  echo "==> Checking gravityzilla symlink/install status..."
+
+  echo "-- Binaries (~/.local/bin/):"
+  for bin_file in "$SCRIPT_DIR/bin/"*; do
+    [[ -f "$bin_file" ]] || continue
+    local filename
+    filename="$(basename "$bin_file")"
+    check_entry "$bin_file" "$HOME/.local/bin/$filename" "~/.local/bin/$filename"
+  done
+
+  echo "-- Antigravity Config (~/.gemini/config/):"
+  for cfg_item in "$SCRIPT_DIR/config/"*; do
+    [[ -e "$cfg_item" ]] || continue
+    local item_name
+    item_name="$(basename "$cfg_item")"
+    if [[ "$item_name" == "config.json" && -f "$HOME/.gemini/config/config.json" && ! -L "$HOME/.gemini/config/config.json" ]]; then
+      echo "  [OK]      ~/.gemini/config/config.json (local runtime state)"
+      continue
+    fi
+    check_entry "$cfg_item" "$HOME/.gemini/config/$item_name" "~/.gemini/config/$item_name"
+  done
+
+  echo "-- Discovery Links & Settings:"
+  check_entry "$SCRIPT_DIR/.agents/skills" "$HOME/.agents/skills" "~/.agents/skills"
+  check_entry "$HOME/.agents/skills" "$HOME/.gemini/config/skills" "~/.gemini/config/skills"
+  check_entry "$HOME/.agents/skills" "$HOME/.gemini/antigravity-cli/skills" "~/.gemini/antigravity-cli/skills"
+  check_entry "$HOME/.gemini/config" "$HOME/.gemini/antigravity" "~/.gemini/antigravity"
+
+  local settings_dest="$HOME/.gemini/antigravity-cli/settings.json"
+  if [[ -f "$settings_dest" ]]; then
+    echo "  [OK]      ~/.gemini/antigravity-cli/settings.json"
+  else
+    echo "  [MISSING] ~/.gemini/antigravity-cli/settings.json"
+    DRIFT_COUNT=$((DRIFT_COUNT + 1))
+  fi
+
+  echo ""
+  if [[ "$DRIFT_COUNT" -eq 0 ]]; then
+    echo "Status: CLEAN (0 drift/missing items)"
+    return 0
+  else
+    echo "Status: $DRIFT_COUNT issue(s) found (run ./install.sh to reconcile)"
+    return 1
+  fi
+}
+
+if [[ "$STATUS_ONLY" == true ]]; then
+  run_status
+  exit $?
+fi
 
 echo "==> Starting Antigravity Linux setup (Mode: $MODE, Force: $FORCE)..."
 
@@ -89,6 +194,7 @@ mkdir -p "$HOME/.config/rtk"
 mkdir -p "$HOME/.agents/memories"
 mkdir -p "$HOME/.agents/advisor"
 mkdir -p "$HOME/.agents/diagnostics"
+mkdir -p "$HOME/.agents/watchdog"
 
 # Cleanup obsolete components (e.g. ledger)
 rm -rf "$HOME/.gemini/config/plugins/ledger" "$HOME/.local/bin/agy-ledger" "$HOME/.agents/ledger"
@@ -136,6 +242,10 @@ echo "==> Deploying Antigravity configuration into ~/.gemini/config/..."
 for cfg_item in "$SCRIPT_DIR/config/"*; do
   [[ -e "$cfg_item" ]] || continue
   item_name="$(basename "$cfg_item")"
+  if [[ "$item_name" == "config.json" && -f "$HOME/.gemini/config/config.json" && ! -L "$HOME/.gemini/config/config.json" && "$FORCE" == false ]]; then
+    echo "    Preserving local ~/.gemini/config/config.json (use --force to reset)."
+    continue
+  fi
   deploy_file "$cfg_item" "$HOME/.gemini/config/$item_name"
 done
 
@@ -178,7 +288,7 @@ fi
 echo "==> Verifying installation..."
 
 # Verify python syntax for helper scripts
-for py_bin in agy-advisor agy-diagnostics agy-stats agy-statusline agent-memory; do
+for py_bin in agy-advisor agy-diagnostics agy-stats agy-statusline agy-watch agent-memory; do
   if [[ -f "$HOME/.local/bin/$py_bin" ]]; then
     python3 -m py_compile "$HOME/.local/bin/$py_bin" >/dev/null 2>&1 && \
       echo "    [PASS] $py_bin syntax OK" || \

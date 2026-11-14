@@ -272,6 +272,33 @@ def build_diagnostics_segment(cid: str) -> str:
     return f"{GREEN}diag: ✓{RESET}"
 
 
+def build_watchdog_segment(cid: str) -> str:
+    if not is_plugin_enabled("watchdog", True):
+        return f"{DIM}watch: off{RESET}"
+    wd_dir = Path(os.environ.get("AGY_WATCHDOG_HOME") or (AGENTS_DIR / "watchdog"))
+    state = read_json(wd_dir / "state.json")
+    if not state.get("enabled", True):
+        return f"{DIM}watch: off{RESET}"
+
+    if cid:
+        sess = read_json(wd_dir / "sessions" / f"{cid}.json")
+        alert = sess.get("last_alert")
+        if isinstance(alert, dict):
+            kind = str(alert.get("kind") or "")
+            detail = str(alert.get("detail") or "")
+            try:
+                ts = float(alert.get("ts") or 0.0)
+            except (TypeError, ValueError):
+                ts = 0.0
+            age = time.time() - ts
+            if kind == "stall" and age <= 120:
+                return f"{RED}watch: ⚠ {detail}{RESET}"
+            if kind == "loop" and age <= 90:
+                return f"{YELLOW}watch: ↻ {detail}{RESET}"
+
+    return f"{GREEN}watch: ✓{RESET}"
+
+
 def build_playwright_segment() -> str:
     if is_plugin_enabled("playwright", False):
         return f"{CYAN}pw: ON{RESET}"
@@ -309,9 +336,10 @@ def main() -> int:
     adv_seg, touched = build_advisor_segment(cid, sess)
     git_seg = build_git_segment(cwd, touched)
     diag_seg = build_diagnostics_segment(cid)
+    watch_seg = build_watchdog_segment(cid)
     pw_seg = build_playwright_segment()
 
-    parts = [p for p in (git_seg, adv_seg, diag_seg, pw_seg) if p]
+    parts = [p for p in (git_seg, adv_seg, diag_seg, watch_seg, pw_seg) if p]
     sep = f" {DIM}│{RESET} "
     sys.stdout.write(sep.join(parts) + "\n")
     return 0

@@ -1,0 +1,1590 @@
+#!/usr/bin/env python3
+"""
+agy-watch: Zero-token execution tracking, loop circuit-breaker, and hung-task
+recovery for Google Antigravity CLI (`agy`).
+
+Hook Architecture (`~/.gemini/config/plugins/watchdog/hooks.json`):
+  1. `PreInvocation`: Records model turn boundaries (`model_start`), syncs user
+     turn state, pops queued guidance (`ABAB_HASH_FLIP`, late-hang kill notes,
+     3x error thrash breaker, 45-step soft check), and wakes `daemon-loop`.
+  2. `PreToolUse` (`*`): Closes active model span (`model_done`), blocks >=3
+     identical `(tool, canonical_args, ws_sig)` calls with unchanged workspace
+     state via `{"decision": "deny"}`, and starts monotonic tool timer.
+  3. `PostToolUse` (`*`): Records exact `duration_ms` matched by `toolCall.id`,
+     updates error streaks, detects `ABAB_HASH_FLIP` edit oscillation, and bumps
+     workspace `mutation_seq`.
+  4. `Stop`: When `NO_TOOL_CALL` pauses with `fullyIdle: false` (backgrounded
+     `run_command` task), checks `task-<idx>.log` bytes + `/proc/<pid>/stat` CPU
+     ticks for up to `stop_idle_bounce_s` (4s on stdin prompt, 12s on 0-CPU/0-IO)
+     and returns `{"decision": "continue", "reason": ...}` so the agent wakes
+     and inspects `manage_task` automatically.
+  5. `daemon-loop`: Self-exiting detached monitor (singleton `watcher.lock`)
+     polling every 3s while sessions are active. Reads ONLY `/proc/<pid>/stat`
+     and `/proc/<pid>/comm`, honors `presence/<cid>.lock` and SQLite
+     `CORTEX_STEP_STATUS_WAITING` (`9`), notifies on sync/model stalls, and
+     surgically terminates single unambiguous hung child `run_command` shells.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import datetime as dt
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shutil
+import signal
+import sqlite3
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any, Iterator
+
+WATCHDOG_HOME = Path(
+    os.environ.get("AGY_WATCHDOG_HOME") or (Path.home() / ".agents" / "watchdog")
+).expanduser()
+CLI_DATA_DIR = Path(
+    os.environ.get("AGY_CLI_DATA_DIR") or (Path.home() / ".gemini" / "antigravity-cli")
+).expanduser()
+
+STATE_FILE = WATCHDOG_HOME / "state.json"
+STATE_LOCK = WATCHDOG_HOME / ".state.lock"
+SESSIONS_DIR = WATCHDOG_HOME / "sessions"
+EVENTS_FILE = WATCHDOG_HOME / "events.jsonl"
+EVENTS_LOCK = WATCHDOG_HOME / ".events.lock"
+LOG_FILE = WATCHDOG_HOME / "watchdog.log"
+WATCHER_LOCK = WATCHDOG_HOME / "watcher.lock"
+
+MAX_EVENTS_BYTES = 1_048_576
+MAX_LOG_BYTES = 524_288
+MAX_HASH_FILE_BYTES = 2_097_152
+TRANSCRIPT_TAIL_BYTES = 65_536
+
+# Protobuf CortexStepStatus integer values verified in agy 1.5.9
+STEP_STATUS_PENDING = 1
+STEP_STATUS_RUNNING = 2
+STEP_STATUS_DONE = 3
+STEP_STATUS_GENERATING = 8
+STEP_STATUS_WAITING = 9
+
+SHELL_COMMS = frozenset({"bash", "sh", "zsh", "dash", "fish", "rtk"})
+EXEMPT_LOOP_TOOLS = frozenset({"ask_question", "exit_plan_mode", "send_message", "schedule"})
+MUTATING_FILE_TOOLS = frozenset(
+    {
+        "edit_file",
+        "write_file",
+        "replace_file_content",
+        "multi_replace_file_content",
+        "write_to_file",
+        "create_file",
+        "delete_file",
+    }
+)
+READONLY_CMD_VERBS = frozenset(
+    {
+        "ls",
+        "cat",
+        "head",
+        "tail",
+        "grep",
+        "rg",
+        "find",
+        "pwd",
+        "which",
+        "stat",
+        "sqlite3",
+    }
+)
+
+VALID_CID_RE = re.compile(r"^[A-Za-z0-9_-]{4,128}$")
+RTK_PREFIX_RE = re.compile(r"^\s*rtk\s+(?:bypass\s+)?")
+STDIN_PROMPT_RE = re.compile(
+    r"(?i)(\[y/n\]|\(y/n\)|\(yes/no\)|password\s*:|passphrase\s*:|enter pin|are you sure\?|press enter to continue)"
+)
+BG_TASK_ID_RE = re.compile(r"Tool is running as a background task with task id:\s*([^\s\n]+)")
+TASK_DESC_RE = re.compile(r"Task Description:\s*(.+)")
+
+UUID_RE = re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b")
+ISO_TS_RE = re.compile(r"(?i)\b\d{4}-\d{2}-\d{2}[t ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:z|[+-]\d{2}:?\d{2})?\b")
+HEX_RE = re.compile(r"\b0x[0-9a-fA-F]+\b")
+NUM_RE = re.compile(r"\b\d+\b")
+WS_RE = re.compile(r"\s+")
+
+DEFAULT_STATE: dict[str, Any] = {
+    "enabled": True,
+    "auto_kill_late_hangs": True,
+    "model_warn_s": 90,
+    "tool_warn_s": 60,
+    "stdin_prompt_s": 4,
+    "stop_idle_bounce_s": 12,
+    "bg_hang_s": 90,
+    "loops_blocked": 0,
+    "thrash_pivots": 0,
+    "hangs_bounced": 0,
+    "late_hangs_killed": 0,
+}
+
+
+def utc_iso_now() -> str:
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def ensure_dirs() -> None:
+    WATCHDOG_HOME.mkdir(parents=True, exist_ok=True)
+    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def sanitize_cid(cid: str) -> str:
+    raw = str(cid or "").strip()
+    if VALID_CID_RE.match(raw):
+        return raw
+    return ""
+
+
+def atomic_write_json(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=False) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+@contextlib.contextmanager
+def file_lock(lock_path: Path) -> Iterator[None]:
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as fh:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
+def load_state() -> dict[str, Any]:
+    ensure_dirs()
+    if not STATE_FILE.is_file():
+        return dict(DEFAULT_STATE)
+    try:
+        raw = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            merged = dict(DEFAULT_STATE)
+            merged.update(raw)
+            return merged
+    except Exception:
+        pass
+    return dict(DEFAULT_STATE)
+
+
+def save_state(state: dict[str, Any]) -> None:
+    with file_lock(STATE_LOCK):
+        atomic_write_json(STATE_FILE, state)
+
+
+def update_state_field(mutator: Any) -> dict[str, Any]:
+    with file_lock(STATE_LOCK):
+        st = load_state()
+        mutator(st)
+        atomic_write_json(STATE_FILE, st)
+        return st
+
+
+def session_path(cid: str) -> Path:
+    return SESSIONS_DIR / f"{cid}.json"
+
+
+def session_lock_path(cid: str) -> Path:
+    return SESSIONS_DIR / f"{cid}.lock"
+
+
+def default_session(cid: str) -> dict[str, Any]:
+    return {
+        "cid": cid,
+        "agy_pid": None,
+        "phase": "idle",
+        "last_user_input": "",
+        "model_started_mono_ns": 0,
+        "model_started_epoch": 0.0,
+        "turn_tool_count": 0,
+        "warned_step_45": False,
+        "mutation_seq": 0,
+        "recent_calls": [],
+        "file_hashes": {},
+        "consecutive_same_err": {"sig": "", "count": 0, "sample": "", "warned_at": 0},
+        "inflight_tools": {},
+        "pending_guidance": [],
+        "stop_bounced_tasks": [],
+        "last_alert": None,
+        "updated_at": 0.0,
+    }
+
+
+def load_session(cid: str) -> dict[str, Any]:
+    p = session_path(cid)
+    base = default_session(cid)
+    if not p.is_file():
+        return base
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            base.update(raw)
+            base["cid"] = cid
+    except Exception:
+        pass
+    return base
+
+
+def save_session(cid: str, sess: dict[str, Any]) -> None:
+    sess["updated_at"] = time.time()
+    atomic_write_json(session_path(cid), sess)
+
+
+def _rotate_if_oversized(path: Path, max_bytes: int) -> None:
+    try:
+        if path.is_file() and path.stat().st_size > max_bytes:
+            backup = path.with_name(path.name + ".1")
+            os.replace(path, backup)
+    except Exception:
+        pass
+
+
+def append_event(
+    cid: str,
+    event: str,
+    step_idx: int | None = None,
+    tool_id: str = "",
+    tool: str = "",
+    duration_ms: int | None = None,
+    status: str = "",
+    detail: str = "",
+) -> None:
+    ensure_dirs()
+    record: dict[str, Any] = {
+        "ts": utc_iso_now(),
+        "mono_ns": time.monotonic_ns(),
+        "cid": cid,
+        "event": event,
+    }
+    if step_idx is not None:
+        record["step_idx"] = step_idx
+    if tool_id:
+        record["tool_id"] = tool_id
+    if tool:
+        record["tool"] = tool
+    if duration_ms is not None:
+        record["duration_ms"] = duration_ms
+    if status:
+        record["status"] = status
+    if detail:
+        record["detail"] = detail
+    line = json.dumps(record, ensure_ascii=True, separators=(",", ":")) + "\n"
+    try:
+        with file_lock(EVENTS_LOCK):
+            _rotate_if_oversized(EVENTS_FILE, MAX_EVENTS_BYTES)
+            with EVENTS_FILE.open("a", encoding="utf-8") as fh:
+                fh.write(line)
+    except Exception:
+        pass
+
+
+def log_line(msg: str) -> None:
+    ensure_dirs()
+    stamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{stamp}] {msg}\n"
+    try:
+        with file_lock(EVENTS_LOCK):
+            _rotate_if_oversized(LOG_FILE, MAX_LOG_BYTES)
+            with LOG_FILE.open("a", encoding="utf-8") as fh:
+                fh.write(line)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Linux /proc/<pid>/stat & /proc/<pid>/comm inspection (never environ/cmdline)
+# ---------------------------------------------------------------------------
+
+
+def _read_proc_stat(pid: int) -> tuple[str, int, int, int] | None:
+    """Return (comm, ppid, pgrp, utime + stime) from /proc/<pid>/stat only."""
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+    lpar = raw.find("(")
+    rpar = raw.rfind(")")
+    if lpar < 0 or rpar <= lpar:
+        return None
+    comm = raw[lpar + 1 : rpar]
+    after = raw[rpar + 2 :].split()
+    if len(after) < 13:
+        return None
+    try:
+        ppid = int(after[1])
+        pgrp = int(after[2])
+        utime = int(after[11])
+        stime = int(after[12])
+    except ValueError:
+        return None
+    try:
+        full_comm = Path(f"/proc/{pid}/comm").read_text(encoding="utf-8", errors="replace").strip()
+        if full_comm:
+            comm = full_comm
+    except Exception:
+        pass
+    return comm, ppid, pgrp, utime + stime
+
+
+def find_ancestor_agy_pid() -> int | None:
+    """Walk up to 6 parent hops using /proc/<pid>/stat and /proc/<pid>/comm only."""
+    pid = os.getppid()
+    seen: set[int] = set()
+    for _ in range(6):
+        if pid <= 1 or pid in seen:
+            break
+        seen.add(pid)
+        info = _read_proc_stat(pid)
+        if info is None:
+            break
+        comm, ppid, _pgrp, _ticks = info
+        if comm == "agy":
+            return pid
+        pid = ppid
+    return None
+
+
+def _build_proc_tree() -> tuple[dict[int, list[tuple[int, int, str, int]]], dict[int, tuple[int, int, str, int]]]:
+    """Scan numeric /proc/<pid>/stat files only (no environ/cmdline)."""
+    children_map: dict[int, list[tuple[int, int, str, int]]] = {}
+    stats_map: dict[int, tuple[int, int, str, int]] = {}
+    try:
+        entries = os.listdir("/proc")
+    except Exception:
+        return children_map, stats_map
+    for name in entries:
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        info = _read_proc_stat(pid)
+        if info is None:
+            continue
+        comm, ppid, pgrp, ticks = info
+        stats_map[pid] = (ppid, pgrp, comm, ticks)
+        children_map.setdefault(ppid, []).append((pid, pgrp, comm, ticks))
+    return children_map, stats_map
+
+
+def sample_agy_child_shells(agy_pid: int | None) -> tuple[int, list[tuple[int, int, str]]]:
+    """Return (total_cpu_ticks, [(child_pid, child_pgrp, comm), ...]) for agy shell children."""
+    if not agy_pid or agy_pid <= 1:
+        return 0, []
+    children_map, stats_map = _build_proc_tree()
+    if agy_pid not in stats_map:
+        return 0, []
+
+    # Exclude this hook process and its own ancestors up to agy_pid.
+    hook_ancestors: set[int] = set()
+    cur = os.getpid()
+    while cur > 1 and cur not in hook_ancestors:
+        hook_ancestors.add(cur)
+        st = stats_map.get(cur)
+        if st is None:
+            break
+        cur = st[0]
+
+    direct_shells: list[tuple[int, int, str]] = []
+    total_ticks = 0
+    for cpid, cpgrp, ccomm, cticks in children_map.get(agy_pid, ()):
+        if cpid in hook_ancestors or ccomm not in SHELL_COMMS:
+            continue
+        direct_shells.append((cpid, cpgrp, ccomm))
+        queue = [cpid]
+        visited = {cpid}
+        total_ticks += cticks
+        while queue:
+            node = queue.pop()
+            for gpid, _gpgrp, _gcomm, gticks in children_map.get(node, ()):
+                if gpid not in visited:
+                    visited.add(gpid)
+                    total_ticks += gticks
+                    queue.append(gpid)
+    return total_ticks, direct_shells
+
+
+def _collect_descendants(root_pid: int, agy_pid: int) -> list[int]:
+    """Return descendants of root_pid (post-order), excluding agy_pid and self."""
+    children_map, _ = _build_proc_tree()
+    ordered: list[int] = []
+    visited = {root_pid, agy_pid, os.getpid()}
+
+    def dfs(pid: int) -> None:
+        for cpid, _pgrp, _comm, _ticks in children_map.get(pid, ()):
+            if cpid not in visited:
+                visited.add(cpid)
+                dfs(cpid)
+                ordered.append(cpid)
+
+    dfs(root_pid)
+    return ordered
+
+
+def kill_child_shell_safely(agy_pid: int, child_pid: int, child_pgrp: int) -> bool:
+    """Surgically terminate child shell without ever signaling agy_pid or agy_pgrp."""
+    if child_pid <= 1 or child_pid == agy_pid or child_pid == os.getpid():
+        return False
+    agy_info = _read_proc_stat(agy_pid)
+    if agy_info is None:
+        return False
+    agy_pgrp = agy_info[2]
+
+    if child_pgrp > 1 and child_pgrp != agy_pgrp:
+        try:
+            os.killpg(child_pgrp, signal.SIGTERM)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return False
+
+    sent = False
+    for dpid in _collect_descendants(child_pid, agy_pid):
+        with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+            os.kill(dpid, signal.SIGTERM)
+            sent = True
+    with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+        os.kill(child_pid, signal.SIGTERM)
+        sent = True
+    return sent
+
+
+# ---------------------------------------------------------------------------
+# Tool canonicalization, error normalization, workspace state, & DB helpers
+# ---------------------------------------------------------------------------
+
+
+def canonicalize_tool_call(tname: str, targs: dict[str, Any]) -> tuple[bool, str]:
+    """Return (exempt_from_identical_block, args_sha256_prefix16)."""
+    if tname in EXEMPT_LOOP_TOOLS:
+        return True, ""
+    if tname == "manage_task" and str(targs.get("Action") or "").lower() in {"status", "list"}:
+        return True, ""
+
+    if tname == "run_command":
+        cmd = str(targs.get("CommandLine") or "")
+        norm_cmd = RTK_PREFIX_RE.sub("", cmd).strip()
+        canon: Any = {"cmd": norm_cmd}
+    elif tname in {"read_file", "view_file"}:
+        canon = {
+            "Path": targs.get("Path") or targs.get("AbsolutePath") or "",
+            "StartLine": targs.get("StartLine"),
+            "EndLine": targs.get("EndLine"),
+            "ByteOffset": targs.get("ByteOffset"),
+        }
+    else:
+        canon = targs
+
+    blob = json.dumps(canon, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+    digest = hashlib.sha256(blob.encode("utf-8", errors="replace")).hexdigest()[:16]
+    return False, digest
+
+
+def normalize_error_sig(err: str) -> str:
+    txt = (err or "").strip().lower()
+    txt = UUID_RE.sub("#", txt)
+    txt = ISO_TS_RE.sub("#", txt)
+    txt = HEX_RE.sub("#", txt)
+    txt = NUM_RE.sub("#", txt)
+    txt = WS_RE.sub(" ", txt).strip()
+    return txt[:160]
+
+
+def is_readonly_command(cmd: str) -> bool:
+    stripped = RTK_PREFIX_RE.sub("", (cmd or "").strip())
+    if not stripped:
+        return True
+    # Reject redirections, subshells, or mutating commands before verb inspection.
+    if any(tok in stripped for tok in (">", ">>", "sed -i", "tee ", "rm ", "mv ", "cp ", "mkdir ", "chmod ")):
+        return False
+    segments = re.split(r"(?:&&|\|\||;|\|)", stripped)
+    for seg in segments:
+        tokens = seg.strip().split()
+        while tokens and "=" in tokens[0] and not tokens[0].startswith("-"):
+            tokens.pop(0)
+        if not tokens:
+            continue
+        verb = Path(tokens[0]).name
+        if verb == "git":
+            sub = next((t for t in tokens[1:] if not t.startswith("-")), "")
+            if sub not in {"status", "log", "diff"}:
+                return False
+        elif verb not in READONLY_CMD_VERBS:
+            return False
+    return True
+
+
+def extract_cwd(payload: dict[str, Any]) -> str:
+    cwd = str(payload.get("cwd") or "").strip()
+    if cwd:
+        return cwd
+    wpaths = payload.get("workspacePaths")
+    if isinstance(wpaths, list) and wpaths:
+        return str(wpaths[0] or "").strip()
+    return ""
+
+
+def compute_ws_sig(mutation_seq: int, cwd: str) -> str:
+    g_hash = ""
+    if cwd and Path(cwd).is_dir():
+        try:
+            proc = subprocess.run(
+                ["git", "-C", cwd, "status", "--porcelain", "-uno", "--no-optional-locks"],
+                capture_output=True,
+                timeout=0.08,
+            )
+            if proc.returncode == 0:
+                g_hash = hashlib.sha256(proc.stdout).hexdigest()[:8]
+        except Exception:
+            pass
+    return f"{mutation_seq}:{g_hash}"
+
+
+def resolve_edited_file_path(targs: dict[str, Any], cwd: str) -> Path | None:
+    raw = str(targs.get("Path") or targs.get("TargetFile") or targs.get("AbsolutePath") or "").strip()
+    if not raw:
+        return None
+    p = Path(raw).expanduser()
+    if not p.is_absolute() and cwd:
+        p = Path(cwd) / p
+    return p
+
+
+def read_db_active_indices(cid: str) -> tuple[bool, set[int], set[int], set[int]]:
+    """Return (db_ok, running_idxs, generating_idxs, waiting_idxs) using idx_steps_status."""
+    db_path = CLI_DATA_DIR / "conversations" / f"{cid}.db"
+    if not db_path.is_file():
+        return False, set(), set(), set()
+    running: set[int] = set()
+    generating: set[int] = set()
+    waiting: set[int] = set()
+    try:
+        with contextlib.closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=0.4)) as conn:
+            for idx, status in conn.execute(
+                "SELECT idx, status FROM steps WHERE status IN (?, ?, ?)",
+                (STEP_STATUS_RUNNING, STEP_STATUS_GENERATING, STEP_STATUS_WAITING),
+            ):
+                s_idx = int(idx)
+                st = int(status)
+                if st == STEP_STATUS_RUNNING:
+                    running.add(s_idx)
+                elif st == STEP_STATUS_GENERATING:
+                    generating.add(s_idx)
+                elif st == STEP_STATUS_WAITING:
+                    waiting.add(s_idx)
+        return True, running, generating, waiting
+    except Exception:
+        return False, set(), set(), set()
+
+
+def is_step_running_in_db(cid: str, step_idx: int) -> bool | None:
+    """Return True if status==2 (RUNNING), False if finished/other, None if DB/row absent."""
+    db_path = CLI_DATA_DIR / "conversations" / f"{cid}.db"
+    if not db_path.is_file():
+        return None
+    try:
+        with contextlib.closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=0.4)) as conn:
+            row = conn.execute("SELECT status FROM steps WHERE idx = ?", (step_idx,)).fetchone()
+            if row is None:
+                return None
+            return int(row[0]) == STEP_STATUS_RUNNING
+    except Exception:
+        return None
+
+
+def find_running_bg_tasks(cid: str) -> list[dict[str, Any]]:
+    """
+    Parse the tail of brain/<cid>/.system_generated/logs/transcript_full.jsonl for
+    backgrounded run_command steps, excluding Timer: schedules, IsDaemon=true tasks,
+    and tasks already finished in conversations/<cid>.db.
+    """
+    tpath = CLI_DATA_DIR / "brain" / cid / ".system_generated" / "logs" / "transcript_full.jsonl"
+    if not tpath.is_file():
+        return []
+    try:
+        size = tpath.stat().st_size
+        with tpath.open("rb") as fh:
+            if size > TRANSCRIPT_TAIL_BYTES:
+                fh.seek(size - TRANSCRIPT_TAIL_BYTES)
+                fh.readline()  # discard partial first line after seek
+            lines = fh.read().decode("utf-8", errors="replace").splitlines()
+    except Exception:
+        return []
+
+    db_ok, running_idxs, _, _ = read_db_active_indices(cid)
+
+    records: list[dict[str, Any]] = []
+    planners: dict[int, list[dict[str, Any]]] = {}
+    for raw in lines:
+        if not raw.strip():
+            continue
+        try:
+            d = json.loads(raw)
+        except Exception:
+            continue
+        if not isinstance(d, dict):
+            continue
+        records.append(d)
+        if d.get("type") == "PLANNER_RESPONSE" and isinstance(d.get("step_index"), int):
+            tcalls = d.get("tool_calls")
+            if isinstance(tcalls, list):
+                planners[int(d["step_index"])] = tcalls
+
+    tasks: list[dict[str, Any]] = []
+    for d in records:
+        if d.get("status") != "RUNNING":
+            continue
+        step_idx = d.get("step_index")
+        if not isinstance(step_idx, int):
+            continue
+        if db_ok and step_idx not in running_idxs:
+            continue
+        content = str(d.get("content") or "")
+        m_id = BG_TASK_ID_RE.search(content)
+        if not m_id:
+            continue
+        task_id = m_id.group(1)
+        m_desc = TASK_DESC_RE.search(content)
+        desc = m_desc.group(1).strip() if m_desc else ""
+        if desc.startswith("Timer:"):
+            continue
+
+        # Check matching PLANNER_RESPONSE tool call for non-run_command or IsDaemon=true.
+        exempt = False
+        best_p = max((p for p in planners if p < step_idx), default=None)
+        if best_p is not None:
+            tcalls = planners[best_p]
+            offset = step_idx - best_p - 1
+            tc = tcalls[offset] if 0 <= offset < len(tcalls) else (tcalls[0] if len(tcalls) == 1 else None)
+            if isinstance(tc, dict):
+                tname = str(tc.get("name") or "")
+                targs = tc.get("args") if isinstance(tc.get("args"), dict) else {}
+                is_daemon = targs.get("IsDaemon")
+                if tname and tname != "run_command":
+                    exempt = True
+                if is_daemon is True or str(is_daemon).lower() == "true":
+                    exempt = True
+        if exempt:
+            continue
+
+        tasks.append({"step_idx": step_idx, "task_id": task_id, "desc": desc})
+    return tasks
+
+
+def read_task_log_tail(cid: str, step_idx: int, max_bytes: int = 512) -> tuple[int, str]:
+    log_path = CLI_DATA_DIR / "brain" / cid / ".system_generated" / "tasks" / f"task-{step_idx}.log"
+    if not log_path.is_file():
+        return 0, ""
+    try:
+        size = log_path.stat().st_size
+        with log_path.open("rb") as fh:
+            if size > max_bytes:
+                fh.seek(size - max_bytes)
+            tail = fh.read().decode("utf-8", errors="replace")
+        return size, tail
+    except Exception:
+        return 0, ""
+
+
+def send_desktop_alert(title: str, body: str) -> None:
+    notifier = shutil.which("notify-send")
+    if not notifier:
+        return
+    with contextlib.suppress(Exception):
+        subprocess.Popen(
+            [notifier, "-u", "critical", "-a", "agy-watch", title, body],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+
+
+def ensure_watcher_running() -> None:
+    """Spawn detached daemon-loop only if watcher.lock is not currently held."""
+    ensure_dirs()
+    try:
+        with WATCHER_LOCK.open("a+", encoding="utf-8") as fh:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    except Exception:
+        return
+
+    with contextlib.suppress(Exception):
+        subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "daemon-loop"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+
+
+def check_presence_unlocked(cid: str) -> bool:
+    """Return True only when presence/<cid>.lock exists and is NOT locked by a live agy."""
+    lock_path = CLI_DATA_DIR / "presence" / f"{cid}.lock"
+    if not lock_path.is_file():
+        return False
+    try:
+        with lock_path.open("r+", encoding="utf-8") as fh:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return False
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            return True
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Hook Handlers
+# ---------------------------------------------------------------------------
+
+
+def _read_hook_payload() -> dict[str, Any]:
+    raw = sys.stdin.read() or "{}"
+    data = json.loads(raw)
+    return data if isinstance(data, dict) else {}
+
+
+def cmd_pre_invocation_hook(_args: argparse.Namespace) -> int:
+    if os.environ.get("AGY_HOOK_INTERNAL") == "1":
+        print("{}")
+        return 0
+    try:
+        payload = _read_hook_payload()
+        cid = sanitize_cid(str(payload.get("conversationId") or ""))
+        if not cid:
+            print("{}")
+            return 0
+        state = load_state()
+        if not state.get("enabled", True):
+            print("{}")
+            return 0
+
+        now = time.time()
+        mono_ns = time.monotonic_ns()
+        user_in = str(payload.get("lastUserInput") or "")
+        agy_pid = find_ancestor_agy_pid()
+
+        inject_msgs: list[str] = []
+        badges: list[str] = []
+        thrash_triggered = False
+
+        with file_lock(session_lock_path(cid)):
+            sess = load_session(cid)
+            if agy_pid:
+                sess["agy_pid"] = agy_pid
+
+            if user_in and user_in != sess.get("last_user_input"):
+                sess["last_user_input"] = user_in
+                sess["turn_tool_count"] = 0
+                sess["warned_step_45"] = False
+                sess["recent_calls"] = []
+                sess["file_hashes"] = {}
+                sess["consecutive_same_err"] = {"sig": "", "count": 0, "sample": "", "warned_at": 0}
+                sess["stop_bounced_tasks"] = []
+                if (sess.get("last_alert") or {}).get("kind") != "stall":
+                    sess["last_alert"] = None
+
+            sess["phase"] = "model"
+            sess["model_started_mono_ns"] = mono_ns
+            sess["model_started_epoch"] = now
+
+            pending = sess.get("pending_guidance") or []
+            if pending:
+                inject_msgs.extend(str(m) for m in pending if m)
+                badges.append(f"watchdog: {len(pending)} notice(s)")
+                sess["pending_guidance"] = []
+
+            err_state = sess.get("consecutive_same_err") or {}
+            err_cnt = int(err_state.get("count") or 0)
+            warned_at = int(err_state.get("warned_at") or 0)
+            if err_cnt >= 3 and warned_at < err_cnt:
+                err_state["warned_at"] = err_cnt
+                sess["consecutive_same_err"] = err_state
+                sample = str(err_state.get("sample") or "repeated error")
+                inject_msgs.append(
+                    f"Thrash Circuit-Breaker ({err_cnt} consecutive identical errors: `{sample}`). "
+                    "Stop repeating the failing command/edit; diagnose the underlying root cause before trying again."
+                )
+                badges.append(f"watchdog: thrash breaker ({err_cnt}x error)")
+                sess["last_alert"] = {"kind": "loop", "detail": f"err×{err_cnt}", "ts": now}
+                thrash_triggered = True
+
+            if int(sess.get("turn_tool_count") or 0) == 45 and not sess.get("warned_step_45"):
+                sess["warned_step_45"] = True
+                inject_msgs.append(
+                    "Turn step check: 45 tool calls executed in this turn. "
+                    "Verify forward progress and avoid unnecessary retry loops."
+                )
+                badges.append("watchdog: 45 tool calls in turn")
+
+            save_session(cid, sess)
+
+        if thrash_triggered:
+            update_state_field(lambda st: st.__setitem__("thrash_pivots", int(st.get("thrash_pivots") or 0) + 1))
+            log_line(f"[THRASH] cid={cid[:8]} err_count={err_cnt}")
+
+        append_event(cid=cid, event="model_start")
+        ensure_watcher_running()
+
+        if inject_msgs:
+            ephemeral = "<watchdog>\n" + "\n".join(f"- {m}" for m in inject_msgs) + "\n</watchdog>"
+            out: dict[str, Any] = {
+                "injectSteps": [
+                    {"ephemeralMessage": ephemeral},
+                    {
+                        "systemMessage": {
+                            "systemMessage": "",
+                            "metadata": {"user_markdown": f"`[Watchdog]` {' | '.join(badges)}"},
+                        }
+                    },
+                ]
+            }
+            print(json.dumps(out))
+        else:
+            print("{}")
+        return 0
+    except Exception:
+        print("{}")
+        return 0
+
+
+def cmd_pre_tool_hook(_args: argparse.Namespace) -> int:
+    if os.environ.get("AGY_HOOK_INTERNAL") == "1":
+        print(json.dumps({"decision": "allow"}))
+        return 0
+    try:
+        payload = _read_hook_payload()
+        cid = sanitize_cid(str(payload.get("conversationId") or ""))
+        if not cid:
+            print(json.dumps({"decision": "allow"}))
+            return 0
+        state = load_state()
+        if not state.get("enabled", True):
+            print(json.dumps({"decision": "allow"}))
+            return 0
+
+        tcall = payload.get("toolCall") if isinstance(payload.get("toolCall"), dict) else {}
+        tname = str(tcall.get("name") or "")
+        targs = tcall.get("args") if isinstance(tcall.get("args"), dict) else {}
+        step_idx = payload.get("stepIdx") if isinstance(payload.get("stepIdx"), int) else None
+        tool_id = str(tcall.get("id") or f"step_{step_idx if step_idx is not None else 0}")
+
+        now = time.time()
+        mono_ns = time.monotonic_ns()
+        cwd = extract_cwd(payload)
+        agy_pid = find_ancestor_agy_pid()
+        exempt, args_hash = canonicalize_tool_call(tname, targs)
+
+        model_dur_ms: int | None = None
+        blocked_reason = ""
+
+        with file_lock(session_lock_path(cid)):
+            sess = load_session(cid)
+            if agy_pid:
+                sess["agy_pid"] = agy_pid
+
+            if sess.get("phase") == "model" and int(sess.get("model_started_mono_ns") or 0) > 0:
+                model_dur_ms = max(0, (mono_ns - int(sess["model_started_mono_ns"])) // 1_000_000)
+
+            ws_sig = compute_ws_sig(int(sess.get("mutation_seq") or 0), cwd)
+            if not exempt and args_hash:
+                recent = list(sess.get("recent_calls") or [])
+                matches = sum(
+                    1
+                    for item in recent[-6:]
+                    if item.get("tool") == tname
+                    and item.get("args_hash") == args_hash
+                    and item.get("ws_sig") == ws_sig
+                )
+                if matches >= 2:
+                    sess["last_alert"] = {"kind": "loop", "detail": f"{tname}×3", "ts": now}
+                    sess["phase"] = "idle"
+                    save_session(cid, sess)
+                    blocked_reason = (
+                        f"[Watchdog] Blocked 3rd identical `{tname}` call with no workspace state change. "
+                        "Do not repeat the exact same call; inspect why earlier attempts did not solve it and change approach."
+                    )
+                else:
+                    recent.append({"tool": tname, "args_hash": args_hash, "ws_sig": ws_sig})
+                    sess["recent_calls"] = recent[-20:]
+
+            if not blocked_reason:
+                sess["phase"] = "tool"
+                inflight = sess.get("inflight_tools") or {}
+                inflight[tool_id] = {
+                    "started_mono_ns": mono_ns,
+                    "started_epoch": now,
+                    "step_idx": step_idx,
+                    "name": tname,
+                    "args_hash": args_hash,
+                    "notified": False,
+                }
+                sess["inflight_tools"] = inflight
+                save_session(cid, sess)
+
+        if model_dur_ms is not None:
+            append_event(cid=cid, event="model_done", duration_ms=model_dur_ms, status="ok")
+
+        if blocked_reason:
+            update_state_field(lambda st: st.__setitem__("loops_blocked", int(st.get("loops_blocked") or 0) + 1))
+            append_event(
+                cid=cid,
+                event="loop_blocked",
+                step_idx=step_idx,
+                tool_id=tool_id,
+                tool=tname,
+                status="denied",
+                detail="3x identical call with unchanged ws_sig",
+            )
+            log_line(f"[LOOP-BLOCK] cid={cid[:8]} tool={tname} step={step_idx}")
+            print(json.dumps({"decision": "deny", "reason": blocked_reason}))
+            return 0
+
+        append_event(cid=cid, event="tool_start", step_idx=step_idx, tool_id=tool_id, tool=tname)
+        ensure_watcher_running()
+        print(json.dumps({"decision": "allow"}))
+        return 0
+    except Exception:
+        print(json.dumps({"decision": "allow"}))
+        return 0
+
+
+def cmd_post_tool_hook(_args: argparse.Namespace) -> int:
+    if os.environ.get("AGY_HOOK_INTERNAL") == "1":
+        print("{}")
+        return 0
+    try:
+        payload = _read_hook_payload()
+        cid = sanitize_cid(str(payload.get("conversationId") or ""))
+        if not cid:
+            print("{}")
+            return 0
+        state = load_state()
+        if not state.get("enabled", True):
+            print("{}")
+            return 0
+
+        tcall = payload.get("toolCall") if isinstance(payload.get("toolCall"), dict) else {}
+        tname = str(tcall.get("name") or "")
+        targs = tcall.get("args") if isinstance(tcall.get("args"), dict) else {}
+        step_idx = payload.get("stepIdx") if isinstance(payload.get("stepIdx"), int) else None
+        tool_id = str(tcall.get("id") or f"step_{step_idx if step_idx is not None else 0}")
+        err = str(payload.get("error") or "").strip()
+        cwd = extract_cwd(payload)
+        mono_ns = time.monotonic_ns()
+
+        duration_ms = 0
+        with file_lock(session_lock_path(cid)):
+            sess = load_session(cid)
+            inflight = sess.get("inflight_tools") or {}
+            tinfo = inflight.pop(tool_id, None)
+            if tinfo is None and step_idx is not None:
+                for k, v in list(inflight.items()):
+                    if isinstance(v, dict) and v.get("step_idx") == step_idx:
+                        tinfo = inflight.pop(k)
+                        break
+            if isinstance(tinfo, dict) and int(tinfo.get("started_mono_ns") or 0) > 0:
+                duration_ms = max(0, (mono_ns - int(tinfo["started_mono_ns"])) // 1_000_000)
+
+            sess["inflight_tools"] = inflight
+            sess["turn_tool_count"] = int(sess.get("turn_tool_count") or 0) + 1
+            if not inflight and (sess.get("last_alert") or {}).get("kind") == "stall":
+                sess["last_alert"] = None
+
+            if err:
+                sig = normalize_error_sig(err)
+                err_state = sess.get("consecutive_same_err") or {}
+                if sig == err_state.get("sig"):
+                    err_state["count"] = int(err_state.get("count") or 0) + 1
+                else:
+                    err_state = {
+                        "sig": sig,
+                        "count": 1,
+                        "sample": err.splitlines()[0][:180],
+                        "warned_at": 0,
+                    }
+                sess["consecutive_same_err"] = err_state
+            else:
+                sess["consecutive_same_err"] = {"sig": "", "count": 0, "sample": "", "warned_at": 0}
+                if tname in MUTATING_FILE_TOOLS:
+                    sess["mutation_seq"] = int(sess.get("mutation_seq") or 0) + 1
+                    fpath = resolve_edited_file_path(targs, cwd)
+                    if fpath and fpath.is_file():
+                        with contextlib.suppress(Exception):
+                            if fpath.stat().st_size <= MAX_HASH_FILE_BYTES:
+                                digest = hashlib.sha256(fpath.read_bytes()).hexdigest()
+                                fhashes = sess.get("file_hashes") or {}
+                                hist = list(fhashes.get(str(fpath)) or [])
+                                hist.append(digest)
+                                hist = hist[-4:]
+                                fhashes[str(fpath)] = hist
+                                sess["file_hashes"] = fhashes
+                                if len(hist) >= 3 and hist[-1] == hist[-3] and hist[-1] != hist[-2]:
+                                    pending = list(sess.get("pending_guidance") or [])
+                                    pending.append(
+                                        f"Edit oscillation (ABAB_HASH_FLIP) detected on `{fpath.name}`: "
+                                        "content reverted to its earlier state. Re-check requirements before editing again."
+                                    )
+                                    sess["pending_guidance"] = pending
+                elif tname == "run_command":
+                    cmd = str(targs.get("CommandLine") or "")
+                    if not is_readonly_command(cmd):
+                        sess["mutation_seq"] = int(sess.get("mutation_seq") or 0) + 1
+
+            save_session(cid, sess)
+
+        append_event(
+            cid=cid,
+            event="tool_done",
+            step_idx=step_idx,
+            tool_id=tool_id,
+            tool=tname,
+            duration_ms=duration_ms,
+            status="error" if err else "ok",
+            detail=err.splitlines()[0][:160] if err else "",
+        )
+        print("{}")
+        return 0
+    except Exception:
+        print("{}")
+        return 0
+
+
+def cmd_stop_hook(_args: argparse.Namespace) -> int:
+    if os.environ.get("AGY_HOOK_INTERNAL") == "1":
+        print(json.dumps({"decision": "stop"}))
+        return 0
+    try:
+        payload = _read_hook_payload()
+        cid = sanitize_cid(str(payload.get("conversationId") or ""))
+        if not cid:
+            print(json.dumps({"decision": "stop"}))
+            return 0
+        state = load_state()
+        if not state.get("enabled", True):
+            print(json.dumps({"decision": "stop"}))
+            return 0
+
+        term_reason = str(payload.get("terminationReason") or "")
+        fully_idle = payload.get("fullyIdle")
+        continuation_active = bool(payload.get("continuationActive"))
+        mono_ns = time.monotonic_ns()
+        agy_pid = find_ancestor_agy_pid()
+
+        model_dur_ms: int | None = None
+        bounced_tasks: list[str] = []
+        with file_lock(session_lock_path(cid)):
+            sess = load_session(cid)
+            if agy_pid:
+                sess["agy_pid"] = agy_pid
+            else:
+                agy_pid = sess.get("agy_pid")
+            if sess.get("phase") == "model" and int(sess.get("model_started_mono_ns") or 0) > 0:
+                model_dur_ms = max(0, (mono_ns - int(sess["model_started_mono_ns"])) // 1_000_000)
+
+            if fully_idle is not False:
+                sess["phase"] = "idle"
+                sess["inflight_tools"] = {}
+                save_session(cid, sess)
+            else:
+                sess["phase"] = "bg_wait"
+                bounced_tasks = list(sess.get("stop_bounced_tasks") or [])
+                save_session(cid, sess)
+
+        if model_dur_ms is not None:
+            append_event(cid=cid, event="model_done", duration_ms=model_dur_ms, status="ok")
+        append_event(
+            cid=cid,
+            event="turn_stop",
+            status=term_reason or "UNKNOWN",
+            detail=f"fullyIdle={fully_idle}",
+        )
+
+        if fully_idle is not False:
+            print(json.dumps({"decision": "stop"}))
+            return 0
+
+        ensure_watcher_running()
+
+        if term_reason == "NO_TOOL_CALL" and not continuation_active:
+            candidates = [t for t in find_running_bg_tasks(cid) if t["task_id"] not in bounced_tasks]
+            if candidates:
+                target = candidates[-1]
+                step_idx = int(target["step_idx"])
+                task_id = str(target["task_id"])
+                bounce_limit = max(1, int(state.get("stop_idle_bounce_s", 12)))
+                stdin_limit = max(1, min(bounce_limit, int(state.get("stdin_prompt_s", 4))))
+
+                size_0, tail_0 = read_task_log_tail(cid, step_idx)
+                cpu_0, _shells = sample_agy_child_shells(agy_pid)
+                start_mono = time.monotonic()
+
+                while True:
+                    db_running = is_step_running_in_db(cid, step_idx)
+                    if db_running is False:
+                        print(json.dumps({"decision": "stop"}))
+                        return 0
+
+                    size_now, tail_now = read_task_log_tail(cid, step_idx)
+                    cpu_now, _ = sample_agy_child_shells(agy_pid)
+                    if size_now > size_0 or cpu_now > cpu_0:
+                        print(json.dumps({"decision": "stop"}))
+                        return 0
+
+                    elapsed = time.monotonic() - start_mono
+                    prompt_hit = bool(STDIN_PROMPT_RE.search(tail_now or tail_0))
+                    if prompt_hit and elapsed >= stdin_limit:
+                        break
+                    if elapsed >= bounce_limit:
+                        break
+                    time.sleep(min(1.0, max(0.1, bounce_limit - elapsed)))
+
+                with file_lock(session_lock_path(cid)):
+                    sess = load_session(cid)
+                    bounced = list(sess.get("stop_bounced_tasks") or [])
+                    if task_id not in bounced:
+                        bounced.append(task_id)
+                    sess["stop_bounced_tasks"] = bounced[-20:]
+                    sess["last_alert"] = {"kind": "stall", "detail": f"task-{step_idx} bounced", "ts": time.time()}
+                    save_session(cid, sess)
+
+                update_state_field(lambda st: st.__setitem__("hangs_bounced", int(st.get("hangs_bounced") or 0) + 1))
+                append_event(
+                    cid=cid,
+                    event="stop_bounce",
+                    step_idx=step_idx,
+                    tool="run_command",
+                    status="bounced",
+                    detail=f"{task_id} idle/stdin prompt",
+                )
+                log_line(f"[STOP-BOUNCE] cid={cid[:8]} task={task_id} prompt={prompt_hit}")
+
+                snippet = (tail_now or tail_0 or "(no output)").strip().splitlines()
+                tail_preview = " | ".join(snippet[-3:])[-240:]
+                reason = (
+                    "<watchdog>\n"
+                    f"Background command `{task_id}` has produced 0% CPU activity and 0 new output bytes "
+                    f"for {int(round(elapsed))}s (log tail: `{tail_preview}`).\n"
+                    f"Do not wait passively: call `manage_task` with `Action: \"status\"` and `TaskId: \"{task_id}\"` "
+                    "to inspect it, then send input (`send_input`) or terminate it (`kill`) and re-run non-interactively.\n"
+                    "</watchdog>"
+                )
+                print(json.dumps({"decision": "continue", "reason": reason}))
+                return 0
+
+        print(json.dumps({"decision": "stop"}))
+        return 0
+    except Exception:
+        print(json.dumps({"decision": "stop"}))
+        return 0
+
+
+# ---------------------------------------------------------------------------
+# Detached Self-Exiting Hang Watcher (`daemon-loop`)
+# ---------------------------------------------------------------------------
+
+
+def cmd_daemon_loop(_args: argparse.Namespace) -> int:
+    ensure_dirs()
+    try:
+        lock_fh = WATCHER_LOCK.open("a+", encoding="utf-8")
+        try:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            lock_fh.close()
+            return 0
+    except Exception:
+        return 0
+
+    try:
+        lock_fh.seek(0)
+        lock_fh.truncate()
+        lock_fh.write(f"{os.getpid()}\n")
+        lock_fh.flush()
+
+        poll_s = float(os.environ.get("AGY_WATCHDOG_POLL_S") or 3.0)
+        idle_limit = int(os.environ.get("AGY_WATCHDOG_IDLE_TICKS") or 5)
+        idle_ticks = 0
+
+        task_tracker: dict[tuple[str, int], dict[str, Any]] = {}
+        tool_notified: set[tuple[str, str]] = set()
+        model_notified: set[tuple[str, float]] = set()
+
+        while True:
+            state = load_state()
+            if not state.get("enabled", True):
+                break
+
+            any_active = False
+            now = time.time()
+
+            for sfile in sorted(SESSIONS_DIR.glob("*.json")):
+                cid = sanitize_cid(sfile.stem)
+                if not cid:
+                    continue
+
+                if check_presence_unlocked(cid):
+                    with file_lock(session_lock_path(cid)):
+                        sess = load_session(cid)
+                        if sess.get("phase") != "idle" or sess.get("inflight_tools"):
+                            sess["phase"] = "idle"
+                            sess["inflight_tools"] = {}
+                            save_session(cid, sess)
+                            append_event(cid=cid, event="session_closed", status="unlocked")
+                            log_line(f"[SESSION-CLOSED] cid={cid[:8]} presence lock released")
+                    continue
+
+                _db_ok, running_idxs, generating_idxs, waiting_idxs = read_db_active_indices(cid)
+                has_waiting = bool(waiting_idxs)
+                has_running_db = bool(running_idxs)
+                has_generating_db = bool(generating_idxs)
+
+                with file_lock(session_lock_path(cid)):
+                    sess = load_session(cid)
+
+                if has_waiting:
+                    if (sess.get("last_alert") or {}).get("kind") == "stall":
+                        with file_lock(session_lock_path(cid)):
+                            sess = load_session(cid)
+                            if (sess.get("last_alert") or {}).get("kind") == "stall":
+                                sess["last_alert"] = None
+                                save_session(cid, sess)
+                    continue
+
+                phase = str(sess.get("phase") or "idle")
+                agy_pid = sess.get("agy_pid") if isinstance(sess.get("agy_pid"), int) else None
+                inflight = dict(sess.get("inflight_tools") or {})
+
+                if phase in {"model", "tool", "bg_wait"} or has_running_db or has_generating_db:
+                    any_active = True
+
+                # 1. Sync tool / MCP stall check (no task-<idx>.log)
+                for tool_id, tinfo in inflight.items():
+                    if not isinstance(tinfo, dict):
+                        continue
+                    s_idx = tinfo.get("step_idx")
+                    has_task_log = False
+                    if isinstance(s_idx, int):
+                        tlog = CLI_DATA_DIR / "brain" / cid / ".system_generated" / "tasks" / f"task-{s_idx}.log"
+                        has_task_log = tlog.is_file()
+                    if (has_running_db or phase == "tool") and not has_task_log:
+                        elapsed = now - float(tinfo.get("started_epoch") or now)
+                        if elapsed >= float(state.get("tool_warn_s", 60)):
+                            tname = str(tinfo.get("name") or "tool")
+                            with file_lock(session_lock_path(cid)):
+                                sess = load_session(cid)
+                                sess["last_alert"] = {
+                                    "kind": "stall",
+                                    "detail": f"{tname} {int(elapsed)}s",
+                                    "ts": now,
+                                }
+                                save_session(cid, sess)
+                            if (cid, tool_id) not in tool_notified:
+                                tool_notified.add((cid, tool_id))
+                                send_desktop_alert(
+                                    "Antigravity Watchdog — Sync Tool Stall",
+                                    f"Session {cid[:8]}: `{tname}` running {int(elapsed)}s (press Esc if wedged).",
+                                )
+                                append_event(
+                                    cid=cid,
+                                    event="tool_stall_alert",
+                                    step_idx=s_idx if isinstance(s_idx, int) else None,
+                                    tool_id=tool_id,
+                                    tool=tname,
+                                    detail=f"{int(elapsed)}s",
+                                )
+                                log_line(f"[TOOL-STALL] cid={cid[:8]} tool={tname} {int(elapsed)}s")
+
+                # 2. Model generation stall check
+                model_started_epoch = float(sess.get("model_started_epoch") or 0.0)
+                if has_generating_db and model_started_epoch > 0:
+                    m_elapsed = now - model_started_epoch
+                    if m_elapsed >= float(state.get("model_warn_s", 90)):
+                        with file_lock(session_lock_path(cid)):
+                            sess = load_session(cid)
+                            sess["last_alert"] = {
+                                "kind": "stall",
+                                "detail": f"model {int(m_elapsed)}s",
+                                "ts": now,
+                            }
+                            save_session(cid, sess)
+                        if m_elapsed >= 180 and (cid, model_started_epoch) not in model_notified:
+                            model_notified.add((cid, model_started_epoch))
+                            send_desktop_alert(
+                                "Antigravity Watchdog — Model Stream Stall",
+                                f"Session {cid[:8]}: model response open {int(m_elapsed)}s.",
+                            )
+                            append_event(cid=cid, event="model_stall_alert", detail=f"{int(m_elapsed)}s")
+                            log_line(f"[MODEL-STALL] cid={cid[:8]} {int(m_elapsed)}s")
+
+                # 3. Late background task stall check + surgical child-shell recovery
+                bg_tasks = find_running_bg_tasks(cid) if (phase == "bg_wait" or has_running_db) else []
+                if bg_tasks:
+                    any_active = True
+                    cpu_ticks, child_shells = sample_agy_child_shells(agy_pid)
+                    for task in bg_tasks:
+                        s_idx = int(task["step_idx"])
+                        size, tail = read_task_log_tail(cid, s_idx)
+                        key = (cid, s_idx)
+                        tr = task_tracker.get(key)
+                        if tr is None:
+                            task_tracker[key] = {
+                                "last_size": size,
+                                "last_cpu": cpu_ticks,
+                                "last_active_ts": now,
+                                "notified": False,
+                                "killed": False,
+                            }
+                            continue
+
+                        if size > tr["last_size"] or cpu_ticks > tr["last_cpu"]:
+                            tr["last_size"] = size
+                            tr["last_cpu"] = cpu_ticks
+                            tr["last_active_ts"] = now
+                            tr["notified"] = False
+                            if (sess.get("last_alert") or {}).get("kind") == "stall":
+                                with file_lock(session_lock_path(cid)):
+                                    sess = load_session(cid)
+                                    if (sess.get("last_alert") or {}).get("kind") == "stall":
+                                        sess["last_alert"] = None
+                                        save_session(cid, sess)
+                            continue
+
+                        stall_s = now - float(tr["last_active_ts"])
+                        prompt_hit = bool(STDIN_PROMPT_RE.search(tail))
+                        threshold = 20.0 if prompt_hit else float(state.get("bg_hang_s", 90))
+                        if stall_s >= threshold and not tr["killed"]:
+                            with file_lock(session_lock_path(cid)):
+                                sess = load_session(cid)
+                                sess["last_alert"] = {
+                                    "kind": "stall",
+                                    "detail": f"task-{s_idx} {int(stall_s)}s",
+                                    "ts": now,
+                                }
+                                save_session(cid, sess)
+
+                            if not tr["notified"]:
+                                tr["notified"] = True
+                                send_desktop_alert(
+                                    "Antigravity Watchdog — Background Task Stall",
+                                    f"Session {cid[:8]}: task-{s_idx} stalled {int(stall_s)}s (0% CPU, 0 bytes).",
+                                )
+                                append_event(
+                                    cid=cid,
+                                    event="late_stall_alert",
+                                    step_idx=s_idx,
+                                    tool="run_command",
+                                    detail=f"{int(stall_s)}s prompt={prompt_hit}",
+                                )
+                                log_line(f"[LATE-STALL] cid={cid[:8]} task-{s_idx} {int(stall_s)}s")
+
+                            if state.get("auto_kill_late_hangs", True) and agy_pid and len(child_shells) == 1:
+                                c_pid, c_pgrp, _comm = child_shells[0]
+                                if kill_child_shell_safely(agy_pid, c_pid, c_pgrp):
+                                    tr["killed"] = True
+                                    with file_lock(session_lock_path(cid)):
+                                        sess = load_session(cid)
+                                        pending = list(sess.get("pending_guidance") or [])
+                                        pending.append(
+                                            f"Background task `task-{s_idx}` stalled at 0% CPU and 0 new output "
+                                            f"for {int(stall_s)}s and was terminated by Watchdog so the session could "
+                                            "recover. Inspect its partial output and re-run with non-interactive flags."
+                                        )
+                                        sess["pending_guidance"] = pending
+                                        save_session(cid, sess)
+                                    update_state_field(
+                                        lambda st: st.__setitem__(
+                                            "late_hangs_killed", int(st.get("late_hangs_killed") or 0) + 1
+                                        )
+                                    )
+                                    append_event(
+                                        cid=cid,
+                                        event="late_hang_killed",
+                                        step_idx=s_idx,
+                                        tool="run_command",
+                                        status="sigterm",
+                                        detail=f"child_pid={c_pid} stall_s={int(stall_s)}",
+                                    )
+                                    log_line(f"[AUTO-KILL] cid={cid[:8]} task-{s_idx} child_pid={c_pid}")
+
+            if any_active:
+                idle_ticks = 0
+            else:
+                idle_ticks += 1
+                if idle_ticks >= idle_limit:
+                    break
+
+            time.sleep(poll_s)
+    finally:
+        with contextlib.suppress(Exception):
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+        with contextlib.suppress(Exception):
+            lock_fh.close()
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# User CLI Commands
+# ---------------------------------------------------------------------------
+
+
+def _is_watcher_alive() -> bool:
+    if not WATCHER_LOCK.is_file():
+        return False
+    try:
+        with WATCHER_LOCK.open("r+", encoding="utf-8") as fh:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            return False
+    except Exception:
+        return False
+
+
+def cmd_status(_args: argparse.Namespace) -> int:
+    st = load_state()
+    alive = _is_watcher_alive()
+    print(
+        f"agy-watch: {'ENABLED' if st.get('enabled', True) else 'DISABLED'} "
+        f"| auto_kill={bool(st.get('auto_kill_late_hangs', True))} "
+        f"| watcher={'RUNNING' if alive else 'idle (stopped)'}"
+    )
+    print(
+        f"thresholds: model={st['model_warn_s']}s tool={st['tool_warn_s']}s "
+        f"stdin={st['stdin_prompt_s']}s bounce={st['stop_idle_bounce_s']}s bg_hang={st['bg_hang_s']}s"
+    )
+    print(
+        f"counters: loops_blocked={st['loops_blocked']} thrash_pivots={st['thrash_pivots']} "
+        f"hangs_bounced={st['hangs_bounced']} late_hangs_killed={st['late_hangs_killed']}"
+    )
+    if SESSIONS_DIR.is_dir():
+        sessions = sorted(SESSIONS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)[:8]
+        if sessions:
+            print("recent sessions:")
+            for sp in sessions:
+                s = load_session(sp.stem)
+                alert = s.get("last_alert")
+                alert_s = f" alert={alert['kind']}:{alert['detail']}" if isinstance(alert, dict) else ""
+                print(
+                    f"  {sp.stem[:8]} phase={s.get('phase')} turn_tools={s.get('turn_tool_count')} "
+                    f"inflight={len(s.get('inflight_tools') or {})}{alert_s}"
+                )
+    return 0
+
+
+def cmd_toggle(enabled: bool) -> int:
+    st = update_state_field(lambda s: s.__setitem__("enabled", enabled))
+    print(f"agy-watch: {'ENABLED' if st['enabled'] else 'DISABLED'}")
+    return 0
+
+
+def cmd_autokill(enabled: bool) -> int:
+    st = update_state_field(lambda s: s.__setitem__("auto_kill_late_hangs", enabled))
+    print(f"agy-watch auto_kill_late_hangs: {bool(st['auto_kill_late_hangs'])}")
+    return 0
+
+
+def cmd_tail_file(path: Path, n: int) -> int:
+    if not path.is_file():
+        print(f"(no file yet: {path})")
+        return 0
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    for line in lines[-max(1, n) :]:
+        print(line)
+    return 0
+
+
+def cmd_reset(_args: argparse.Namespace) -> int:
+    ensure_dirs()
+    with file_lock(STATE_LOCK):
+        st = load_state()
+        for k in ("loops_blocked", "thrash_pivots", "hangs_bounced", "late_hangs_killed"):
+            st[k] = 0
+        atomic_write_json(STATE_FILE, st)
+    if SESSIONS_DIR.is_dir():
+        for p in SESSIONS_DIR.glob("*.json"):
+            with contextlib.suppress(Exception):
+                p.unlink()
+    print("agy-watch: counters and session state reset.")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="agy-watch", description="Zero-token execution watchdog for Antigravity CLI.")
+    sub = p.add_subparsers(dest="cmd")
+
+    sub.add_parser("pre-invocation-hook")
+    sub.add_parser("pre-tool-hook")
+    sub.add_parser("post-tool-hook")
+    sub.add_parser("stop-hook")
+    sub.add_parser("daemon-loop")
+
+    sub.add_parser("status")
+    sub.add_parser("on")
+    sub.add_parser("off")
+    ak = sub.add_parser("autokill")
+    ak.add_argument("mode", choices=["on", "off"])
+
+    lg = sub.add_parser("logs")
+    lg.add_argument("-n", type=int, default=30)
+
+    ev = sub.add_parser("events")
+    ev.add_argument("-n", type=int, default=30)
+
+    sub.add_parser("reset")
+    return p
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    cmd = args.cmd or "status"
+    if cmd == "pre-invocation-hook":
+        return cmd_pre_invocation_hook(args)
+    if cmd == "pre-tool-hook":
+        return cmd_pre_tool_hook(args)
+    if cmd == "post-tool-hook":
+        return cmd_post_tool_hook(args)
+    if cmd == "stop-hook":
+        return cmd_stop_hook(args)
+    if cmd == "daemon-loop":
+        return cmd_daemon_loop(args)
+    if cmd == "status":
+        return cmd_status(args)
+    if cmd == "on":
+        return cmd_toggle(True)
+    if cmd == "off":
+        return cmd_toggle(False)
+    if cmd == "autokill":
+        return cmd_autokill(args.mode == "on")
+    if cmd == "logs":
+        return cmd_tail_file(LOG_FILE, args.n)
+    if cmd == "events":
+        return cmd_tail_file(EVENTS_FILE, args.n)
+    if cmd == "reset":
+        return cmd_reset(args)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
