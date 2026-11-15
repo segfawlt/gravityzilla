@@ -150,6 +150,9 @@ STDIN_PROMPT_RE = re.compile(
 )
 BG_TASK_ID_RE = re.compile(r"Tool is running as a background task with task id:\s*([^\s\n]+)")
 TASK_DESC_RE = re.compile(r"Task Description:\s*(.+)")
+INLINE_ENV_ASSIGN_RE = re.compile(r"(?<![A-Za-z0-9_.-])([A-Za-z_][A-Za-z0-9_]*)=(\S+)")
+SUBAGENT_CID_RE = re.compile(r'"conversationId"\s*:\s*"([A-Za-z0-9_-]{4,128})"')
+USER_REQ_CLEAN_RE = re.compile(r"(?is)<ADDITIONAL_METADATA>.*?</ADDITIONAL_METADATA>|</?USER_REQUEST>")
 
 UUID_RE = re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b")
 ISO_TS_RE = re.compile(r"(?i)\b\d{4}-\d{2}-\d{2}[t ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:z|[+-]\d{2}:?\d{2})?\b")
@@ -246,6 +249,11 @@ def default_session(cid: str) -> dict[str, Any]:
     return {
         "cid": cid,
         "agy_pid": None,
+        "cwd": "",
+        "project": "",
+        "model": "",
+        "parent_cid": "",
+        "role": "",
         "phase": "idle",
         "last_user_input": "",
         "model_started_mono_ns": 0,
@@ -258,11 +266,24 @@ def default_session(cid: str) -> dict[str, Any]:
         "err_cursor_step_idx": -1,
         "consecutive_same_err": {"sig": "", "count": 0, "sample": "", "warned_at": 0},
         "inflight_tools": {},
+        "last_step": None,
         "pending_guidance": [],
         "stop_bounced_tasks": [],
         "last_alert": None,
         "updated_at": 0.0,
     }
+
+
+def _sync_session_meta(sess: dict[str, Any], payload: dict[str, Any]) -> str:
+    """Populate session cwd/project/model from hook payload without clobbering existing metadata."""
+    cwd = extract_cwd(payload)
+    if cwd:
+        sess["cwd"] = cwd
+        sess["project"] = Path(cwd).name or cwd
+    model = str(payload.get("modelName") or "").strip()
+    if model:
+        sess["model"] = model
+    return cwd or str(sess.get("cwd") or "")
 
 
 def load_session(cid: str) -> dict[str, Any]:
@@ -303,6 +324,8 @@ def append_event(
     duration_ms: int | None = None,
     status: str = "",
     detail: str = "",
+    project: str = "",
+    target: str = "",
 ) -> None:
     ensure_dirs()
     record: dict[str, Any] = {
@@ -311,12 +334,16 @@ def append_event(
         "cid": cid,
         "event": event,
     }
+    if project:
+        record["project"] = project
     if step_idx is not None:
         record["step_idx"] = step_idx
     if tool_id:
         record["tool_id"] = tool_id
     if tool:
         record["tool"] = tool
+    if target:
+        record["target"] = target
     if duration_ms is not None:
         record["duration_ms"] = duration_ms
     if status:
@@ -779,8 +806,138 @@ def resolve_transcript_path(cid: str, payload: dict[str, Any] | None = None) -> 
             p = Path(raw_tp).expanduser()
             if p.is_file():
                 return p
-    cand = CLI_DATA_DIR / "brain" / cid / ".system_generated" / "logs" / "transcript.jsonl"
-    return cand if cand.is_file() else None
+    logs_dir = CLI_DATA_DIR / "brain" / cid / ".system_generated" / "logs"
+    for fname in ("transcript.jsonl", "transcript_full.jsonl"):
+        cand = logs_dir / fname
+        if cand.is_file():
+            return cand
+    return None
+
+
+def _trunc_str(text: str, limit: int) -> str:
+    if limit <= 1 or len(text) <= limit:
+        return text[:limit] if limit <= 1 else text
+    return text[: limit - 1].rstrip() + "…"
+
+
+def clean_prompt_preview(raw: str, limit: int = 80) -> str:
+    """Strip wrapper tags and return a single concise line of the user prompt."""
+    cleaned = USER_REQ_CLEAN_RE.sub("", raw or "")
+    for line in cleaned.splitlines():
+        s = WS_RE.sub(" ", line).strip()
+        if s:
+            return _trunc_str(s, limit)
+    return ""
+
+
+def _shorten_target_path(raw: str, cwd: str = "") -> str:
+    """Shorten a file path relative to cwd or home without touching the filesystem."""
+    p = Path(raw)
+    if cwd:
+        cwd_p = Path(cwd)
+        with contextlib.suppress(ValueError):
+            rel = str(p.relative_to(cwd_p))
+            return rel if rel != "." else (cwd_p.name or ".")
+    with contextlib.suppress(ValueError):
+        rel_home = str(p.relative_to(Path.home()))
+        return f"~/{rel_home}" if rel_home != "." else "~"
+    return raw
+
+
+def summarize_tool_target(tname: str, targs: dict[str, Any], cwd: str = "") -> str:
+    """Pure string formatter summarizing tool target arguments (never reads files or env)."""
+    if not isinstance(targs, dict):
+        return ""
+    if tname == "run_command":
+        summary = WS_RE.sub(" ", str(targs.get("toolSummary") or "")).strip()
+        cmd = RTK_PREFIX_RE.sub("", str(targs.get("CommandLine") or "").strip())
+        cmd = INLINE_ENV_ASSIGN_RE.sub(r"\1=***", cmd)
+        cmd = WS_RE.sub(" ", cmd).strip()
+        if summary and cmd:
+            cmd_short = _trunc_str(cmd, 49)
+            return _trunc_str(f"{summary} ({cmd_short})", 78)
+        return _trunc_str(summary or cmd, 78)
+
+    if tname in MUTATING_FILE_TOOLS or tname in {"read_file", "view_file"}:
+        raw = str(targs.get("Path") or targs.get("TargetFile") or targs.get("AbsolutePath") or "").strip()
+        if not raw:
+            return ""
+        short = _shorten_target_path(raw, cwd)
+        if tname in {"read_file", "view_file"}:
+            s_line = targs.get("StartLine")
+            e_line = targs.get("EndLine")
+            if s_line is not None and str(s_line).strip():
+                if e_line is not None and str(e_line).strip():
+                    short = f"{short}:{s_line}-{e_line}"
+                else:
+                    short = f"{short}:{s_line}"
+        return _trunc_str(short, 78)
+
+    if tname in {"grep_search", "find_by_name"}:
+        q = WS_RE.sub(" ", str(targs.get("Query") or targs.get("Pattern") or "")).strip()
+        return _trunc_str(q, 64)
+    if tname == "invoke_subagent":
+        t_type = str(targs.get("TypeName") or "subagent").strip()
+        role = WS_RE.sub(" ", str(targs.get("Role") or "")).strip()
+        return _trunc_str(f"{t_type}: {role}".strip(": "), 72)
+    if tname == "manage_task":
+        act = str(targs.get("Action") or "").strip()
+        tid = str(targs.get("TaskId") or "").split("/")[-1].strip()
+        return _trunc_str(f"{act} {tid}".strip(), 64)
+    if tname == "send_message":
+        rec = str(targs.get("Recipient") or "").strip()
+        return f"-> {rec[:8]}" if rec else ""
+    if tname == "search_web":
+        q = WS_RE.sub(" ", str(targs.get("query") or "")).strip()
+        return _trunc_str(q, 64)
+    if tname == "schedule":
+        dur = targs.get("DurationSeconds")
+        cron = targs.get("CronExpression")
+        if dur is not None and str(dur).strip():
+            return f"{dur}s"
+        return _trunc_str(str(cron or "").strip(), 48)
+    if tname == "exit_plan_mode":
+        return "hand off plan"
+    return ""
+
+
+def _extract_spawned_subagent_cid(cid: str, payload: dict[str, Any] | None, step_idx: int | None) -> str:
+    """Parse transcript tail to extract newly created subagent conversationId."""
+    tpath = resolve_transcript_path(cid, payload)
+    if not tpath or not tpath.is_file():
+        return ""
+    try:
+        size = tpath.stat().st_size
+        with tpath.open("rb") as fh:
+            if size > 16384:
+                fh.seek(size - 16384)
+                fh.readline()
+            lines = fh.read().decode("utf-8", errors="replace").splitlines()
+    except Exception:
+        return ""
+
+    fallback_cid = ""
+    for raw in reversed(lines):
+        if not raw.strip():
+            continue
+        try:
+            d = json.loads(raw)
+        except Exception:
+            continue
+        if not isinstance(d, dict) or d.get("type") != "GENERIC":
+            continue
+        content = str(d.get("content") or "")
+        m = SUBAGENT_CID_RE.search(content)
+        if not m:
+            continue
+        found = sanitize_cid(m.group(1))
+        if not found or found == cid:
+            continue
+        if step_idx is not None and d.get("step_index") == step_idx:
+            return found
+        if not fallback_cid and "Created the following subagent:" in content and step_idx is None:
+            fallback_cid = found
+    return fallback_cid
 
 
 def _reset_error_hits(sess: dict[str, Any]) -> None:
@@ -939,21 +1096,33 @@ def ensure_watcher_running() -> None:
         )
 
 
-def check_presence_unlocked(cid: str) -> bool:
-    """Return True only when presence/<cid>.lock exists and is NOT locked by a live agy."""
+def _probe_presence_lock(cid: str) -> tuple[bool, bool]:
+    """Return (lock_file_exists, is_currently_locked_by_agy)."""
     lock_path = CLI_DATA_DIR / "presence" / f"{cid}.lock"
     if not lock_path.is_file():
-        return False
+        return False, False
     try:
         with lock_path.open("r+", encoding="utf-8") as fh:
             try:
                 fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
-                return False
+                return True, True
             fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-            return True
+            return True, False
     except Exception:
-        return False
+        return True, False
+
+
+def is_presence_locked(cid: str) -> bool:
+    """Return True only when presence/<cid>.lock exists and IS locked by a live agy."""
+    exists, locked = _probe_presence_lock(cid)
+    return exists and locked
+
+
+def check_presence_unlocked(cid: str) -> bool:
+    """Return True only when presence/<cid>.lock exists and is NOT locked by a live agy."""
+    exists, locked = _probe_presence_lock(cid)
+    return exists and not locked
 
 
 # ---------------------------------------------------------------------------
@@ -994,6 +1163,8 @@ def cmd_pre_invocation_hook(_args: argparse.Namespace) -> int:
             sess = load_session(cid)
             if agy_pid:
                 sess["agy_pid"] = agy_pid
+            _sync_session_meta(sess, payload)
+            proj = str(sess.get("project") or "")
 
             if user_in and user_in != sess.get("last_user_input"):
                 sess["last_user_input"] = user_in
@@ -1044,7 +1215,7 @@ def cmd_pre_invocation_hook(_args: argparse.Namespace) -> int:
             update_state_field(lambda st: st.__setitem__("thrash_pivots", int(st.get("thrash_pivots") or 0) + 1))
             log_line(f"[THRASH] cid={cid[:8]} err_count={err_cnt}")
 
-        append_event(cid=cid, event="model_start")
+        append_event(cid=cid, event="model_start", project=proj)
         ensure_watcher_running()
 
         if inject_msgs:
@@ -1092,11 +1263,16 @@ def cmd_pre_tool_hook(_args: argparse.Namespace) -> int:
 
         model_dur_ms: int | None = None
         blocked_reason = ""
+        proj = ""
+        target = ""
 
         with file_lock(session_lock_path(cid)):
             sess = load_session(cid)
             if agy_pid:
                 sess["agy_pid"] = agy_pid
+            cwd = _sync_session_meta(sess, payload)
+            proj = str(sess.get("project") or "")
+            target = summarize_tool_target(tname, targs, cwd)
 
             if sess.get("phase") == "model" and int(sess.get("model_started_mono_ns") or 0) > 0:
                 model_dur_ms = max(0, (mono_ns - int(sess["model_started_mono_ns"])) // 1_000_000)
@@ -1131,6 +1307,7 @@ def cmd_pre_tool_hook(_args: argparse.Namespace) -> int:
                     "started_epoch": now,
                     "step_idx": step_idx,
                     "name": tname,
+                    "target": target,
                     "args_hash": args_hash,
                     "notified": False,
                 }
@@ -1138,7 +1315,7 @@ def cmd_pre_tool_hook(_args: argparse.Namespace) -> int:
                 save_session(cid, sess)
 
         if model_dur_ms is not None:
-            append_event(cid=cid, event="model_done", duration_ms=model_dur_ms, status="ok")
+            append_event(cid=cid, event="model_done", duration_ms=model_dur_ms, status="ok", project=proj)
 
         if blocked_reason:
             update_state_field(lambda st: st.__setitem__("loops_blocked", int(st.get("loops_blocked") or 0) + 1))
@@ -1150,12 +1327,14 @@ def cmd_pre_tool_hook(_args: argparse.Namespace) -> int:
                 tool=tname,
                 status="denied",
                 detail="3x identical call with unchanged ws_sig",
+                project=proj,
+                target=target,
             )
             log_line(f"[LOOP-BLOCK] cid={cid[:8]} tool={tname} step={step_idx}")
             print(json.dumps({"decision": "deny", "reason": blocked_reason}))
             return 0
 
-        append_event(cid=cid, event="tool_start", step_idx=step_idx, tool_id=tool_id, tool=tname)
+        append_event(cid=cid, event="tool_start", step_idx=step_idx, tool_id=tool_id, tool=tname, project=proj, target=target)
         ensure_watcher_running()
         print(json.dumps({"decision": "allow"}))
         return 0
@@ -1189,8 +1368,12 @@ def cmd_post_tool_hook(_args: argparse.Namespace) -> int:
         mono_ns = time.monotonic_ns()
 
         duration_ms = 0
+        proj = ""
+        target = ""
         with file_lock(session_lock_path(cid)):
             sess = load_session(cid)
+            cwd = _sync_session_meta(sess, payload)
+            proj = str(sess.get("project") or "")
             inflight = sess.get("inflight_tools") or {}
             tinfo = inflight.pop(tool_id, None)
             if tinfo is None and step_idx is not None:
@@ -1201,8 +1384,21 @@ def cmd_post_tool_hook(_args: argparse.Namespace) -> int:
             if isinstance(tinfo, dict) and int(tinfo.get("started_mono_ns") or 0) > 0:
                 duration_ms = max(0, (mono_ns - int(tinfo["started_mono_ns"])) // 1_000_000)
 
+            target = summarize_tool_target(tname, targs, cwd)
+            if not target and isinstance(tinfo, dict):
+                target = str(tinfo.get("target") or "")
+
             sess["inflight_tools"] = inflight
             sess["turn_tool_count"] = int(sess.get("turn_tool_count") or 0) + 1
+            sess["last_step"] = {
+                "event": "tool_done",
+                "step_idx": step_idx,
+                "tool": tname,
+                "target": target,
+                "duration_ms": duration_ms,
+                "status": "error" if err else "ok",
+                "ts": time.time(),
+            }
             if not inflight and (sess.get("last_alert") or {}).get("kind") == "stall":
                 sess["last_alert"] = None
 
@@ -1244,6 +1440,21 @@ def cmd_post_tool_hook(_args: argparse.Namespace) -> int:
 
             save_session(cid, sess)
 
+        if tname == "invoke_subagent" and not err:
+            child_cid = _extract_spawned_subagent_cid(cid, payload, step_idx)
+            role = WS_RE.sub(" ", str(targs.get("Role") or targs.get("TypeName") or "")).strip()[:72]
+            if child_cid and child_cid != cid:
+                with file_lock(session_lock_path(child_cid)):
+                    child_sess = load_session(child_cid)
+                    child_sess["parent_cid"] = cid
+                    if role:
+                        child_sess["role"] = role
+                    if cwd and not child_sess.get("cwd"):
+                        child_sess["cwd"] = cwd
+                    if proj and not child_sess.get("project"):
+                        child_sess["project"] = proj
+                    save_session(child_cid, child_sess)
+
         append_event(
             cid=cid,
             event="tool_done",
@@ -1253,6 +1464,8 @@ def cmd_post_tool_hook(_args: argparse.Namespace) -> int:
             duration_ms=duration_ms,
             status="error" if err else "ok",
             detail=err.splitlines()[0][:160] if err else "",
+            project=proj,
+            target=target,
         )
         print("{}")
         return 0
@@ -1284,12 +1497,15 @@ def cmd_stop_hook(_args: argparse.Namespace) -> int:
 
         model_dur_ms: int | None = None
         bounced_tasks: list[str] = []
+        proj = ""
         with file_lock(session_lock_path(cid)):
             sess = load_session(cid)
             if agy_pid:
                 sess["agy_pid"] = agy_pid
             else:
                 agy_pid = sess.get("agy_pid")
+            _sync_session_meta(sess, payload)
+            proj = str(sess.get("project") or "")
             if sess.get("phase") == "model" and int(sess.get("model_started_mono_ns") or 0) > 0:
                 model_dur_ms = max(0, (mono_ns - int(sess["model_started_mono_ns"])) // 1_000_000)
 
@@ -1303,12 +1519,13 @@ def cmd_stop_hook(_args: argparse.Namespace) -> int:
                 save_session(cid, sess)
 
         if model_dur_ms is not None:
-            append_event(cid=cid, event="model_done", duration_ms=model_dur_ms, status="ok")
+            append_event(cid=cid, event="model_done", duration_ms=model_dur_ms, status="ok", project=proj)
         append_event(
             cid=cid,
             event="turn_stop",
             status=term_reason or "UNKNOWN",
             detail=f"fullyIdle={fully_idle}",
+            project=proj,
         )
 
         if fully_idle is not False:
@@ -1367,6 +1584,7 @@ def cmd_stop_hook(_args: argparse.Namespace) -> int:
                     tool="run_command",
                     status="bounced",
                     detail=f"{task_id} idle/stdin prompt",
+                    project=proj,
                 )
                 log_line(f"[STOP-BOUNCE] cid={cid[:8]} task={task_id} prompt={prompt_hit}")
 
@@ -1699,6 +1917,682 @@ def cmd_status(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _make_styler(mode: str) -> dict[str, str]:
+    use_color = mode == "always" or (mode == "auto" and sys.stdout.isatty() and "NO_COLOR" not in os.environ)
+    if not use_color:
+        return {k: "" for k in ("bold", "dim", "red", "yellow", "green", "cyan", "blue", "magenta", "reset")}
+    return {
+        "bold": "\033[1m",
+        "dim": "\033[2m",
+        "red": "\033[31m",
+        "yellow": "\033[33m",
+        "green": "\033[32m",
+        "cyan": "\033[36m",
+        "blue": "\033[34m",
+        "magenta": "\033[35m",
+        "reset": "\033[0m",
+    }
+
+
+def _probe_all_presence_locks() -> dict[str, bool]:
+    """Return {cid: is_locked} across all presence/*.lock files."""
+    pdir = CLI_DATA_DIR / "presence"
+    if not pdir.is_dir():
+        return {}
+    result: dict[str, bool] = {}
+    for lp in pdir.glob("*.lock"):
+        cid = sanitize_cid(lp.stem)
+        if not cid:
+            continue
+        result[cid] = is_presence_locked(cid)
+    return result
+
+
+def collect_session_snapshots(include_closed: bool = False, cid_prefix: str = "") -> list[dict[str, Any]]:
+    """Build normalized, hierarchically ordered session snapshots across active & recent agy sessions."""
+    presence_state = _probe_all_presence_locks()
+    any_presence_files = bool(presence_state)
+
+    candidate_cids: set[str] = set()
+    if SESSIONS_DIR.is_dir():
+        for sp in SESSIONS_DIR.glob("*.json"):
+            scid = sanitize_cid(sp.stem)
+            if scid:
+                candidate_cids.add(scid)
+    for pcid, is_locked in presence_state.items():
+        if is_locked or include_closed:
+            candidate_cids.add(pcid)
+
+    now = time.time()
+    items: list[dict[str, Any]] = []
+    for cid in sorted(candidate_cids):
+        sess = load_session(cid)
+        presence_file = cid in presence_state
+        presence_locked = presence_state.get(cid, False)
+
+        if presence_file and not presence_locked and not include_closed:
+            continue
+
+        _db_ok, running_idxs, generating_idxs, waiting_idxs = read_db_active_indices(cid)
+        agy_pid = sess.get("agy_pid") if isinstance(sess.get("agy_pid"), int) else None
+        pid_alive = bool(agy_pid and agy_pid > 1 and _read_proc_stat(agy_pid) is not None)
+
+        if presence_file:
+            kind = "main"
+        elif sess.get("parent_cid") or sess.get("role") or any_presence_files:
+            kind = "subagent"
+        else:
+            kind = "main"
+
+        if presence_file:
+            live = presence_locked
+        else:
+            live = (
+                sess.get("phase") in {"model", "tool", "bg_wait"}
+                or bool(running_idxs or generating_idxs or waiting_idxs)
+            ) and (pid_alive or agy_pid is None)
+
+        if not live and not include_closed:
+            continue
+
+        raw_inflight = sess.get("inflight_tools") or {}
+        inflight_sortable: list[tuple[float, dict[str, Any]]] = []
+        if isinstance(raw_inflight, dict):
+            for tool_id, tinfo in raw_inflight.items():
+                if not isinstance(tinfo, dict):
+                    continue
+                st_epoch = float(tinfo.get("started_epoch") or now)
+                inflight_sortable.append(
+                    (
+                        st_epoch,
+                        {
+                            "tool_id": str(tool_id),
+                            "step_idx": tinfo.get("step_idx"),
+                            "name": str(tinfo.get("name") or ""),
+                            "target": str(tinfo.get("target") or ""),
+                            "elapsed_s": round(max(0.0, now - st_epoch), 1),
+                        },
+                    )
+                )
+        inflight_sortable.sort(key=lambda pair: pair[0])
+        inflight_list = [entry for _ts, entry in inflight_sortable]
+
+        bg_tasks: list[dict[str, Any]] = []
+        if live and (sess.get("phase") in {"bg_wait", "tool"} or running_idxs):
+            for t in find_running_bg_tasks(cid):
+                s_idx = int(t["step_idx"])
+                log_bytes, raw_tail = read_task_log_tail(cid, s_idx, max_bytes=384)
+                tail_lines = [ln.strip() for ln in raw_tail.splitlines() if ln.strip()]
+                log_tail = _trunc_str(WS_RE.sub(" ", tail_lines[-1]), 96) if tail_lines else ""
+                bg_tasks.append(
+                    {
+                        "step_idx": s_idx,
+                        "task_id": str(t.get("task_id") or ""),
+                        "desc": _trunc_str(WS_RE.sub(" ", str(t.get("desc") or "")).strip(), 78),
+                        "log_bytes": log_bytes,
+                        "log_tail": log_tail,
+                    }
+                )
+
+        last_alert = sess.get("last_alert") if isinstance(sess.get("last_alert"), dict) else None
+        model_started = float(sess.get("model_started_epoch") or 0.0)
+        updated_at = float(sess.get("updated_at") or 0.0)
+        if not updated_at and session_path(cid).is_file():
+            with contextlib.suppress(Exception):
+                updated_at = session_path(cid).stat().st_mtime
+
+        elapsed_s = 0.0
+        if live and waiting_idxs:
+            st_name = "waiting_approval"
+            if inflight_list:
+                elapsed_s = max(x["elapsed_s"] for x in inflight_list)
+            elif model_started > 0:
+                elapsed_s = max(0.0, now - model_started)
+        elif live and isinstance(last_alert, dict) and last_alert.get("kind") == "stall":
+            st_name = "stalled"
+            if inflight_list:
+                elapsed_s = max(x["elapsed_s"] for x in inflight_list)
+            elif last_alert.get("ts"):
+                elapsed_s = max(0.0, now - float(last_alert["ts"]))
+        elif live and inflight_list:
+            st_name = "tool"
+            elapsed_s = max(x["elapsed_s"] for x in inflight_list)
+        elif live and (sess.get("phase") == "model" or generating_idxs):
+            st_name = "model"
+            if model_started > 0:
+                elapsed_s = max(0.0, now - model_started)
+        elif live and (sess.get("phase") == "bg_wait" or bg_tasks):
+            st_name = "bg_wait"
+            if updated_at > 0:
+                elapsed_s = max(0.0, now - updated_at)
+        else:
+            st_name = "idle"
+            elapsed_s = 0.0
+
+        cwd_val = str(sess.get("cwd") or "")
+        proj_val = str(sess.get("project") or "") or (Path(cwd_val).name if cwd_val else "")
+        items.append(
+            {
+                "cid": cid,
+                "kind": kind,
+                "parent_cid": str(sess.get("parent_cid") or ""),
+                "role": str(sess.get("role") or ""),
+                "live": live,
+                "state": st_name,
+                "elapsed_s": round(max(0.0, elapsed_s), 1),
+                "phase": str(sess.get("phase") or "idle"),
+                "agy_pid": agy_pid,
+                "cwd": cwd_val,
+                "project": proj_val,
+                "model": str(sess.get("model") or ""),
+                "turn_tool_count": int(sess.get("turn_tool_count") or 0),
+                "prompt_preview": clean_prompt_preview(str(sess.get("last_user_input") or "")),
+                "inflight": inflight_list,
+                "bg_tasks": bg_tasks,
+                "last_step": sess.get("last_step") if isinstance(sess.get("last_step"), dict) else None,
+                "last_alert": last_alert,
+                "updated_at": round(updated_at, 3),
+            }
+        )
+
+    pid_to_main = {
+        item["agy_pid"]: item["cid"]
+        for item in items
+        if item["kind"] == "main" and item["live"] and item["agy_pid"]
+    }
+    for item in items:
+        if item["kind"] == "subagent" and not item["parent_cid"] and item["agy_pid"] in pid_to_main:
+            item["parent_cid"] = pid_to_main[item["agy_pid"]]
+
+    filtered = [
+        item
+        for item in items
+        if (item["live"] or include_closed)
+        and (
+            not cid_prefix
+            or item["cid"].startswith(cid_prefix)
+            or item["parent_cid"].startswith(cid_prefix)
+        )
+    ]
+
+    visible_cids = {item["cid"] for item in filtered}
+    children_map: dict[str, list[dict[str, Any]]] = {}
+    roots: list[dict[str, Any]] = []
+    for item in filtered:
+        pcid = item["parent_cid"]
+        if pcid and pcid in visible_cids:
+            children_map.setdefault(pcid, []).append(item)
+        else:
+            roots.append(item)
+
+    sort_key = lambda x: (not x["live"], -float(x["updated_at"]), x["cid"])
+    roots.sort(key=sort_key)
+    for clist in children_map.values():
+        clist.sort(key=sort_key)
+
+    ordered: list[dict[str, Any]] = []
+    visited: set[str] = set()
+
+    def _emit_tree(node: dict[str, Any]) -> None:
+        if node["cid"] in visited:
+            return
+        visited.add(node["cid"])
+        ordered.append(node)
+        for child in children_map.get(node["cid"], ()):
+            _emit_tree(child)
+
+    for root in roots:
+        _emit_tree(root)
+    return ordered
+
+
+def _fmt_elapsed(seconds: float) -> str:
+    if seconds <= 0:
+        return ""
+    if seconds < 10:
+        return f"{seconds:.1f}s"
+    if seconds < 60:
+        return f"{int(round(seconds))}s"
+    mins, secs = divmod(int(seconds), 60)
+    return f"{mins}m{secs:02d}s"
+
+
+def render_ps_human(
+    snapshots: list[dict[str, Any]],
+    state: dict[str, Any],
+    watcher_alive: bool,
+    color_mode: str = "auto",
+) -> str:
+    c = _make_styler(color_mode)
+    live_cnt = sum(1 for s in snapshots if s["live"])
+    enabled_tag = "" if state.get("enabled", True) else f" {c['red']}[DISABLED]{c['reset']}"
+    watcher_s = f"{c['green']}RUNNING{c['reset']}" if watcher_alive else f"{c['dim']}idle{c['reset']}"
+    lines = [f"{c['bold']}agy-watch ps{c['reset']}{enabled_tag} | {live_cnt} live | watcher: {watcher_s}"]
+
+    if not snapshots:
+        lines.append(f"  {c['dim']}(no active agy sessions — pass --all to view closed sessions){c['reset']}")
+        return "\n".join(lines)
+
+    visible_cids = {s["cid"] for s in snapshots}
+    state_style = {
+        "waiting_approval": ("⏸", "WAITING APPROVAL", f"{c['yellow']}{c['bold']}"),
+        "stalled": ("!", "stalled", f"{c['red']}{c['bold']}"),
+        "tool": ("▶", "tool", c["cyan"]),
+        "model": ("◈", "model", c["blue"]),
+        "bg_wait": ("⏳", "bg_wait", c["magenta"]),
+        "idle": ("·", "idle", c["green"]),
+    }
+
+    for s in snapshots:
+        is_child = bool(s["kind"] == "subagent" and s["parent_cid"] and s["parent_cid"] in visible_cids)
+        indent = "  └─ " if is_child else ""
+        sub_pad = "       " if is_child else "  "
+
+        if not s["live"] and s["state"] == "idle":
+            glyph, st_txt, st_col = "○", "closed", c["dim"]
+        else:
+            glyph, st_txt, st_col = state_style.get(s["state"], ("·", s["state"], ""))
+
+        if s["kind"] == "subagent":
+            role_lbl = s["role"] or "subagent"
+            proj_sfx = f" ({s['project']})" if not is_child and s["project"] else ""
+            label = f"[{role_lbl}]{proj_sfx}"
+        else:
+            label = f"[{s['project'] or 'unknown'}]"
+
+        el_txt = _fmt_elapsed(float(s["elapsed_s"] or 0.0))
+        el_part = f" {el_txt}" if el_txt else ""
+        closed_tag = f" {c['dim']}closed{c['reset']}" if not s["live"] and st_txt != "closed" else ""
+        lines.append(
+            f"{indent}{st_col}{glyph}{c['reset']} {c['bold']}{s['cid'][:8]}{c['reset']} "
+            f"{label}  {st_col}{st_txt}{el_part}{c['reset']}  "
+            f"{c['dim']}tools:{s['turn_tool_count']}{c['reset']}{closed_tag}"
+        )
+
+        if s["prompt_preview"] and s["kind"] == "main":
+            lines.append(f"{sub_pad}{c['dim']}prompt:{c['reset']} \"{s['prompt_preview']}\"")
+
+        for t in s["inflight"]:
+            t_el = _fmt_elapsed(float(t.get("elapsed_s") or 0.0)) or "0.0s"
+            tgt = f": {t['target']}" if t.get("target") else ""
+            lines.append(f"{sub_pad}{c['cyan']}▶ {t.get('name', '')} ({t_el}){tgt}{c['reset']}")
+
+        for bt in s["bg_tasks"]:
+            bt_info = bt.get("log_tail") or bt.get("desc") or ""
+            bt_sfx = f": {bt_info}" if bt_info else ""
+            lines.append(
+                f"{sub_pad}{c['magenta']}⏳ task-{bt['step_idx']} ({bt['log_bytes']}B){bt_sfx}{c['reset']}"
+            )
+
+        if s["state"] == "idle" and isinstance(s.get("last_step"), dict):
+            ls = s["last_step"]
+            ls_tgt = f" {ls['target']}" if ls.get("target") else ""
+            lines.append(
+                f"{sub_pad}{c['dim']}last: {ls.get('tool', '')}{ls_tgt} "
+                f"({ls.get('duration_ms', 0)}ms, {ls.get('status', '')}){c['reset']}"
+            )
+
+        if isinstance(s.get("last_alert"), dict):
+            la = s["last_alert"]
+            lines.append(f"{sub_pad}{c['red']}! alert: {la.get('kind', '')}:{la.get('detail', '')}{c['reset']}")
+
+    return "\n".join(lines)
+
+
+def _ps_json_payload(include_closed: bool, cid_prefix: str) -> dict[str, Any]:
+    st = load_state()
+    return {
+        "ts": utc_iso_now(),
+        "enabled": bool(st.get("enabled", True)),
+        "watcher_running": _is_watcher_alive(),
+        "counters": {
+            "loops_blocked": int(st.get("loops_blocked") or 0),
+            "thrash_pivots": int(st.get("thrash_pivots") or 0),
+            "hangs_bounced": int(st.get("hangs_bounced") or 0),
+            "late_hangs_killed": int(st.get("late_hangs_killed") or 0),
+        },
+        "sessions": collect_session_snapshots(include_closed=include_closed, cid_prefix=cid_prefix),
+    }
+
+
+def cmd_ps(args: argparse.Namespace) -> int:
+    include_closed = bool(args.all)
+    cid_prefix = str(args.cid or "").strip()
+    watch_interval = args.watch
+    use_json = bool(args.json)
+    color_mode = str(args.color or "auto")
+
+    if watch_interval is None:
+        if use_json:
+            print(json.dumps(_ps_json_payload(include_closed, cid_prefix), indent=2, ensure_ascii=True))
+        else:
+            st = load_state()
+            snaps = collect_session_snapshots(include_closed=include_closed, cid_prefix=cid_prefix)
+            print(render_ps_human(snaps, st, _is_watcher_alive(), color_mode=color_mode))
+        return 0
+
+    sleep_s = max(0.1, float(watch_interval))
+    is_tty = sys.stdout.isatty()
+    while True:
+        if use_json:
+            print(
+                json.dumps(_ps_json_payload(include_closed, cid_prefix), ensure_ascii=True, separators=(",", ":")),
+                flush=True,
+            )
+        else:
+            st = load_state()
+            snaps = collect_session_snapshots(include_closed=include_closed, cid_prefix=cid_prefix)
+            frame = render_ps_human(snaps, st, _is_watcher_alive(), color_mode=color_mode)
+            if is_tty:
+                sys.stdout.write("\033[2J\033[H" + frame + "\n")
+                sys.stdout.flush()
+            else:
+                print(frame, flush=True)
+                print("---", flush=True)
+        time.sleep(sleep_s)
+
+
+def _format_local_hms(iso_ts: str) -> str:
+    if not iso_ts:
+        return "--:--:--"
+    try:
+        norm = iso_ts[:-1] + "+00:00" if iso_ts.endswith("Z") else iso_ts
+        parsed = dt.datetime.fromisoformat(norm)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=dt.timezone.utc)
+        return parsed.astimezone().strftime("%H:%M:%S")
+    except Exception:
+        return iso_ts[11:19] if len(iso_ts) >= 19 else "--:--:--"
+
+
+def _load_session_labels_cache(cache: dict[str, tuple[float, dict[str, str]]]) -> None:
+    if not SESSIONS_DIR.is_dir():
+        return
+    for sp in SESSIONS_DIR.glob("*.json"):
+        cid = sanitize_cid(sp.stem)
+        if not cid:
+            continue
+        with contextlib.suppress(Exception):
+            mtime = sp.stat().st_mtime
+            prev = cache.get(cid)
+            if prev is not None and prev[0] == mtime:
+                continue
+            s = load_session(cid)
+            cwd_val = str(s.get("cwd") or "")
+            proj = str(s.get("project") or "") or (Path(cwd_val).name if cwd_val else "")
+            role = str(s.get("role") or "")
+            is_sub = bool(s.get("parent_cid") or role)
+            cache[cid] = (
+                mtime,
+                {
+                    "project": proj,
+                    "role": role,
+                    "is_sub": "1" if is_sub else "",
+                },
+            )
+
+
+def _resolve_event_label(ev: dict[str, Any], cache: dict[str, tuple[float, dict[str, str]]]) -> str:
+    cid = str(ev.get("cid") or "")
+    if cid not in cache:
+        _load_session_labels_cache(cache)
+    info = cache.get(cid, (0.0, {}))[1]
+    proj = str(ev.get("project") or info.get("project") or "")
+    role = info.get("role") or ""
+    if info.get("is_sub"):
+        return f"sub:{role[:12]}" if role else (f"sub:{proj[:12]}" if proj else "sub")
+    return (proj or "-")[:18]
+
+
+def _format_stream_event_human(
+    ev: dict[str, Any],
+    cache: dict[str, tuple[float, dict[str, str]]],
+    c: dict[str, str],
+) -> str:
+    hms = _format_local_hms(str(ev.get("ts") or ""))
+    cid = str(ev.get("cid") or "")
+    label = _resolve_event_label(ev, cache)
+    ev_name = str(ev.get("event") or "")
+    status = str(ev.get("status") or "")
+    tool = str(ev.get("tool") or "")
+    target = str(ev.get("target") or "")
+    detail = str(ev.get("detail") or "")
+    dur = ev.get("duration_ms")
+
+    glyph_map = {
+        "model_start": ("◈", c["blue"]),
+        "model_done": ("◇", c["dim"]),
+        "tool_start": ("▶", c["cyan"]),
+        "loop_blocked": ("✕", f"{c['red']}{c['bold']}"),
+        "stop_bounce": ("↻", c["yellow"]),
+        "turn_stop": ("■", c["dim"]),
+        "session_closed": ("○", c["dim"]),
+        "tool_stall_alert": ("!", f"{c['red']}{c['bold']}"),
+        "model_stall_alert": ("!", f"{c['red']}{c['bold']}"),
+        "late_stall_alert": ("!", f"{c['red']}{c['bold']}"),
+        "late_hang_killed": ("!", f"{c['red']}{c['bold']}"),
+    }
+    if ev_name == "tool_done":
+        glyph, col = ("✓", c["green"]) if status == "ok" else ("✗", c["red"])
+    else:
+        glyph, col = glyph_map.get(ev_name, ("·", ""))
+
+    tool_part = f"  {c['bold']}{tool}{c['reset']}" if tool else ""
+    body = target or detail
+    body_part = f"  {body}" if body else (f"  [{status}]" if status and status != "ok" else "")
+    dur_part = f" {c['dim']}({dur}ms){c['reset']}" if dur is not None and ev_name in {"model_done", "tool_done"} else ""
+    return f"{c['dim']}{hms}{c['reset']}  {cid[:8]} [{label}]  {col}{glyph} {ev_name:<15}{c['reset']}{tool_part}{body_part}{dur_part}"
+
+
+def _emit_stream_event(
+    ev: dict[str, Any],
+    cache: dict[str, tuple[float, dict[str, str]]],
+    use_json: bool,
+    c: dict[str, str],
+) -> None:
+    if use_json:
+        out = {"kind": "event", **ev}
+        if not out.get("project"):
+            cid = str(ev.get("cid") or "")
+            if cid not in cache:
+                _load_session_labels_cache(cache)
+            proj = cache.get(cid, (0.0, {}))[1].get("project")
+            if proj:
+                out["project"] = proj
+        print(json.dumps(out, ensure_ascii=True, separators=(",", ":")), flush=True)
+    else:
+        print(_format_stream_event_human(ev, cache, c), flush=True)
+
+
+def _emit_task_output_line(
+    cid: str,
+    project: str,
+    step_idx: int,
+    task_id: str,
+    line_text: str,
+    use_json: bool,
+    c: dict[str, str],
+) -> None:
+    if use_json:
+        rec = {
+            "ts": utc_iso_now(),
+            "kind": "task_output",
+            "cid": cid,
+            "project": project,
+            "step_idx": step_idx,
+            "task_id": task_id,
+            "line": line_text,
+        }
+        print(json.dumps(rec, ensure_ascii=True, separators=(",", ":")), flush=True)
+    else:
+        hms = dt.datetime.now().strftime("%H:%M:%S")
+        lbl = (project or "-")[:18]
+        tname = f"task-{step_idx}"
+        print(f"{c['dim']}{hms}{c['reset']}  {cid[:8]} [{lbl}]  {c['magenta']}⏳ {tname:<15}{c['reset']}  {line_text}", flush=True)
+
+
+def _read_initial_events(n: int, cid_prefix: str) -> tuple[list[dict[str, Any]], int | None, int, str]:
+    """Read tail of events.jsonl up to last complete line; return (last_n_matching, inode, offset, buf)."""
+    if not EVENTS_FILE.is_file():
+        return [], None, 0, ""
+    try:
+        with EVENTS_FILE.open("rb") as fh:
+            st = os.fstat(fh.fileno())
+            inode = st.st_ino
+            size = st.st_size
+            read_from = max(0, size - 262_144) if n > 0 else size
+            if read_from > 0:
+                fh.seek(read_from)
+                fh.readline()
+            actual_start = fh.tell()
+            raw_bytes = fh.read()
+        text = raw_bytes.decode("utf-8", errors="replace")
+        trailing = ""
+        if text and not text.endswith("\n"):
+            last_nl = text.rfind("\n")
+            if last_nl >= 0:
+                trailing = text[last_nl + 1 :]
+                text = text[: last_nl + 1]
+            else:
+                trailing = text
+                text = ""
+        offset = actual_start + len(raw_bytes)
+        if n <= 0:
+            return [], inode, offset, trailing
+        matched: list[dict[str, Any]] = []
+        for raw in text.splitlines():
+            if not raw.strip():
+                continue
+            try:
+                d = json.loads(raw)
+            except Exception:
+                continue
+            if not isinstance(d, dict):
+                continue
+            if cid_prefix and not str(d.get("cid") or "").startswith(cid_prefix):
+                continue
+            matched.append(d)
+        return matched[-n:], inode, offset, trailing
+    except Exception:
+        return [], None, 0, ""
+
+
+def _scan_bg_task_logs(
+    task_offsets: dict[tuple[str, int], int],
+    task_bufs: dict[tuple[str, int], str],
+    cid_prefix: str,
+    emit: bool,
+    use_json: bool,
+    c: dict[str, str],
+) -> None:
+    snaps = collect_session_snapshots(include_closed=False, cid_prefix=cid_prefix)
+    active_keys: set[tuple[str, int]] = set()
+    for s in snaps:
+        scid = s["cid"]
+        proj = str(s.get("project") or "")
+        for bt in s.get("bg_tasks") or []:
+            s_idx = int(bt["step_idx"])
+            task_id = str(bt.get("task_id") or "")
+            key = (scid, s_idx)
+            active_keys.add(key)
+            log_path = CLI_DATA_DIR / "brain" / scid / ".system_generated" / "tasks" / f"task-{s_idx}.log"
+            if not log_path.is_file():
+                task_offsets.setdefault(key, 0)
+                continue
+            with contextlib.suppress(Exception):
+                size = log_path.stat().st_size
+                if not emit:
+                    task_offsets[key] = size
+                    task_bufs[key] = ""
+                    continue
+                if key not in task_offsets:
+                    task_offsets[key] = 0
+                off = task_offsets[key]
+                if size < off:
+                    off = 0
+                    task_bufs[key] = ""
+                if size > off:
+                    with log_path.open("rb") as fh:
+                        fh.seek(off)
+                        chunk = fh.read()
+                    task_offsets[key] = off + len(chunk)
+                    buf = task_bufs.get(key, "") + chunk.decode("utf-8", errors="replace")
+                    while "\n" in buf:
+                        line, buf = buf.split("\n", 1)
+                        clean = WS_RE.sub(" ", line.rstrip("\r")).strip()
+                        if clean:
+                            _emit_task_output_line(scid, proj, s_idx, task_id, _trunc_str(clean, 140), use_json, c)
+                    task_bufs[key] = buf
+    for stale_key in list(task_offsets.keys()):
+        if stale_key not in active_keys:
+            task_offsets.pop(stale_key, None)
+            task_bufs.pop(stale_key, None)
+
+
+def cmd_stream(args: argparse.Namespace) -> int:
+    n_init = max(0, int(args.n))
+    follow = not bool(args.no_follow)
+    watch_tasks = not bool(args.no_tasks)
+    cid_prefix = str(args.cid or "").strip()
+    use_json = bool(args.json)
+    interval = max(0.02, float(args.interval))
+    c = _make_styler(str(args.color or "auto"))
+
+    label_cache: dict[str, tuple[float, dict[str, str]]] = {}
+    _load_session_labels_cache(label_cache)
+
+    initial_events, ev_inode, ev_offset, ev_buf = _read_initial_events(n_init, cid_prefix)
+    for ev in initial_events:
+        _emit_stream_event(ev, label_cache, use_json, c)
+
+    if not follow:
+        sys.stdout.flush()
+        return 0
+
+    task_offsets: dict[tuple[str, int], int] = {}
+    task_bufs: dict[tuple[str, int], str] = {}
+    if watch_tasks:
+        _scan_bg_task_logs(task_offsets, task_bufs, cid_prefix, emit=False, use_json=use_json, c=c)
+
+    task_poll_every = min(1.0, max(0.15, interval * 4.0))
+    last_task_scan = time.monotonic()
+
+    while True:
+        if EVENTS_FILE.is_file():
+            with contextlib.suppress(Exception):
+                st = EVENTS_FILE.stat()
+                if ev_inode != st.st_ino or st.st_size < ev_offset:
+                    ev_inode = st.st_ino
+                    ev_offset = 0
+                    ev_buf = ""
+                if st.st_size > ev_offset:
+                    with EVENTS_FILE.open("rb") as fh:
+                        fh.seek(ev_offset)
+                        chunk = fh.read()
+                    ev_offset += len(chunk)
+                    ev_buf += chunk.decode("utf-8", errors="replace")
+                    while "\n" in ev_buf:
+                        raw_line, ev_buf = ev_buf.split("\n", 1)
+                        if not raw_line.strip():
+                            continue
+                        try:
+                            d = json.loads(raw_line)
+                        except Exception:
+                            continue
+                        if not isinstance(d, dict):
+                            continue
+                        if cid_prefix and not str(d.get("cid") or "").startswith(cid_prefix):
+                            continue
+                        _emit_stream_event(d, label_cache, use_json, c)
+
+        if watch_tasks and (time.monotonic() - last_task_scan >= task_poll_every):
+            last_task_scan = time.monotonic()
+            _scan_bg_task_logs(task_offsets, task_bufs, cid_prefix, emit=True, use_json=use_json, c=c)
+
+        sys.stdout.flush()
+        time.sleep(interval)
+
+
 def cmd_toggle(enabled: bool) -> int:
     st = update_state_field(lambda s: s.__setitem__("enabled", enabled))
     print(f"agy-watch: {'ENABLED' if st['enabled'] else 'DISABLED'}")
@@ -1747,6 +2641,23 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("daemon-loop")
 
     sub.add_parser("status")
+
+    ps = sub.add_parser("ps", aliases=["sessions"])
+    ps.add_argument("-a", "--all", action="store_true", help="Include closed/recent sessions")
+    ps.add_argument("--json", action="store_true", help="Output structured JSON snapshot (or NDJSON with --watch)")
+    ps.add_argument("-w", "--watch", nargs="?", const=1.0, type=float, default=None, help="Refresh interval in seconds")
+    ps.add_argument("--cid", default="", help="Filter by conversation ID prefix")
+    ps.add_argument("--color", choices=["auto", "always", "never"], default="auto")
+
+    strm = sub.add_parser("stream", aliases=["tail"])
+    strm.add_argument("-n", type=int, default=20, help="Number of recent events to print initially")
+    strm.add_argument("--no-follow", action="store_true", help="Print recent events and exit without tailing")
+    strm.add_argument("--no-tasks", action="store_true", help="Disable live background task log tailing")
+    strm.add_argument("--cid", default="", help="Filter by conversation ID prefix")
+    strm.add_argument("--json", action="store_true", help="Output line-buffered NDJSON events")
+    strm.add_argument("--interval", type=float, default=0.25, help="Poll interval in seconds")
+    strm.add_argument("--color", choices=["auto", "always", "never"], default="auto")
+
     sub.add_parser("on")
     sub.add_parser("off")
     ak = sub.add_parser("autokill")
@@ -1762,33 +2673,50 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _silence_broken_pipe() -> None:
+    with contextlib.suppress(Exception):
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+        os.close(devnull)
+
+
 def main() -> int:
     args = build_parser().parse_args()
     cmd = args.cmd or "status"
-    if cmd == "pre-invocation-hook":
-        return cmd_pre_invocation_hook(args)
-    if cmd == "pre-tool-hook":
-        return cmd_pre_tool_hook(args)
-    if cmd == "post-tool-hook":
-        return cmd_post_tool_hook(args)
-    if cmd == "stop-hook":
-        return cmd_stop_hook(args)
-    if cmd == "daemon-loop":
-        return cmd_daemon_loop(args)
-    if cmd == "status":
-        return cmd_status(args)
-    if cmd == "on":
-        return cmd_toggle(True)
-    if cmd == "off":
-        return cmd_toggle(False)
-    if cmd == "autokill":
-        return cmd_autokill(args.mode == "on")
-    if cmd == "logs":
-        return cmd_tail_file(LOG_FILE, args.n)
-    if cmd == "events":
-        return cmd_tail_file(EVENTS_FILE, args.n)
-    if cmd == "reset":
-        return cmd_reset(args)
+    try:
+        if cmd == "pre-invocation-hook":
+            return cmd_pre_invocation_hook(args)
+        if cmd == "pre-tool-hook":
+            return cmd_pre_tool_hook(args)
+        if cmd == "post-tool-hook":
+            return cmd_post_tool_hook(args)
+        if cmd == "stop-hook":
+            return cmd_stop_hook(args)
+        if cmd == "daemon-loop":
+            return cmd_daemon_loop(args)
+        if cmd == "status":
+            return cmd_status(args)
+        if cmd in {"ps", "sessions"}:
+            return cmd_ps(args)
+        if cmd in {"stream", "tail"}:
+            return cmd_stream(args)
+        if cmd == "on":
+            return cmd_toggle(True)
+        if cmd == "off":
+            return cmd_toggle(False)
+        if cmd == "autokill":
+            return cmd_autokill(args.mode == "on")
+        if cmd == "logs":
+            return cmd_tail_file(LOG_FILE, args.n)
+        if cmd == "events":
+            return cmd_tail_file(EVENTS_FILE, args.n)
+        if cmd == "reset":
+            return cmd_reset(args)
+    except KeyboardInterrupt:
+        return 0
+    except BrokenPipeError:
+        _silence_broken_pipe()
+        return 0
     return 0
 
 

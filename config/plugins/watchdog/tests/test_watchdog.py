@@ -68,14 +68,21 @@ class WatchdogTestCase(unittest.TestCase):
             self._lock_fh.close()
             self._lock_fh = None
 
-    def _run_watch(self, subcmd: str, payload: dict[str, Any] | None = None, extra_env: dict[str, str] | None = None) -> tuple[int, str, float]:
+    def _run_watch(
+        self,
+        subcmd: str,
+        payload: dict[str, Any] | None = None,
+        extra_env: dict[str, str] | None = None,
+        extra_args: list[str] | None = None,
+    ) -> tuple[int, str, float]:
         env = self.env.copy()
         if extra_env:
             env.update(extra_env)
         stdin_str = json.dumps(payload) if payload is not None else None
+        cmd = [str(WATCH_BIN), subcmd, *(extra_args or [])]
         t0 = time.monotonic()
         proc = subprocess.run(
-            [str(WATCH_BIN), subcmd],
+            cmd,
             input=stdin_str,
             capture_output=True,
             text=True,
@@ -721,6 +728,224 @@ class WatchdogTestCase(unittest.TestCase):
                     except ProcessLookupError:
                         pass
                     proc.wait(timeout=2)
+
+    def test_8_ps_snapshot_and_stream_handles(self) -> None:
+        import selectors
+
+        cid_main = "cid-main-0008"
+        cid_sub = "cid-sub-0008"
+        plock = self.cli_dir / "presence" / f"{cid_main}.lock"
+
+        with plock.open("w+", encoding="utf-8") as pfh:
+            fcntl.flock(pfh.fileno(), fcntl.LOCK_EX)
+
+            # 1. Start main turn with cwd, modelName, and tagged prompt
+            self._run_watch(
+                "pre-invocation-hook",
+                {
+                    "conversationId": cid_main,
+                    "cwd": "/tmp/gravity-demo",
+                    "modelName": "gemini-pro",
+                    "lastUserInput": "<ADDITIONAL_METADATA>\ntime: now\n</ADDITIONAL_METADATA>\n<USER_REQUEST>\nBuild stream handle\n</USER_REQUEST>",
+                },
+            )
+            self._run_watch(
+                "pre-tool-hook",
+                {
+                    "conversationId": cid_main,
+                    "stepIdx": 2,
+                    "cwd": "/tmp/gravity-demo",
+                    "toolCall": {
+                        "id": "call-env",
+                        "name": "run_command",
+                        "args": {"CommandLine": "API_KEY=secret123 pytest -q", "toolSummary": "Run unit suite"},
+                    },
+                },
+            )
+            self._run_watch(
+                "post-tool-hook",
+                {
+                    "conversationId": cid_main,
+                    "stepIdx": 2,
+                    "cwd": "/tmp/gravity-demo",
+                    "toolCall": {
+                        "id": "call-env",
+                        "name": "run_command",
+                        "args": {"CommandLine": "API_KEY=secret123 pytest -q", "toolSummary": "Run unit suite"},
+                    },
+                },
+            )
+
+            # Assert inline env secret was redacted in events.jsonl and session last_step
+            ev_text = (self.wd_home / "events.jsonl").read_text(encoding="utf-8")
+            self.assertNotIn("secret123", ev_text)
+            self.assertIn("API_KEY=***", ev_text)
+            main_sess = json.loads((self.wd_home / "sessions" / f"{cid_main}.json").read_text(encoding="utf-8"))
+            self.assertIn("API_KEY=***", (main_sess.get("last_step") or {}).get("target", ""))
+            self.assertNotIn("secret123", json.dumps(main_sess))
+
+            # 2. Simulate invoke_subagent parent->child linking and child active tool
+            logs_dir = self.cli_dir / "brain" / cid_main / ".system_generated" / "logs"
+            logs_dir.mkdir(parents=True, exist_ok=True)
+            tpath = logs_dir / "transcript.jsonl"
+            tpath.write_text(
+                json.dumps(
+                    {
+                        "step_index": 5,
+                        "type": "GENERIC",
+                        "status": "DONE",
+                        "content": 'Created the following subagent:\n{"conversationId": "cid-sub-0008"}',
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            self._run_watch(
+                "pre-tool-hook",
+                {
+                    "conversationId": cid_main,
+                    "stepIdx": 5,
+                    "cwd": "/tmp/gravity-demo",
+                    "toolCall": {
+                        "id": "call-sub",
+                        "name": "invoke_subagent",
+                        "args": {"Role": "Log Worker", "TypeName": "self"},
+                    },
+                },
+            )
+            self._run_watch(
+                "post-tool-hook",
+                {
+                    "conversationId": cid_main,
+                    "stepIdx": 5,
+                    "cwd": "/tmp/gravity-demo",
+                    "transcriptPath": str(tpath),
+                    "toolCall": {
+                        "id": "call-sub",
+                        "name": "invoke_subagent",
+                        "args": {"Role": "Log Worker", "TypeName": "self"},
+                    },
+                },
+            )
+            self._run_watch(
+                "pre-invocation-hook",
+                {"conversationId": cid_sub, "cwd": "/tmp/gravity-demo", "lastUserInput": "Subtask"},
+            )
+            self._run_watch(
+                "pre-tool-hook",
+                {
+                    "conversationId": cid_sub,
+                    "stepIdx": 2,
+                    "cwd": "/tmp/gravity-demo",
+                    "toolCall": {
+                        "id": "sub-ed",
+                        "name": "edit_file",
+                        "args": {"Path": "/tmp/gravity-demo/src/app.py"},
+                    },
+                },
+            )
+
+            # 3. Verify `agy-watch ps --json` structure and hierarchy
+            rc, ps_json_out, _ = self._run_watch("ps", extra_args=["--json"])
+            self.assertEqual(rc, 0)
+            ps_data = json.loads(ps_json_out)
+            sessions = ps_data["sessions"]
+            by_cid = {s["cid"]: s for s in sessions}
+            self.assertIn(cid_main, by_cid)
+            self.assertIn(cid_sub, by_cid)
+            self.assertEqual(by_cid[cid_main]["kind"], "main")
+            self.assertTrue(by_cid[cid_main]["live"])
+            self.assertEqual(by_cid[cid_main]["project"], "gravity-demo")
+            self.assertEqual(by_cid[cid_main]["prompt_preview"], "Build stream handle")
+            self.assertEqual(by_cid[cid_sub]["kind"], "subagent")
+            self.assertEqual(by_cid[cid_sub]["parent_cid"], cid_main)
+            self.assertEqual(by_cid[cid_sub]["role"], "Log Worker")
+            self.assertEqual(by_cid[cid_sub]["state"], "tool")
+            self.assertEqual(by_cid[cid_sub]["inflight"][0]["target"], "src/app.py")
+
+            # 4. Verify WAITING APPROVAL state from SQLite status=9
+            db_path = self._create_conv_db(cid_main, [(6, 15, 3), (7, 132, 9)])
+            rc, ps_wait_json, _ = self._run_watch("ps", extra_args=["--json"])
+            self.assertEqual(rc, 0)
+            wait_map = {s["cid"]: s for s in json.loads(ps_wait_json)["sessions"]}
+            self.assertEqual(wait_map[cid_main]["state"], "waiting_approval")
+
+            rc, ps_human, _ = self._run_watch("ps")
+            self.assertEqual(rc, 0)
+            self.assertIn("WAITING APPROVAL", ps_human)
+            self.assertIn("gravity-demo", ps_human)
+            self.assertIn("Log Worker", ps_human)
+
+            # 5. Verify `agy-watch stream --no-follow` (human + NDJSON)
+            rc, st_human, _ = self._run_watch("stream", extra_args=["--no-follow", "-n", "20"])
+            self.assertEqual(rc, 0)
+            self.assertIn("gravity-demo", st_human)
+            self.assertIn("src/app.py", st_human)
+
+            rc, st_ndjson, _ = self._run_watch("stream", extra_args=["--no-follow", "--json", "-n", "20"])
+            self.assertEqual(rc, 0)
+            parsed_lines = [json.loads(ln) for ln in st_ndjson.splitlines() if ln.strip()]
+            self.assertGreaterEqual(len(parsed_lines), 4)
+            self.assertTrue(any(d.get("kind") == "event" and d.get("project") == "gravity-demo" for d in parsed_lines))
+            self.assertTrue(any(d.get("target") == "src/app.py" for d in parsed_lines))
+
+            # 6. Verify live `agy-watch stream` following both events and running bg task log lines
+            conn = sqlite3.connect(str(db_path))
+            conn.execute("UPDATE steps SET status = 2 WHERE idx = 7")
+            conn.execute("INSERT INTO steps (idx, step_type, status) VALUES (10, 132, 2)")
+            conn.commit()
+            conn.close()
+            log_path = self._setup_bg_transcript(cid_main, 10, "cargo build", log_text="Initial warmup line\n")
+
+            proc = subprocess.Popen(
+                [str(WATCH_BIN), "stream", "--json", "-n", "0", "--interval", "0.05"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=self.env,
+            )
+            try:
+                time.sleep(0.2)
+                self._run_watch(
+                    "pre-invocation-hook",
+                    {"conversationId": cid_main, "cwd": "/tmp/gravity-demo", "lastUserInput": "Build stream handle"},
+                )
+                with log_path.open("a", encoding="utf-8") as lfh:
+                    lfh.write("Compiling widget v0.1.0\n")
+
+                assert proc.stdout is not None
+                sel = selectors.DefaultSelector()
+                sel.register(proc.stdout, selectors.EVENT_READ)
+                seen_event = False
+                seen_task = False
+                deadline = time.monotonic() + 4.0
+                while time.monotonic() < deadline and not (seen_event and seen_task):
+                    events = sel.select(timeout=max(0.05, deadline - time.monotonic()))
+                    if not events:
+                        continue
+                    line = proc.stdout.readline()
+                    if not line:
+                        break
+                    rec = json.loads(line)
+                    if rec.get("kind") == "event" and rec.get("cid") == cid_main:
+                        seen_event = True
+                    if rec.get("kind") == "task_output" and "Compiling widget" in str(rec.get("line") or ""):
+                        seen_task = True
+                sel.close()
+
+                self.assertTrue(seen_event, "Expected live streamed event record from agy-watch stream")
+                self.assertTrue(seen_task, "Expected live streamed task_output record from agy-watch stream")
+                proc.send_signal(signal.SIGINT)
+                rc = proc.wait(timeout=3)
+                self.assertEqual(rc, 0)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=2)
+                if proc.stdout is not None:
+                    proc.stdout.close()
+                if proc.stderr is not None:
+                    proc.stderr.close()
 
 
 if __name__ == "__main__":

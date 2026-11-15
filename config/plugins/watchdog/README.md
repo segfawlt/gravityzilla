@@ -13,11 +13,24 @@ Deterministic step timestamping, retry/error loop circuit-breaking, and silent `
 ## CLI Usage
 
 ```bash
-agy-watch status          # Show enabled state, thresholds, counters, active sessions
-agy-watch on              # Enable watchdog hooks & watcher
-agy-watch off             # Disable watchdog (fail-open pass-through)
-agy-watch autokill on|off # Toggle surgical child-shell kill on late bg hangs
-agy-watch logs -n 30      # Tail ~/.agents/watchdog/watchdog.log
-agy-watch events -n 30    # Tail ~/.agents/watchdog/events.jsonl
-agy-watch reset           # Reset counters and session files
+agy-watch status                   # Show enabled state, thresholds, counters, active sessions
+agy-watch ps                       # Active session & subagent snapshot (-a/--all, -w/--watch, --json)
+agy-watch stream                   # Live chronological event & background task tail (--no-follow, --json)
+agy-watch on                       # Enable watchdog hooks & watcher
+agy-watch off                      # Disable watchdog (fail-open pass-through)
+agy-watch autokill on|off          # Toggle surgical child-shell kill on late bg hangs
+agy-watch logs -n 30               # Tail ~/.agents/watchdog/watchdog.log
+agy-watch events -n 30             # Tail raw ~/.agents/watchdog/events.jsonl
+agy-watch reset                    # Reset counters and session files
+```
+
+### Split-Screen / Sidebar Usage
+
+Point a Ghostty split, `zellij` pane, or external UI at either handle:
+
+```bash
+agy-watch ps -w 1                  # Live refreshing multi-session tree
+agy-watch stream                   # Continuous human-readable activity feed
+agy-watch ps -w 1 --json           # Machine-readable NDJSON session snapshots
+agy-watch stream --json            # Machine-readable NDJSON event + task log stream
 ```
