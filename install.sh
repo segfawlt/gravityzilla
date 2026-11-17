@@ -24,9 +24,9 @@ Options:
   -h, --help       Show this help message.
 
 Targets configured:
-  ~/.local/bin/              Helper scripts and tools (agy-advisor, agy-stats, agy-watch, rtk, etc.)
+  ~/.local/bin/              Helper scripts and tools (agy-stats, agy-watch, agy-compound, rtk, etc.)
   ~/.agents/skills/          Agent skills (repo .agents/skills, linked into Antigravity)
-  ~/.gemini/config/          Global instructions, plugins, custom agents
+  ~/.gemini/config/          Global instructions, plugins, MCP configs
   ~/.gemini/antigravity-cli/ settings.json with path templating
   ~/.config/agy-stats/       Stats preferences
   ~/.config/rtk/             RTK token condenser configs
@@ -137,7 +137,6 @@ run_status() {
   check_entry "$SCRIPT_DIR/.agents/skills" "$HOME/.agents/skills" "~/.agents/skills"
   check_entry "$HOME/.agents/skills" "$HOME/.gemini/config/skills" "~/.gemini/config/skills"
   check_entry "$HOME/.agents/skills" "$HOME/.gemini/antigravity-cli/skills" "~/.gemini/antigravity-cli/skills"
-  check_entry "$HOME/.gemini/config" "$HOME/.gemini/antigravity" "~/.gemini/antigravity"
 
   local settings_dest="$HOME/.gemini/antigravity-cli/settings.json"
   if [[ -f "$settings_dest" ]]; then
@@ -192,12 +191,17 @@ mkdir -p "$HOME/.gemini/antigravity-cli"
 mkdir -p "$HOME/.config/agy-stats"
 mkdir -p "$HOME/.config/rtk"
 mkdir -p "$HOME/.agents/memories"
-mkdir -p "$HOME/.agents/advisor"
+mkdir -p "$HOME/.agents/compound"
 mkdir -p "$HOME/.agents/diagnostics"
 mkdir -p "$HOME/.agents/watchdog"
 
-# Cleanup obsolete components (e.g. ledger)
-rm -rf "$HOME/.gemini/config/plugins/ledger" "$HOME/.local/bin/agy-ledger" "$HOME/.agents/ledger"
+# Cleanup obsolete components (e.g. ledger, advisor)
+rm -rf "$HOME/.gemini/config/plugins/ledger" "$HOME/.local/bin/agy-ledger" "$HOME/.agents/ledger" \
+       "$HOME/.gemini/config/plugins/advisor" "$HOME/.gemini/config/agents/advisor-core.md" \
+       "$HOME/.local/bin/agy-advisor" "$HOME/.agents/advisor"
+if [[ -L "$HOME/.gemini/config/agents" && ! -e "$HOME/.gemini/config/agents" ]]; then
+  rm -f "$HOME/.gemini/config/agents"
+fi
 
 deploy_file() {
   local src="$1"
@@ -256,7 +260,14 @@ done
 ln -sfn "$SCRIPT_DIR/.agents/skills" "$HOME/.agents/skills"
 ln -sfn "$HOME/.agents/skills" "$HOME/.gemini/config/skills"
 ln -sfn "$HOME/.agents/skills" "$HOME/.gemini/antigravity-cli/skills"
-ln -sfn "$HOME/.gemini/config" "$HOME/.gemini/antigravity"
+
+# Remove legacy ~/.gemini/antigravity -> ~/.gemini/config symlink so Antigravity Desktop
+# can manage ~/.gemini/antigravity/ as its own runtime data directory.
+if [[ -L "$HOME/.gemini/antigravity" ]]; then
+  if [[ "$(readlink -f "$HOME/.gemini/antigravity" 2>/dev/null || true)" == "$(readlink -f "$HOME/.gemini/config" 2>/dev/null || true)" ]]; then
+    rm -f "$HOME/.gemini/antigravity"
+  fi
+fi
 
 # 5. Deploy config-extra items (~/.config/agy-stats and ~/.config/rtk)
 echo "==> Deploying extra configs into ~/.config/..."
@@ -288,7 +299,7 @@ fi
 echo "==> Verifying installation..."
 
 # Verify python syntax for helper scripts
-for py_bin in agy-advisor agy-diagnostics agy-stats agy-statusline agy-watch agent-memory; do
+for py_bin in agy-compound agy-diagnostics agy-stats agy-statusline agy-watch agent-memory; do
   if [[ -f "$HOME/.local/bin/$py_bin" ]]; then
     python3 -m py_compile "$HOME/.local/bin/$py_bin" >/dev/null 2>&1 && \
       echo "    [PASS] $py_bin syntax OK" || \

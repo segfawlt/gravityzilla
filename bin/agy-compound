@@ -1,0 +1,1342 @@
+#!/usr/bin/env python3
+"""
+Audit, Stop-hook enforcement, and CLI for repository compound learning (docs/learnings/).
+
+State: ~/.agents/compound/
+  state.json            Settings & lifetime counters
+  audit.jsonl           Per-turn outcome records (CAPTURED/UPDATED/SKIPPED_*/MISSED_OR_UNRECORDED)
+  compound.log          Human-readable debug & event log
+  sessions/<cid>.json   Per-session turn deduplication & state
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import datetime as dt
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from collections import Counter
+from pathlib import Path
+from typing import Any, Iterator
+
+HOME = Path.home()
+AGENTS_DIR = Path(os.environ.get("AGY_AGENTS_DIR") or (HOME / ".agents"))
+COMPOUND_HOME = Path(os.environ.get("AGY_COMPOUND_HOME") or (AGENTS_DIR / "compound"))
+WATCHDOG_HOME = Path(os.environ.get("AGY_WATCHDOG_HOME") or (AGENTS_DIR / "watchdog"))
+CLI_DATA_DIR = Path(os.environ.get("AGY_CLI_DATA_DIR") or (HOME / ".gemini" / "antigravity-cli"))
+BRAIN_DIR = Path(os.environ.get("AGY_BRAIN_DIR") or (CLI_DATA_DIR / "brain"))
+
+STATE_FILE = COMPOUND_HOME / "state.json"
+STATE_LOCK = COMPOUND_HOME / "state.lock"
+AUDIT_FILE = COMPOUND_HOME / "audit.jsonl"
+AUDIT_LOCK = COMPOUND_HOME / "audit.lock"
+LOG_FILE = COMPOUND_HOME / "compound.log"
+SESSIONS_DIR = COMPOUND_HOME / "sessions"
+
+MAX_AUDIT_BYTES = 5 * 1024 * 1024
+MAX_LOG_BYTES = 2 * 1024 * 1024
+
+VALID_CID_RE = re.compile(r"^[A-Za-z0-9._-]{4,128}$")
+WS_RE = re.compile(r"\s+")
+MD_LINK_RE = re.compile(r"\[[^\]]+\]\(([^)#]+\.md)(?:#[^)]+)?\)")
+REF_HEADING_RE = re.compile(r"(?m)^##\s+References\s*\n+(\d+)\b")
+RTK_PREFIX_RE = re.compile(r"^\s*rtk\s+(?:bypass\s+)?")
+
+DEFAULT_STATE: dict[str, Any] = {
+    "enabled": True,
+    "mode": "gate",
+    "model": "gemini-3.8-flash-low",
+    "bounces": 0,
+    "captures": 0,
+    "skips": 0,
+}
+
+MUTATING_FILE_TOOLS = {
+    "edit_file",
+    "write_file",
+    "Edit",
+    "Write",
+    "replace_file_content",
+    "multi_replace_file_content",
+    "apply_patch",
+}
+
+SHELL_MUTATION_RE = re.compile(
+    r"(?:^|[;&|]\s*)(?:rm|mv|cp|chmod|chown|mkdir|touch|ln|install|sed\s+-i|perl\s+-pi|tee|git\s+(?:apply|checkout|restore|reset|merge|rebase|cherry-pick))\b|(?<![-=<&\d])[12]?>>?\s*[^\s&>]"
+)
+
+IGNORED_REPO_PREFIXES = ("docs/api/", ".git/", "node_modules/", "dist/", "build/", ".next/", "coverage/")
+DOC_EXTENSIONS = {".md", ".mdx", ".txt"}
+
+
+def utc_iso_now() -> str:
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def ensure_dirs() -> None:
+    COMPOUND_HOME.mkdir(parents=True, exist_ok=True)
+    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def sanitize_cid(cid: str) -> str:
+    raw = str(cid or "").strip()
+    return raw if VALID_CID_RE.match(raw) else ""
+
+
+@contextlib.contextmanager
+def file_lock(lock_path: Path) -> Iterator[None]:
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as fh:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
+def atomic_write_json(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=False) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _rotate_if_oversized(path: Path, max_bytes: int) -> None:
+    with contextlib.suppress(Exception):
+        if path.is_file() and path.stat().st_size > max_bytes:
+            os.replace(path, path.with_name(path.name + ".1"))
+
+
+def log_event(message: str) -> None:
+    ensure_dirs()
+    line = f"{utc_iso_now()} {message}\n"
+    with contextlib.suppress(Exception):
+        with file_lock(COMPOUND_HOME / "log.lock"):
+            _rotate_if_oversized(LOG_FILE, MAX_LOG_BYTES)
+            with LOG_FILE.open("a", encoding="utf-8") as fh:
+                fh.write(line)
+
+
+def load_state() -> dict[str, Any]:
+    ensure_dirs()
+    merged = dict(DEFAULT_STATE)
+    if STATE_FILE.is_file():
+        with contextlib.suppress(Exception):
+            raw = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                merged.update(raw)
+    return merged
+
+
+def update_state(mutator: Any) -> dict[str, Any]:
+    ensure_dirs()
+    with file_lock(STATE_LOCK):
+        st = load_state()
+        mutator(st)
+        atomic_write_json(STATE_FILE, st)
+        return st
+
+
+def session_path(cid: str) -> Path:
+    return SESSIONS_DIR / f"{cid}.json"
+
+
+def session_lock_path(cid: str) -> Path:
+    return SESSIONS_DIR / f"{cid}.lock"
+
+
+def load_session(cid: str) -> dict[str, Any]:
+    p = session_path(cid)
+    base: dict[str, Any] = {
+        "cid": cid,
+        "bounced_turn_key": "",
+        "bounced_at_planner_steps": 0,
+        "bounced_at_ts": 0.0,
+        "finalized_turn_key": "",
+        "recorded_turns": {},
+        "updated_at": 0.0,
+    }
+    if p.is_file():
+        with contextlib.suppress(Exception):
+            raw = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                base.update(raw)
+                base["cid"] = cid
+    return base
+
+
+def save_session(cid: str, sess: dict[str, Any]) -> None:
+    sess["updated_at"] = time.time()
+    atomic_write_json(session_path(cid), sess)
+
+
+def append_audit(record: dict[str, Any]) -> None:
+    ensure_dirs()
+    entry = {"ts": utc_iso_now(), **record}
+    line = json.dumps(entry, ensure_ascii=True, separators=(",", ":")) + "\n"
+    with contextlib.suppress(Exception):
+        with file_lock(AUDIT_LOCK):
+            _rotate_if_oversized(AUDIT_FILE, MAX_AUDIT_BYTES)
+            with AUDIT_FILE.open("a", encoding="utf-8") as fh:
+                fh.write(line)
+
+
+def read_audit_records() -> list[dict[str, Any]]:
+    if not AUDIT_FILE.is_file():
+        return []
+    out: list[dict[str, Any]] = []
+    with contextlib.suppress(Exception):
+        for line in AUDIT_FILE.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            with contextlib.suppress(Exception):
+                obj = json.loads(line)
+                if isinstance(obj, dict):
+                    out.append(obj)
+    return out
+
+
+def resolve_repo_root(cwd: str) -> Path | None:
+    base = Path(cwd or ".").expanduser()
+    if base.is_file():
+        base = base.parent
+    if not base.exists():
+        return None
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(base), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            return Path(proc.stdout.strip()).resolve()
+    except Exception:
+        pass
+    return None
+
+
+def _resolve_candidate_path(raw: str, cwd: str) -> Path | None:
+    s = str(raw or "").strip().strip('"').strip("'")
+    if not s:
+        return None
+    p = Path(s).expanduser()
+    if not p.is_absolute():
+        p = Path(cwd or ".") / p
+    with contextlib.suppress(Exception):
+        return p.resolve()
+    return p
+
+
+def _rel_to_repo(p: Path, repo_root: Path | None) -> str | None:
+    if repo_root is None:
+        return None
+    with contextlib.suppress(ValueError):
+        return str(p.relative_to(repo_root))
+    return None
+
+
+def is_mutating_command(cmd: str, repo_root: Path | None = None) -> bool:
+    stripped = RTK_PREFIX_RE.sub("", (cmd or "").strip())
+    if not stripped:
+        return False
+    # Strip heredoc bodies and inline `-c`/`-e` quoted code strings so operators inside code snippets aren't treated as shell mutations
+    cleaned = re.sub(r"<<[-~]?\s*['\"]?(\w+)['\"]?.*?(?:\n\1\b|$)", " HEREDOC ", stripped, flags=re.S)
+    cleaned = re.sub(r"\s-(?:c|e)\s+(?:'[^']*'|\"(?:\\.|[^\"])*\")", " -c INLINE_CODE", cleaned, flags=re.S)
+    for raw_seg in re.split(r"(?:&&|\|\||;|\n)", cleaned):
+        seg = raw_seg.strip()
+        if not seg:
+            continue
+        lower = seg.lower()
+        if "agy-compound" in lower or "agent-memory" in lower:
+            continue
+        seg_unquoted = re.sub(r"'[^']*'|\"(?:\\.|[^\"])*\"", " QUOTED ", seg)
+        if not SHELL_MUTATION_RE.search(seg_unquoted):
+            continue
+        if repo_root is not None:
+            abs_paths = re.findall(r"(?:/[^\s\"';&|)]+|~/[^\s\"';&|)]+)", seg)
+            if abs_paths and all(
+                (rp is None or _rel_to_repo(rp, repo_root) is None)
+                for rp in (_resolve_candidate_path(p, str(repo_root)) for p in abs_paths)
+            ):
+                continue
+        return True
+    return False
+
+
+def _load_full_step_lookup(tpath: Path) -> dict[int, dict[str, Any]]:
+    full_path = tpath.with_name("transcript_full.jsonl")
+    if not full_path.is_file() or tpath.name == "transcript_full.jsonl":
+        return {}
+    mapping: dict[int, dict[str, Any]] = {}
+    with contextlib.suppress(Exception):
+        for line in full_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            with contextlib.suppress(Exception):
+                obj = json.loads(line)
+                if isinstance(obj, dict) and isinstance(obj.get("step_index"), int):
+                    mapping[obj["step_index"]] = obj
+    return mapping
+
+
+def resolve_transcript_path(cid: str, payload: dict[str, Any] | None = None) -> Path | None:
+    if isinstance(payload, dict):
+        raw = str(payload.get("transcriptPath") or "").strip().strip('"')
+        if raw:
+            p = Path(raw).expanduser()
+            if p.is_file():
+                return p
+    brain_dirs = [BRAIN_DIR] + [
+        HOME / ".gemini" / prod / "brain"
+        for prod in ("antigravity-cli", "antigravity", "antigravity-ide")
+    ]
+    for bdir in brain_dirs:
+        for fname in ("transcript.jsonl", "transcript_full.jsonl"):
+            cand = bdir / cid / ".system_generated" / "logs" / fname
+            if cand.is_file():
+                return cand
+    return None
+
+
+def _is_internal_continuation_prompt(content: str) -> bool:
+    c = (content or "").lstrip()
+    return any(
+        tag in c[:240]
+        for tag in ("<compound-check>", "<watchdog>", "[plan review due]", "Continue working.")
+    )
+
+
+def _unwrap_arg_str(val: Any) -> str:
+    if not isinstance(val, str):
+        return ""
+    s = val.strip()
+    if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+        with contextlib.suppress(Exception):
+            dec = json.loads(s)
+            if isinstance(dec, str):
+                return dec.strip()
+    return s.strip('"').strip("'")
+
+
+def _is_worker_session(cid: str, payload: dict[str, Any] | None, first_prompt: str, first_system: str = "") -> bool:
+    if isinstance(payload, dict) and (payload.get("parentConversationId") or payload.get("isSubagent")):
+        return True
+    fp = (first_prompt or "").lstrip()
+    if any(tok in fp[:300] for tok in ("[AGY_INTERNAL_WORKER]", "<SWARM", "You are the Persistent Advisor")):
+        return True
+    if first_system and "# Repository Memory" not in first_system and re.search(r"sender=[0-9a-fA-F-]{8,}", first_system):
+        return True
+    wd_sess_file = WATCHDOG_HOME / "sessions" / f"{cid}.json"
+    if wd_sess_file.is_file():
+        with contextlib.suppress(Exception):
+            wd = json.loads(wd_sess_file.read_text(encoding="utf-8"))
+            if isinstance(wd, dict) and (wd.get("parent_cid") or wd.get("role")):
+                return True
+    return False
+
+
+def _extract_tool_target_paths(tname: str, args: dict[str, Any]) -> list[str]:
+    out: list[str] = []
+    for key in ("Path", "TargetFile", "path", "file_path", "target_file"):
+        s = _unwrap_arg_str(args.get(key))
+        if s:
+            out.append(s)
+    return out
+
+
+def analyze_transcript_turns(
+    tpath: Path,
+    cid: str = "",
+    repo_root: Path | None = None,
+    cwd: str = "",
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Parse transcript.jsonl into user turns and classify mutations/learnings/outcomes."""
+    if not tpath.is_file():
+        return {"cid": cid, "is_worker": False, "turns": []}
+
+    raw_entries: list[dict[str, Any]] = []
+    has_truncated_calls = False
+    with contextlib.suppress(Exception):
+        for line in tpath.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            with contextlib.suppress(Exception):
+                obj = json.loads(line)
+                if isinstance(obj, dict):
+                    if "tool_calls" in (obj.get("truncated_fields") or []):
+                        has_truncated_calls = True
+                    raw_entries.append(obj)
+
+    full_lookup = _load_full_step_lookup(tpath) if has_truncated_calls else {}
+
+    first_user_prompt = ""
+    first_system_msg = ""
+    turns: list[dict[str, Any]] = []
+    cur: dict[str, Any] | None = None
+
+    def _new_turn(prompt: str, step_idx: Any, created_at: str) -> dict[str, Any]:
+        h = hashlib.sha1((prompt or "").encode("utf-8", errors="replace")).hexdigest()[:10]
+        return {
+            "turn_key": f"{step_idx if step_idx is not None else len(turns)}:{h}",
+            "prompt_preview": WS_RE.sub(" ", prompt or "").strip()[:100],
+            "start_ts": created_at,
+            "end_ts": created_at,
+            "planner_steps": 0,
+            "repo_code_edits": [],
+            "repo_doc_edits": [],
+            "external_edits": [],
+            "mutating_cmds": [],
+            "learning_doc_writes": [],
+            "learning_readme_writes": [],
+            "compound_action": "",
+            "compound_skip_reason": "",
+            "compound_record_files": [],
+            "error_steps": 0,
+            "substantive": False,
+        }
+
+    for entry in raw_entries:
+        if "tool_calls" in (entry.get("truncated_fields") or []) and isinstance(entry.get("step_index"), int):
+            full_entry = full_lookup.get(entry["step_index"])
+            if full_entry:
+                entry = full_entry
+
+        etype = str(entry.get("type") or "")
+        created_at = str(entry.get("created_at") or "")
+        status = str(entry.get("status") or "")
+
+        if etype == "SYSTEM_MESSAGE" and not first_system_msg:
+            first_system_msg = str(entry.get("content") or "")
+            continue
+
+        if etype == "USER_INPUT":
+            content = str(entry.get("content") or "")
+            if not first_user_prompt and content.strip():
+                first_user_prompt = content
+            if cur is None or not _is_internal_continuation_prompt(content):
+                cur = _new_turn(content, entry.get("step_index"), created_at)
+                turns.append(cur)
+            continue
+
+        if cur is None:
+            continue
+
+        if created_at:
+            cur["end_ts"] = created_at
+        if etype == "PLANNER_RESPONSE":
+            cur["planner_steps"] += 1
+        if status == "ERROR":
+            cur["error_steps"] += 1
+        else:
+            txt_c = str(entry.get("content") or "")
+            if etype != "PLANNER_RESPONSE" and any(
+                sig in txt_c for sig in ("Traceback (most recent call last)", "Exit code: 1", "FAIL ")
+            ):
+                cur["error_steps"] += 1
+
+        for tc in entry.get("tool_calls") or []:
+            if not isinstance(tc, dict):
+                continue
+            tname = str(tc.get("name") or "")
+            args = tc.get("args") if tc.get("args") is not None else tc.get("arguments")
+            if isinstance(args, str):
+                with contextlib.suppress(Exception):
+                    args = json.loads(args)
+            if not isinstance(args, dict):
+                args = {}
+
+            if tname in MUTATING_FILE_TOOLS:
+                for raw_path in _extract_tool_target_paths(tname, args):
+                    rpath = _resolve_candidate_path(raw_path, cwd)
+                    rel = _rel_to_repo(rpath, repo_root) if rpath else None
+                    if rel is not None:
+                        rel_norm = rel.replace("\\", "/")
+                        if rel_norm.startswith("docs/learnings/"):
+                            if rel_norm == "docs/learnings/README.md":
+                                if rel_norm not in cur["learning_readme_writes"]:
+                                    cur["learning_readme_writes"].append(rel_norm)
+                            elif rel_norm not in cur["learning_doc_writes"]:
+                                cur["learning_doc_writes"].append(rel_norm)
+                            continue
+                        if any(rel_norm.startswith(ign) for ign in IGNORED_REPO_PREFIXES):
+                            continue
+                        if Path(rel_norm).suffix.lower() in DOC_EXTENSIONS or rel_norm.startswith("docs/"):
+                            if rel_norm not in cur["repo_doc_edits"]:
+                                cur["repo_doc_edits"].append(rel_norm)
+                        else:
+                            if rel_norm not in cur["repo_code_edits"]:
+                                cur["repo_code_edits"].append(rel_norm)
+                    else:
+                        disp = str(rpath or raw_path)
+                        if disp not in cur["external_edits"]:
+                            cur["external_edits"].append(disp)
+
+            elif tname == "run_command":
+                cmd_str = _unwrap_arg_str(args.get("CommandLine"))
+                if not cmd_str:
+                    continue
+                if "agy-compound" in cmd_str:
+                    if re.search(r"\bagy-compound\s+record\b", cmd_str):
+                        cur["compound_action"] = "record"
+                    elif re.search(r"\bagy-compound\s+skip\b", cmd_str):
+                        cur["compound_action"] = "skip"
+                elif is_mutating_command(cmd_str, repo_root):
+                    if repo_root is not None:
+                        short_cmd = WS_RE.sub(" ", cmd_str)[:120]
+                        if short_cmd not in cur["mutating_cmds"]:
+                            cur["mutating_cmds"].append(short_cmd)
+
+    is_worker = _is_worker_session(cid, payload, first_user_prompt, first_system_msg)
+    for t in turns:
+        t["substantive"] = (
+            bool(t["repo_code_edits"]) or bool(t["mutating_cmds"])
+        ) and not is_worker
+    return {"cid": cid, "is_worker": is_worker, "turns": turns}
+
+
+def parse_frontmatter(text: str) -> dict[str, Any]:
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return {}
+    meta: dict[str, Any] = {}
+    for line in lines[1:]:
+        if line.strip() == "---":
+            break
+        if ":" in line:
+            k, v = line.split(":", 1)
+            meta[k.strip()] = v.strip().strip('"').strip("'")
+    return meta
+
+
+def inspect_learnings_tree(repo_root: Path | None) -> dict[str, Any]:
+    if repo_root is None:
+        return {"exists": False}
+    ldir = repo_root / "docs" / "learnings"
+    if not ldir.is_dir():
+        return {"exists": False, "repo_root": str(repo_root)}
+
+    readme_path = ldir / "README.md"
+    readme_text = readme_path.read_text(encoding="utf-8", errors="replace") if readme_path.is_file() else ""
+    linked_rels = {m.replace("\\", "/").removeprefix("./") for m in MD_LINK_RE.findall(readme_text)}
+
+    files: list[dict[str, Any]] = []
+    missing_frontmatter: list[str] = []
+    missing_refs: list[str] = []
+    unindexed: list[str] = []
+    promote_candidates: list[tuple[str, int, str]] = []
+
+    for p in sorted(ldir.rglob("*.md")):
+        if p.name == "README.md":
+            continue
+        rel_from_ldir = str(p.relative_to(ldir)).replace("\\", "/")
+        rel_from_repo = str(p.relative_to(repo_root)).replace("\\", "/")
+        content = p.read_text(encoding="utf-8", errors="replace")
+        fm = parse_frontmatter(content)
+        missing_keys = [k for k in ("title", "category", "tags", "date") if not fm.get(k)]
+        if missing_keys:
+            missing_frontmatter.append(f"{rel_from_ldir} (missing: {', '.join(missing_keys)})")
+        ref_m = REF_HEADING_RE.search(content)
+        refs = int(ref_m.group(1)) if ref_m else -1
+        if refs < 0:
+            missing_refs.append(rel_from_ldir)
+        elif refs >= 3:
+            promote_candidates.append((rel_from_repo, refs, str(fm.get("title") or rel_from_ldir)))
+
+        if readme_text and rel_from_ldir not in linked_rels and rel_from_repo not in readme_text:
+            unindexed.append(rel_from_ldir)
+
+        files.append({"rel": rel_from_ldir, "repo_rel": rel_from_repo, "title": fm.get("title", ""), "refs": refs})
+
+    broken_links = [
+        lnk
+        for lnk in sorted(linked_rels)
+        if not lnk.startswith("http") and not (ldir / lnk).resolve().is_file() and not (repo_root / lnk).resolve().is_file()
+    ]
+
+    return {
+        "exists": True,
+        "repo_root": str(repo_root),
+        "learnings_dir": str(ldir),
+        "readme_exists": readme_path.is_file(),
+        "total_docs": len(files),
+        "files": files,
+        "unindexed": unindexed,
+        "broken_links": broken_links,
+        "missing_frontmatter": missing_frontmatter,
+        "missing_refs": missing_refs,
+        "promote_candidates": promote_candidates,
+    }
+
+
+def _resolve_active_cid(explicit_cid: str, cwd: str) -> str:
+    cand = sanitize_cid(explicit_cid or os.environ.get("AGY_CONVERSATION_ID") or "")
+    if cand:
+        return cand
+    repo_root = resolve_repo_root(cwd)
+    best_cid = ""
+    best_score = (-1, 0.0)
+    if (WATCHDOG_HOME / "sessions").is_dir():
+        for sp in (WATCHDOG_HOME / "sessions").glob("*.json"):
+            scid = sanitize_cid(sp.stem)
+            if not scid:
+                continue
+            with contextlib.suppress(Exception):
+                s = json.loads(sp.read_text(encoding="utf-8"))
+                if not isinstance(s, dict) or s.get("parent_cid") or s.get("role"):
+                    continue
+                scwd = str(s.get("cwd") or "")
+                matches_repo = bool(
+                    repo_root and scwd and (Path(scwd).resolve() == repo_root or str(Path(scwd).resolve()).startswith(str(repo_root) + "/"))
+                )
+                is_active = 1 if s.get("phase") not in ("", "idle") else 0
+                upd = float(s.get("updated_at") or sp.stat().st_mtime)
+                score = (is_active * 2 + (1 if matches_repo else 0), upd)
+                if score > best_score:
+                    best_score = score
+                    best_cid = scid
+    if best_cid:
+        return best_cid
+    if BRAIN_DIR.is_dir():
+        latest_tp = max(
+            BRAIN_DIR.glob("*/.system_generated/logs/transcript.jsonl"),
+            key=lambda p: p.stat().st_mtime,
+            default=None,
+        )
+        if latest_tp is not None:
+            return sanitize_cid(latest_tp.parents[2].name)
+    return ""
+
+
+def _read_hook_payload() -> dict[str, Any]:
+    raw = sys.stdin.read()
+    if not raw.strip():
+        return {}
+    obj = json.loads(raw)
+    return obj if isinstance(obj, dict) else {}
+
+
+def _infer_repo_from_transcript(tpath: Path) -> str:
+    """Best-effort workspace path inference when scanning historical transcripts."""
+    with contextlib.suppress(Exception):
+        for line in tpath.read_text(encoding="utf-8", errors="replace").splitlines()[:40]:
+            obj = json.loads(line)
+            for tc in obj.get("tool_calls") or []:
+                args = tc.get("args") if tc.get("args") is not None else tc.get("arguments")
+                if isinstance(args, str):
+                    with contextlib.suppress(Exception):
+                        args = json.loads(args)
+                if isinstance(args, dict):
+                    for p in _extract_tool_target_paths(str(tc.get("name") or ""), args):
+                        if p.startswith("/") and "/.gemini/" not in p and "/.agents/" not in p:
+                            rr = resolve_repo_root(str(Path(p).parent))
+                            if rr:
+                                return str(rr)
+    return ""
+
+
+def _record_turn_outcome(
+    cid: str,
+    cwd: str,
+    outcome: str,
+    files: list[str] | None = None,
+    summary: str = "",
+    reason: str = "",
+    code_edits: list[str] | None = None,
+    error_steps: int = 0,
+    turn_key: str = "",
+) -> dict[str, Any]:
+    repo_root = resolve_repo_root(cwd)
+    project = repo_root.name if repo_root else (Path(cwd).name if cwd else "")
+    rec = {
+        "cid": cid,
+        "project": project,
+        "cwd": str(repo_root or cwd),
+        "turn_key": turn_key,
+        "outcome": outcome,
+        "files": list(files or []),
+        "code_edits": list(code_edits or [])[:25],
+        "error_steps": error_steps,
+        "summary": summary or reason,
+    }
+    append_audit(rec)
+    log_event(
+        f"[{outcome}] cid={cid[:8] if cid else 'manual'} proj={project or '-'} "
+        f"files={len(files or [])} edits={len(code_edits or [])} {rec['summary'][:120]}"
+    )
+    if outcome in ("CAPTURED", "UPDATED"):
+        update_state(lambda s: s.__setitem__("captures", int(s.get("captures") or 0) + 1))
+    elif outcome == "SKIPPED_ROUTINE":
+        update_state(lambda s: s.__setitem__("skips", int(s.get("skips") or 0) + 1))
+    return rec
+
+
+def _launch_auto_extract(cid: str, cwd: str) -> None:
+    try:
+        subprocess.Popen(
+            [sys.executable, __file__, "extract", "--cid", cid, "--cwd", cwd, "--quiet"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            env={**os.environ, "AGY_HOOK_INTERNAL": "1"},
+        )
+    except Exception:
+        pass
+
+
+def cmd_stop_hook(_args: argparse.Namespace) -> int:
+    stop_json = json.dumps({"decision": "stop"})
+    if os.environ.get("AGY_HOOK_INTERNAL") == "1":
+        print(stop_json)
+        return 0
+    try:
+        payload = _read_hook_payload()
+        cid = sanitize_cid(str(payload.get("conversationId") or ""))
+        state = load_state()
+        if not cid or not state.get("enabled", True):
+            print(stop_json)
+            return 0
+
+        term_reason = str(payload.get("terminationReason") or "")
+        if term_reason and term_reason != "NO_TOOL_CALL":
+            print(stop_json)
+            return 0
+        if payload.get("fullyIdle") is False:
+            print(stop_json)
+            return 0
+
+        wpaths = [str(p) for p in (payload.get("workspacePaths") or []) if p]
+        raw_cwd = str(payload.get("cwd") or payload.get("workspacePath") or (wpaths[0] if wpaths else os.getcwd()))
+        repo_root = resolve_repo_root(raw_cwd)
+        cwd = raw_cwd
+        if repo_root is None and wpaths:
+            for wp in wpaths:
+                cand_root = resolve_repo_root(wp)
+                if cand_root is not None:
+                    repo_root = cand_root
+                    cwd = wp
+                    break
+        tpath = resolve_transcript_path(cid, payload)
+        if tpath is None:
+            print(stop_json)
+            return 0
+
+        analysis = analyze_transcript_turns(tpath, cid=cid, repo_root=repo_root, cwd=cwd, payload=payload)
+        turns = analysis["turns"]
+        if not turns:
+            print(stop_json)
+            return 0
+
+        cur = turns[-1]
+        turn_key = cur["turn_key"]
+
+        with file_lock(session_lock_path(cid)):
+            sess = load_session(cid)
+            if sess.get("finalized_turn_key") == turn_key:
+                print(stop_json)
+                return 0
+
+            if analysis["is_worker"]:
+                sess["finalized_turn_key"] = turn_key
+                save_session(cid, sess)
+                print(stop_json)
+                return 0
+
+            # If agent already created/updated docs/learnings/*.md OR invoked record/skip this turn:
+            recorded_turns = sess.get("recorded_turns") or {}
+            if cur["learning_doc_writes"] or cur["compound_action"] in ("record", "skip") or turn_key in recorded_turns:
+                if turn_key not in recorded_turns:
+                    if cur["compound_action"] == "skip":
+                        outc = "SKIPPED_ROUTINE"
+                        msg = "Skipped via agy-compound skip"
+                    else:
+                        outc = "CAPTURED"
+                        msg = f"Learnings written: {', '.join(cur['learning_doc_writes'])}"
+                    _record_turn_outcome(
+                        cid,
+                        cwd,
+                        outc,
+                        files=cur["learning_doc_writes"],
+                        summary=msg,
+                        code_edits=cur["repo_code_edits"],
+                        error_steps=cur["error_steps"],
+                        turn_key=turn_key,
+                    )
+                sess["finalized_turn_key"] = turn_key
+                save_session(cid, sess)
+                print(stop_json)
+                return 0
+
+            # Read-only, external-only (~/.local/bin), or non-repo turn -> log & pass cleanly
+            if not cur["substantive"]:
+                why = (
+                    "no git repository"
+                    if repo_root is None
+                    else (
+                        "docs-only / external harness edits"
+                        if (cur["repo_doc_edits"] or cur["external_edits"])
+                        else "read-only / check-only turn"
+                    )
+                )
+                _record_turn_outcome(
+                    cid,
+                    cwd,
+                    "SKIPPED_READONLY",
+                    summary=why,
+                    code_edits=cur["repo_code_edits"],
+                    error_steps=cur["error_steps"],
+                    turn_key=turn_key,
+                )
+                sess["finalized_turn_key"] = turn_key
+                save_session(cid, sess)
+                print(stop_json)
+                return 0
+
+            # Already bounced once on this exact user turn?
+            now = time.time()
+            if sess.get("bounced_turn_key") == turn_key:
+                prev_steps = int(sess.get("bounced_at_planner_steps") or 0)
+                prev_ts = float(sess.get("bounced_at_ts") or 0.0)
+                if cur["planner_steps"] <= prev_steps and (now - prev_ts) < 15.0:
+                    # Duplicate hook firing within the same Stop pass (relay + hooks.json): do not finalize or re-bounce
+                    print(stop_json)
+                    return 0
+                _record_turn_outcome(
+                    cid,
+                    cwd,
+                    "MISSED_OR_UNRECORDED",
+                    summary="Agent stopped after compound check without writing docs/learnings/ or calling record/skip",
+                    code_edits=cur["repo_code_edits"],
+                    error_steps=cur["error_steps"],
+                    turn_key=turn_key,
+                )
+                sess["finalized_turn_key"] = turn_key
+                save_session(cid, sess)
+                print(stop_json)
+                return 0
+
+            if payload.get("stopHookActive"):
+                _record_turn_outcome(
+                    cid,
+                    cwd,
+                    "MISSED_OR_UNRECORDED",
+                    summary="stopHookActive already true without compound capture/skip",
+                    code_edits=cur["repo_code_edits"],
+                    error_steps=cur["error_steps"],
+                    turn_key=turn_key,
+                )
+                sess["finalized_turn_key"] = turn_key
+                save_session(cid, sess)
+                print(stop_json)
+                return 0
+
+            # Substantive repo mutation without a compound check -> enforce gate or auto-extract
+            mode = str(state.get("mode") or "gate")
+            if mode == "auto":
+                _record_turn_outcome(
+                    cid,
+                    cwd,
+                    "AUTO_QUEUED",
+                    summary=f"Queued background extraction for {len(cur['repo_code_edits'])} repo files",
+                    code_edits=cur["repo_code_edits"],
+                    error_steps=cur["error_steps"],
+                    turn_key=turn_key,
+                )
+                sess["finalized_turn_key"] = turn_key
+                save_session(cid, sess)
+                _launch_auto_extract(cid, cwd)
+                print(stop_json)
+                return 0
+
+            sess["bounced_turn_key"] = turn_key
+            sess["bounced_at_planner_steps"] = cur["planner_steps"]
+            sess["bounced_at_ts"] = now
+            save_session(cid, sess)
+
+        update_state(lambda s: s.__setitem__("bounces", int(s.get("bounces") or 0) + 1))
+        edited_preview = ", ".join((cur["repo_code_edits"] or cur["mutating_cmds"])[:6])
+        more = len(cur["repo_code_edits"]) - 6
+        if more > 0:
+            edited_preview += f" (+{more} more)"
+        log_event(
+            f"[BOUNCE] cid={cid[:8]} edits={len(cur['repo_code_edits'])} "
+            f"cmds={len(cur['mutating_cmds'])} errs={cur['error_steps']}"
+        )
+        reason_msg = (
+            "<compound-check>\n"
+            f"Before concluding this turn, review all substantive changes made ({edited_preview}; "
+            f"error_signals={cur['error_steps']}):\n"
+            "1. Enumerate every distinct root cause, invariant, workaround, or non-obvious bug solved (1..N items).\n"
+            "2. For each item that passes the `compound` Strict Gate, write/update its own "
+            "`docs/learnings/<category>/<slug>.md` file and update `docs/learnings/README.md` — "
+            "capture ALL distinct qualifying lessons (`1..N` files), never stop after just one.\n"
+            "3. Record captured/updated files:\n"
+            "   `~/.local/bin/agy-compound record --files docs/learnings/... --summary \"...\"`\n"
+            "4. If all edits were strictly routine/trivial, record the skip reason per item:\n"
+            "   `~/.local/bin/agy-compound skip \"<item>: <why routine>\"`\n"
+            "</compound-check>"
+        )
+        print(json.dumps({"decision": "continue", "reason": reason_msg}))
+        return 0
+    except Exception as exc:
+        log_event(f"[ERROR] stop-hook exception: {exc}")
+        print(stop_json)
+        return 0
+
+
+def _mark_active_turn_recorded(cid: str, turn_key: str, outcome: str) -> None:
+    if not cid or not turn_key:
+        return
+    with file_lock(session_lock_path(cid)):
+        sess = load_session(cid)
+        rec_map = dict(sess.get("recorded_turns") or {})
+        rec_map[turn_key] = outcome
+        sess["recorded_turns"] = rec_map
+        sess["finalized_turn_key"] = turn_key
+        save_session(cid, sess)
+
+
+def cmd_record(args: argparse.Namespace) -> int:
+    cwd = str(Path(args.cwd or os.getcwd()).resolve())
+    cid = _resolve_active_cid(args.cid or "", cwd)
+    repo_root = resolve_repo_root(cwd)
+    turn_key = ""
+    code_edits: list[str] = []
+    err_steps = 0
+    if cid:
+        tp = resolve_transcript_path(cid)
+        if tp:
+            an = analyze_transcript_turns(tp, cid=cid, repo_root=repo_root, cwd=cwd)
+            if an["turns"]:
+                turn_key = an["turns"][-1]["turn_key"]
+                code_edits = an["turns"][-1]["repo_code_edits"]
+                err_steps = an["turns"][-1]["error_steps"]
+    outcome = "UPDATED" if args.updated else "CAPTURED"
+    _record_turn_outcome(
+        cid,
+        cwd,
+        outcome,
+        files=list(args.files or []),
+        summary=args.summary or f"Recorded {len(args.files or [])} learning file(s)",
+        code_edits=code_edits,
+        error_steps=err_steps,
+        turn_key=turn_key,
+    )
+    _mark_active_turn_recorded(cid, turn_key, outcome)
+    print(f"agy-compound: {outcome} ({len(args.files or [])} file(s)) recorded.")
+    return 0
+
+
+def cmd_skip(args: argparse.Namespace) -> int:
+    cwd = str(Path(args.cwd or os.getcwd()).resolve())
+    cid = _resolve_active_cid(args.cid or "", cwd)
+    repo_root = resolve_repo_root(cwd)
+    turn_key = ""
+    code_edits: list[str] = []
+    err_steps = 0
+    if cid:
+        tp = resolve_transcript_path(cid)
+        if tp:
+            an = analyze_transcript_turns(tp, cid=cid, repo_root=repo_root, cwd=cwd)
+            if an["turns"]:
+                turn_key = an["turns"][-1]["turn_key"]
+                code_edits = an["turns"][-1]["repo_code_edits"]
+                err_steps = an["turns"][-1]["error_steps"]
+    reason = " ".join(args.reason).strip() or "routine change"
+    _record_turn_outcome(
+        cid,
+        cwd,
+        "SKIPPED_ROUTINE",
+        reason=reason,
+        code_edits=code_edits,
+        error_steps=err_steps,
+        turn_key=turn_key,
+    )
+    _mark_active_turn_recorded(cid, turn_key, "SKIPPED_ROUTINE")
+    print(f"agy-compound: SKIPPED_ROUTINE recorded ({reason}).")
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    st = load_state()
+    cwd = str(Path(args.cwd or os.getcwd()).resolve())
+    repo_root = resolve_repo_root(cwd)
+    tree = inspect_learnings_tree(repo_root)
+    audits = read_audit_records()
+    counts = Counter(str(a.get("outcome") or "UNKNOWN") for a in audits)
+
+    print(
+        f"agy-compound: {'ON' if st.get('enabled', True) else 'OFF'} | "
+        f"mode={st.get('mode', 'gate')} | model={st.get('model')} | "
+        f"bounces={st.get('bounces', 0)} captures={st.get('captures', 0)} skips={st.get('skips', 0)}"
+    )
+    if audits:
+        summary_bits = ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
+        print(f"audit history ({len(audits)} total): {summary_bits}")
+    else:
+        print("audit history: 0 records yet (turns are tracked dynamically on Stop or via `agy-compound audit`)")
+
+    if tree.get("exists"):
+        health = "OK"
+        issues: list[str] = []
+        if not tree["readme_exists"]:
+            issues.append("missing README.md")
+        if tree["unindexed"]:
+            issues.append(f"{len(tree['unindexed'])} unindexed")
+        if tree["broken_links"]:
+            issues.append(f"{len(tree['broken_links'])} broken links")
+        if tree["missing_frontmatter"]:
+            issues.append(f"{len(tree['missing_frontmatter'])} bad frontmatter")
+        if tree["missing_refs"]:
+            issues.append(f"{len(tree['missing_refs'])} missing ## References")
+        if issues:
+            health = "WARN: " + ", ".join(issues)
+        print(f"repo learnings ({tree['repo_root']}): {tree['total_docs']} docs | index={health}")
+        if tree["promote_candidates"]:
+            print("promote candidates (References >= 3):")
+            for rel, refs, title in tree["promote_candidates"]:
+                print(f"  - [{refs} refs] {rel} — {title}")
+            print("  tip: run /correct to enforce repeated pitfalls in types/lint/tests before adding prose rules")
+    else:
+        print(f"repo learnings: none under {cwd}")
+    return 0
+
+
+def _collect_live_audit_rows(cwd: str, cid_filter: str, scan_all: bool, limit: int) -> list[dict[str, Any]]:
+    stored = read_audit_records()
+    by_cid_turn: dict[tuple[str, str], dict[str, Any]] = {}
+    rows: list[dict[str, Any]] = []
+    for rec in stored:
+        if cid_filter and not str(rec.get("cid") or "").startswith(cid_filter):
+            continue
+        k = (str(rec.get("cid") or ""), str(rec.get("turn_key") or ""))
+        if k[0] and k[1]:
+            by_cid_turn[k] = rec
+        rows.append(rec)
+
+    repo_root = resolve_repo_root(cwd)
+    if BRAIN_DIR.is_dir():
+        tp_list = sorted(
+            BRAIN_DIR.glob("*/.system_generated/logs/transcript.jsonl"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )[:30]
+        for tp in tp_list:
+            scid = tp.parents[2].name
+            if cid_filter and not scid.startswith(cid_filter):
+                continue
+            inferred_rr_str = _infer_repo_from_transcript(tp)
+            scid_rr = Path(inferred_rr_str) if inferred_rr_str else None
+            if not scan_all and repo_root and scid_rr and scid_rr != repo_root:
+                continue
+            an = analyze_transcript_turns(tp, cid=scid, repo_root=scid_rr or repo_root, cwd=inferred_rr_str or cwd)
+            if an["is_worker"]:
+                continue
+            for t in an["turns"]:
+                k = (scid, t["turn_key"])
+                if k in by_cid_turn:
+                    continue
+                if t["learning_doc_writes"]:
+                    outcome = "CAPTURED"
+                    summary = f"Learnings written: {', '.join(t['learning_doc_writes'])}"
+                elif t["compound_action"] == "skip":
+                    outcome = "SKIPPED_ROUTINE"
+                    summary = "Skipped via CLI"
+                elif t["substantive"]:
+                    outcome = "MISSED_OR_UNAUDITED"
+                    summary = f"Substantive edits ({len(t['repo_code_edits'])} code, {t['error_steps']} err signals) without capture"
+                else:
+                    outcome = "SKIPPED_READONLY"
+                    summary = "Read-only / check-only / external"
+                rows.append(
+                    {
+                        "ts": t["end_ts"] or t["start_ts"] or dt.datetime.fromtimestamp(tp.stat().st_mtime, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "cid": scid,
+                        "project": (scid_rr.name if scid_rr else (repo_root.name if repo_root else "")),
+                        "turn_key": t["turn_key"],
+                        "outcome": outcome,
+                        "files": t["learning_doc_writes"],
+                        "code_edits": t["repo_code_edits"],
+                        "error_steps": t["error_steps"],
+                        "summary": summary,
+                        "source": "transcript_scan",
+                    }
+                )
+
+    rows.sort(key=lambda r: str(r.get("ts") or ""), reverse=True)
+    return rows[: max(1, limit)]
+
+
+def cmd_audit(args: argparse.Namespace) -> int:
+    cwd = str(Path(args.cwd or os.getcwd()).resolve())
+    rows = _collect_live_audit_rows(cwd, args.cid or "", bool(args.all), int(args.n))
+    if args.json:
+        print(json.dumps({"records": rows}, indent=2))
+        return 0
+    if not rows:
+        print("agy-compound audit: no matching turns found.")
+        return 0
+    for r in rows:
+        ts = str(r.get("ts") or "")[:19].replace("T", " ")
+        cid_s = str(r.get("cid") or "")[:8] or "manual  "
+        proj = str(r.get("project") or "-")[:16]
+        outc = str(r.get("outcome") or "")
+        edits_n = len(r.get("code_edits") or [])
+        files_n = len(r.get("files") or [])
+        errs = int(r.get("error_steps") or 0)
+        summary = str(r.get("summary") or "")[:90]
+        src = " [scan]" if r.get("source") == "transcript_scan" else ""
+        print(f"{ts}  {cid_s}  {proj:<16}  {outc:<21}  edits={edits_n:<2} docs={files_n:<2} err={errs:<2}  {summary}{src}")
+    return 0
+
+
+def _build_extract_prompt(repo_root: Path, turns_summary: list[dict[str, Any]]) -> str:
+    payload = json.dumps(turns_summary, indent=2)
+    return (
+        "Analyze these substantive session turn(s) and extract ALL distinct non-trivial, durable learnings (1..N).\n"
+        f"Repository root: {repo_root}\n\n"
+        "Strict gate per distinct root cause/invariant/workaround:\n"
+        "1) Solved and verified? 2) Non-trivial? 3) Durable (could a future agent repeat it)?\n"
+        "Return strict JSON matching:\n"
+        '{"lessons": [{"qualifies": true, "category": "<cat>", "slug": "<3-6-word-kebab>", '
+        '"title": "<title>", "tags": ["..."], "summary": "<concise technical takeaway>", '
+        '"skip_reason": ""}]}\n\n'
+        f"Turn trace:\n{payload}"
+    )
+
+
+def cmd_extract(args: argparse.Namespace) -> int:
+    cwd = str(Path(args.cwd or os.getcwd()).resolve())
+    repo_root = resolve_repo_root(cwd)
+    if repo_root is None:
+        print("agy-compound extract: not inside a git repository.")
+        return 1
+    cid = _resolve_active_cid(args.cid or "", cwd)
+    if not cid:
+        print("agy-compound extract: no active conversation ID found.")
+        return 1
+    tp = resolve_transcript_path(cid)
+    if tp is None:
+        print(f"agy-compound extract: no transcript found for {cid[:8]}.")
+        return 1
+
+    an = analyze_transcript_turns(tp, cid=cid, repo_root=repo_root, cwd=cwd)
+    substantive_turns = [t for t in an["turns"] if t["substantive"] or args.force]
+    if not substantive_turns:
+        if not args.quiet:
+            print(f"agy-compound extract: no substantive repo mutations in {cid[:8]}.")
+        return 0
+
+    agy_bin = shutil.which("agy")
+    if not agy_bin:
+        print("agy-compound extract: `agy` CLI not found on PATH.")
+        return 1
+
+    st = load_state()
+    model = str(st.get("model") or "gemini-3.8-flash-low")
+    prompt = _build_extract_prompt(repo_root, substantive_turns[-2:])
+    cmd = [agy_bin, "--mode", "plan", "--model", model, "--output-format", "json", "-p", prompt]
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            cwd=str(repo_root),
+            env={**os.environ, "AGY_HOOK_INTERNAL": "1", "WSL_INTEROP": "1"},
+        )
+    except Exception as exc:
+        log_event(f"[ERROR] extract failed cid={cid[:8]}: {exc}")
+        if not args.quiet:
+            print(f"agy-compound extract failed: {exc}")
+        return 1
+
+    raw = (proc.stdout or "").strip()
+    if args.dry_run or not args.quiet:
+        print(raw[:4000] if raw else "(empty extractor response)")
+    log_event(f"[EXTRACT] cid={cid[:8]} rc={proc.returncode} dry_run={bool(args.dry_run)}")
+    return 0 if proc.returncode == 0 else 1
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    cwd = str(Path(args.cwd or os.getcwd()).resolve())
+    repo_root = resolve_repo_root(cwd)
+    st = load_state()
+    problems = 0
+
+    print(f"agy-compound doctor ({utc_iso_now()}):")
+    print(f"  state: enabled={st.get('enabled')} mode={st.get('mode')} model={st.get('model')}")
+
+    # 1. Hook registration check
+    mem_hooks = HOME / ".gemini" / "config" / "plugins" / "memory" / "hooks.json"
+    hook_ok = False
+    if mem_hooks.is_file():
+        with contextlib.suppress(Exception):
+            hj = json.loads(mem_hooks.read_text(encoding="utf-8"))
+            stop_list = (hj.get("repo-memory") or {}).get("Stop") or []
+            hook_ok = any("agy-compound stop-hook" in str(h.get("command") or "") for h in stop_list if isinstance(h, dict))
+    print(f"  hook wiring ({mem_hooks}): {'OK' if hook_ok else 'MISSING agy-compound stop-hook'}")
+    if not hook_ok:
+        problems += 1
+
+    # 2. Binary check
+    bin_path = Path(__file__).resolve()
+    is_exec = os.access(bin_path, os.X_OK)
+    print(f"  executable ({bin_path}): {'OK' if is_exec else 'NOT EXECUTABLE'}")
+    if not is_exec:
+        problems += 1
+
+    # 3. Repo docs/learnings integrity
+    tree = inspect_learnings_tree(repo_root)
+    if tree.get("exists"):
+        print(f"  learnings tree ({tree['learnings_dir']}): {tree['total_docs']} file(s), README={'OK' if tree['readme_exists'] else 'MISSING'}")
+        if not tree["readme_exists"]:
+            problems += 1
+        for key, label in (
+            ("unindexed", "unindexed learning files"),
+            ("broken_links", "broken links in README.md"),
+            ("missing_frontmatter", "missing YAML frontmatter fields"),
+            ("missing_refs", "missing integer ## References trailer"),
+        ):
+            vals = tree.get(key) or []
+            if vals:
+                if key == "broken_links":
+                    problems += len(vals)
+                print(f"    WARN {label} ({len(vals)}): {', '.join(vals[:5])}")
+        if not any(tree.get(k) for k in ("unindexed", "broken_links", "missing_frontmatter", "missing_refs")) and tree["readme_exists"]:
+            print("    index & frontmatter checks: ALL OK")
+    else:
+        print(f"  learnings tree: not present under {cwd} (skipped)")
+
+    # 4. Recent missed turns
+    rows = _collect_live_audit_rows(cwd, "", False, 15)
+    missed = [r for r in rows if r.get("outcome") in ("MISSED_OR_UNRECORDED", "MISSED_OR_UNAUDITED")]
+    print(f"  recent turns inspected: {len(rows)} | missed/unaudited={len(missed)}")
+    return 0 if problems == 0 else 1
+
+
+def cmd_logs(args: argparse.Namespace) -> int:
+    if not LOG_FILE.is_file():
+        print(f"(no log file yet: {LOG_FILE})")
+        return 0
+    lines = LOG_FILE.read_text(encoding="utf-8", errors="replace").splitlines()
+    for line in lines[-max(1, args.n) :]:
+        print(line)
+    return 0
+
+
+def cmd_toggle(enabled: bool) -> int:
+    st = update_state(lambda s: s.__setitem__("enabled", enabled))
+    print(f"agy-compound: {'ON' if st['enabled'] else 'OFF'}")
+    return 0
+
+
+def cmd_mode(mode: str) -> int:
+    st = update_state(lambda s: s.__setitem__("mode", mode))
+    print(f"agy-compound mode: {st['mode']}")
+    return 0
+
+
+def cmd_model(model: str) -> int:
+    st = update_state(lambda s: s.__setitem__("model", model))
+    print(f"agy-compound model: {st['model']}")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="agy-compound", description="Audit & Stop-hook gate for docs/learnings/.")
+    sub = p.add_subparsers(dest="cmd")
+
+    sub.add_parser("stop-hook")
+
+    st = sub.add_parser("status")
+    st.add_argument("--cwd", default="")
+
+    au = sub.add_parser("audit")
+    au.add_argument("-n", type=int, default=15)
+    au.add_argument("--cid", default="")
+    au.add_argument("--cwd", default="")
+    au.add_argument("--all", action="store_true")
+    au.add_argument("--json", action="store_true")
+
+    rec = sub.add_parser("record")
+    rec.add_argument("--cid", default="")
+    rec.add_argument("--cwd", default="")
+    rec.add_argument("--files", nargs="+", default=[])
+    rec.add_argument("--summary", default="")
+    rec.add_argument("--updated", action="store_true")
+
+    sk = sub.add_parser("skip")
+    sk.add_argument("reason", nargs="+")
+    sk.add_argument("--cid", default="")
+    sk.add_argument("--cwd", default="")
+
+    ex = sub.add_parser("extract")
+    ex.add_argument("--cid", default="")
+    ex.add_argument("--cwd", default="")
+    ex.add_argument("--dry-run", action="store_true")
+    ex.add_argument("--force", action="store_true")
+    ex.add_argument("--quiet", action="store_true")
+
+    doc = sub.add_parser("doctor")
+    doc.add_argument("--cwd", default="")
+
+    lg = sub.add_parser("logs")
+    lg.add_argument("-n", type=int, default=40)
+
+    sub.add_parser("on")
+    sub.add_parser("off")
+
+    md = sub.add_parser("mode")
+    md.add_argument("mode", choices=["gate", "auto"])
+
+    ml = sub.add_parser("model")
+    ml.add_argument("model")
+    return p
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    cmd = args.cmd or "status"
+    if cmd == "stop-hook":
+        return cmd_stop_hook(args)
+    if cmd == "status":
+        return cmd_status(args)
+    if cmd == "audit":
+        return cmd_audit(args)
+    if cmd == "record":
+        return cmd_record(args)
+    if cmd == "skip":
+        return cmd_skip(args)
+    if cmd == "extract":
+        return cmd_extract(args)
+    if cmd == "doctor":
+        return cmd_doctor(args)
+    if cmd == "logs":
+        return cmd_logs(args)
+    if cmd == "on":
+        return cmd_toggle(True)
+    if cmd == "off":
+        return cmd_toggle(False)
+    if cmd == "mode":
+        return cmd_mode(args.mode)
+    if cmd == "model":
+        return cmd_model(args.model)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
