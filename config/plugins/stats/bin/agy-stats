@@ -917,6 +917,44 @@ def _resolve_initial_model(cid, conv_first_from, subagent_info, conv_meta, inter
         return "Gemini 4 Argon (High)"
     return "Gemini 4 Argon (Medium)"
 
+def _clean_preview_for_title(raw_text, max_len=60):
+    s = str(raw_text or "").strip()
+    if not s:
+        return ""
+    m_req = re.search(r"<USER_REQUEST>(.*?)</USER_REQUEST>", s, re.DOTALL)
+    if m_req:
+        s = m_req.group(1).strip()
+    s = re.sub(r"<(?:ADDITIONAL_METADATA|USER_SETTINGS_CHANGE)>.*?</(?:ADDITIONAL_METADATA|USER_SETTINGS_CHANGE)>", "", s, flags=re.DOTALL)
+    first_line = ""
+    for ln in s.splitlines():
+        cand = ln.strip()
+        if cand and not cand.startswith("[AGY_INTERNAL_WORKER]"):
+            first_line = cand
+            break
+    first_line = re.sub(r"\s+", " ", first_line).strip()
+    if not first_line or first_line in ("/resume", "/remote-control", "/quit", "/exit"):
+        return ""
+    if len(first_line) > max_len:
+        return first_line[: max_len - 1].rstrip() + "…"
+    return first_line
+
+
+def _resolve_session_display_title(cid, meta_entry, agent_type, sub_tuple, conv_meta, is_internal_worker=False, first_user_text=""):
+    raw_t = (meta_entry.get("title") or "").strip()
+    if raw_t and raw_t != "Untitled Session":
+        return raw_t
+    if is_internal_worker:
+        return f"Internal Worker ({cid[:8]})"
+    parent_cid = (meta_entry.get("parent") or (sub_tuple[2] if sub_tuple and len(sub_tuple) > 2 else "") or "").strip()
+    if parent_cid:
+        p_title = ((conv_meta.get(parent_cid) or {}).get("title") or "").strip()
+        if p_title and p_title != "Untitled Session":
+            return f"{p_title} › {agent_type}"
+        return f"{agent_type} ({cid[:8]})"
+    prev_t = _clean_preview_for_title(first_user_text) or _clean_preview_for_title(meta_entry.get("preview") or "")
+    return prev_t or "Untitled Session"
+
+
 def load_raw_telemetry(force=False):
     global _TELEMETRY_CACHE, _TELEMETRY_CACHE_TIME
     now = time.time()
@@ -928,6 +966,7 @@ def load_raw_telemetry(force=False):
     t0 = time.time()
     roots = _discover_agy_roots()
     conv_meta = {}
+    summary_worker_cids = set()
     for root in roots:
         conv_db = os.path.join(root, "conversation_summaries.db")
         if os.path.exists(conv_db):
@@ -944,8 +983,10 @@ def load_raw_telemetry(force=False):
                         prev_entry = conv_meta.get(cid_row)
                         if prev_entry and prev_entry.get("step_count", 0) > step_cnt:
                             continue
+                        if "[AGY_INTERNAL_WORKER]" in (r[2] or ""):
+                            summary_worker_cids.add(cid_row)
                         conv_meta[cid_row] = {
-                            "title": r[1] or "Untitled Session",
+                            "title": (r[1] or "").strip(),
                             "preview": r[2] or "",
                             "step_count": step_cnt,
                             "last_modified": r[4] or "",
@@ -979,7 +1020,7 @@ def load_raw_telemetry(force=False):
     # Pass 1: Discover initial models, native subagents, and internal worker sessions
     conv_first_from = {}
     subagent_info = {}
-    internal_worker_cids = set()
+    internal_worker_cids = set(summary_worker_cids)
     attached_internal_children = defaultdict(set)
 
     if os.path.isfile(INTERNAL_SUBAGENTS_PATH):
@@ -1125,6 +1166,8 @@ def load_raw_telemetry(force=False):
         sub_tuple = subagent_info.get(cid)
         agent_type = meta_entry.get("agent") or (sub_tuple[0] if sub_tuple and sub_tuple[0] else ("subagent" if meta_entry.get("parent") else "Lead"))
         is_internal_worker = cid in internal_worker_cids
+        first_user_text_for_title = ""
+        eff_title = _resolve_session_display_title(cid, meta_entry, agent_type, sub_tuple, conv_meta, is_internal_worker=is_internal_worker)
 
         ws_proj = infer_project_from_path(meta_ws) if meta_ws else None
         if ws_proj and ws_proj.startswith("~/.gemini/"):
@@ -1207,7 +1250,7 @@ def load_raw_telemetry(force=False):
                             "signature": sig,
                             "msg": err_line[:180],
                             "fullMsg": content[:2400] if content else err_line,
-                            "title": meta_entry.get("title", "Untitled Session")
+                            "title": eff_title
                         })
                     else:
                         if consecutive_errors >= 2 and not is_internal_worker:
@@ -1219,7 +1262,7 @@ def load_raw_telemetry(force=False):
                                 "detail": f"{consecutive_errors} consecutive failed attempts",
                                 "time": raw_dt,
                                 "ts": ts_ms,
-                                "title": meta_entry.get("title", "Untitled Session")
+                                "title": eff_title
                             })
                         consecutive_errors = 0
 
@@ -1231,6 +1274,14 @@ def load_raw_telemetry(force=False):
                             user_text = req_m.group(1).strip() if req_m else content.strip()
 
                             if user_text and not user_text.startswith("This is a side question") and "[AGY_INTERNAL_WORKER]" not in user_text:
+                                if not first_user_text_for_title:
+                                    first_user_text_for_title = user_text
+                                    if eff_title == "Untitled Session":
+                                        eff_title = _resolve_session_display_title(
+                                            cid, meta_entry, agent_type, sub_tuple, conv_meta,
+                                            is_internal_worker=is_internal_worker,
+                                            first_user_text=first_user_text_for_title,
+                                        )
                                 turns_cnt += 1
                                 user_turn_events.append((cid, ts_ms))
                                 found_for_turn = set()
@@ -1249,7 +1300,7 @@ def load_raw_telemetry(force=False):
                                         "detail": f'"{matched_str}" — {first_line}',
                                         "time": raw_dt,
                                         "ts": ts_ms,
-                                        "title": meta_entry.get("title", "Untitled Session")
+                                        "title": eff_title
                                     })
 
                     if stype == "PLANNER_RESPONSE" and "input_tokens" in d:
@@ -1339,7 +1390,7 @@ def load_raw_telemetry(force=False):
                             "date": loc_dt_str,
                             "model": current_model,
                             "agent": agent_type,
-                            "title": meta_entry.get("title") or (f"{agent_type} ({cid[:8]})" if meta_entry.get("parent") else "Untitled Session"),
+                            "title": eff_title,
                             "project": inferred_proj or fallback_tool_proj or ws_proj or "(unassigned)",
                             "in": inp,
                             "out": out,
@@ -1363,15 +1414,16 @@ def load_raw_telemetry(force=False):
                         pending_tool_events = []
 
             proj_final = inferred_proj or fallback_tool_proj or ws_proj or "(unassigned)"
-            # Backfill inferred project onto requests of this session
+            # Backfill inferred project and resolved title onto requests of this session
             for r in reversed(all_requests):
                 if r["cid"] != cid:
                     break
                 r["project"] = proj_final
+                r["title"] = eff_title
 
             session_base[cid] = {
                 "cid": cid,
-                "title": meta_entry.get("title") or (f"{agent_type} ({cid[:8]})" if meta_entry.get("parent") else "Untitled Session"),
+                "title": eff_title,
                 "preview": (meta_entry.get("preview") or "")[:140],
                 "workspace": proj_final,
                 "agent": agent_type,

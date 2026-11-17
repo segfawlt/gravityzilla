@@ -15,6 +15,7 @@ Storage root: ~/.agents/memories/
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
 import fcntl
 import glob
@@ -25,6 +26,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +46,7 @@ PI_SESSIONS_DIR = HOME / ".pi" / "agent" / "sessions"
 COMPOUND_BIN = Path("/home/domixi/.local/bin/agy-compound")
 
 INTERNAL_MARKER = "[AGY_INTERNAL_WORKER]"
+UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 DEFAULT_MODEL = "gemini-3.8-flash-low"
 SYNC_COOLDOWN_SEC = 1200  # 20 minutes between automatic background checks
 MIN_IDLE_SEC = 1800       # Only distill transcripts idle >= 30 minutes (unless --force)
@@ -416,23 +419,154 @@ def find_agy_binary() -> str:
     raise RuntimeError("agy binary not found")
 
 
+def _snapshot_agy_state(
+    gemini_root: Path = HOME / ".gemini",
+    products: tuple[str, ...] = AGY_PRODUCTS,
+) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
+    """Snapshot existing brain directories and conversation stems across agy products."""
+    brains: dict[str, set[str]] = {}
+    convs: dict[str, set[str]] = {}
+    for prod in products:
+        pdir = gemini_root / prod
+        bdir = pdir / "brain"
+        brains[prod] = set(os.listdir(bdir)) if bdir.is_dir() else set()
+        cdir = pdir / "conversations"
+        cset: set[str] = set()
+        if cdir.is_dir():
+            for ext in ("*.db", "*.pb"):
+                for p in cdir.glob(ext):
+                    if UUID_RE.match(p.stem):
+                        cset.add(p.stem)
+        convs[prod] = cset
+    return brains, convs
+
+
+def _db_step0_has_marker(db_path: Path, marker: str = INTERNAL_MARKER) -> bool:
+    """Return True when a conversation SQLite DB's step 0 payload contains marker."""
+    try:
+        if not db_path.is_file() or db_path.stat().st_size == 0:
+            return False
+        with contextlib.closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=0.5)) as conn:
+            row = conn.execute("SELECT step_payload FROM steps WHERE idx = 0 LIMIT 1").fetchone()
+        return bool(row and row[0] and marker.encode("utf-8") in bytes(row[0]))
+    except Exception:
+        return False
+
+
+def _discover_new_worker_cids(
+    existing_brains: dict[str, set[str]],
+    existing_convs: dict[str, set[str]],
+    ephemeral_cid: str = "",
+    gemini_root: Path = HOME / ".gemini",
+    products: tuple[str, ...] = AGY_PRODUCTS,
+) -> set[str]:
+    """Identify newly created internal worker conversation IDs across brain, SQLite DBs, and summaries."""
+    found: set[str] = set()
+    if ephemeral_cid and UUID_RE.match(ephemeral_cid):
+        found.add(ephemeral_cid)
+    for prod in products:
+        pdir = gemini_root / prod
+        bdir = pdir / "brain"
+        if bdir.is_dir():
+            for nb in set(os.listdir(bdir)) - existing_brains.get(prod, set()):
+                if not UUID_RE.match(nb):
+                    continue
+                tpath = bdir / nb / ".system_generated" / "logs" / "transcript.jsonl"
+                if tpath.is_file():
+                    with contextlib.suppress(Exception):
+                        with tpath.open("r", encoding="utf-8", errors="ignore") as tf:
+                            first = tf.readline()
+                        if INTERNAL_MARKER in first:
+                            found.add(nb)
+        cdir = pdir / "conversations"
+        if cdir.is_dir():
+            current_stems = {p.stem for p in cdir.glob("*.db") if UUID_RE.match(p.stem)}
+            for ncid in current_stems - existing_convs.get(prod, set()):
+                if _db_step0_has_marker(cdir / f"{ncid}.db"):
+                    found.add(ncid)
+        sum_db = pdir / "conversation_summaries.db"
+        if sum_db.is_file():
+            with contextlib.suppress(Exception):
+                with contextlib.closing(sqlite3.connect(f"file:{sum_db}?mode=ro", uri=True, timeout=0.5)) as sconn:
+                    for (cid_val, _prev) in sconn.execute(
+                        "SELECT conversation_id, preview FROM conversation_summaries WHERE preview LIKE ?",
+                        (f"%{INTERNAL_MARKER}%",),
+                    ):
+                        cstr = str(cid_val or "").strip()
+                        if UUID_RE.match(cstr) and cstr not in existing_convs.get(prod, set()):
+                            found.add(cstr)
+    return found
+
+
+def purge_ephemeral_conversations(
+    cids: set[str],
+    gemini_root: Path = HOME / ".gemini",
+    products: tuple[str, ...] = AGY_PRODUCTS,
+) -> int:
+    """Remove all brain, conversation SQLite/protobuf, presence, and summary index rows for given UUIDs."""
+    valid = sorted(str(c) for c in cids if UUID_RE.match(str(c)))
+    if not valid:
+        return 0
+    for prod in products:
+        pdir = gemini_root / prod
+        for ccid in valid:
+            shutil.rmtree(pdir / "brain" / ccid, ignore_errors=True)
+            for ext in (".pb", ".db", ".db-wal", ".db-shm"):
+                with contextlib.suppress(OSError):
+                    (pdir / "conversations" / f"{ccid}{ext}").unlink(missing_ok=True)
+            with contextlib.suppress(OSError):
+                (pdir / "presence" / f"{ccid}.lock").unlink(missing_ok=True)
+        sum_db = pdir / "conversation_summaries.db"
+        if sum_db.is_file():
+            with contextlib.suppress(Exception):
+                with contextlib.closing(sqlite3.connect(str(sum_db), timeout=3.0)) as sconn:
+                    params = [(c,) for c in valid]
+                    sconn.executemany(
+                        "DELETE FROM conversation_summaries WHERE conversation_id = ?",
+                        params,
+                    )
+                    with contextlib.suppress(sqlite3.OperationalError):
+                        sconn.executemany(
+                            "DELETE FROM conversations_fts WHERE conversation_id = ?",
+                            params,
+                        )
+                    with contextlib.suppress(sqlite3.OperationalError):
+                        sconn.executemany(
+                            "DELETE FROM conversation_parents WHERE conversation_id = ?",
+                            params,
+                        )
+                    sconn.commit()
+    return len(valid)
+
+
 def call_llm_json(prompt_text: str, schema: dict[str, Any], model: str, timeout: int = 90) -> dict[str, Any] | None:
     agy_bin = find_agy_binary()
     env = os.environ.copy()
     env["AGY_HOOK_INTERNAL"] = "1"
     env["WSL_INTEROP"] = "1"
-    existing_brains = set(os.listdir(AGY_BRAIN_DIR)) if AGY_BRAIN_DIR.is_dir() else set()
+    existing_brains, existing_convs = _snapshot_agy_state()
     ephemeral_cid = ""
+    tmp_log = Path(f"/tmp/agy-memory-worker-{os.getpid()}-{time.time_ns()}.log")
+    worker_guard = (
+        "Do NOT call any filesystem, search, or shell tools (run_command, read_file, etc.). "
+        "Distill strictly from the text provided below and return the JSON response immediately."
+    )
     cmd = [
         agy_bin,
+        "--mode",
+        "plan",
         "--model",
         model,
         "--disable-slash-commands",
+        "--log-file",
+        str(tmp_log),
+        "--print-timeout",
+        f"{max(10, int(timeout) - 5)}s",
         "--output-format",
         "json",
         "--json-schema",
         json.dumps(schema),
-        f"--print={INTERNAL_MARKER}\n{prompt_text}",
+        f"--print={INTERNAL_MARKER}\n{worker_guard}\n\n{prompt_text}",
     ]
     try:
         proc = subprocess.run(
@@ -444,51 +578,29 @@ def call_llm_json(prompt_text: str, schema: dict[str, Any], model: str, timeout:
             timeout=timeout,
         )
         if proc.returncode != 0:
+            log_event(f"[LLM-ERR] model={model} rc={proc.returncode} stderr={(proc.stderr or '').strip()[:200]}")
             return None
         out = proc.stdout.strip()
         if not out:
+            log_event(f"[LLM-ERR] model={model} empty stdout")
             return None
         envelope = json.loads(out)
-        ephemeral_cid = str(envelope.get("conversation_id") or "")
+        ephemeral_cid = str(envelope.get("conversation_id") or envelope.get("session_id") or "")
         if isinstance(envelope.get("structured_output"), dict):
             return envelope["structured_output"]
         resp_text = str(envelope.get("response") or "").strip()
         if resp_text:
             return json.loads(resp_text)
         return None
-    except Exception:
+    except Exception as exc:
+        log_event(f"[LLM-ERR] model={model} err={exc!r}")
         return None
     finally:
-        try:
-            cleaned_cids: set[str] = set()
-            if ephemeral_cid:
-                cleaned_cids.add(ephemeral_cid)
-                if (AGY_BRAIN_DIR / ephemeral_cid).is_dir():
-                    shutil.rmtree(AGY_BRAIN_DIR / ephemeral_cid, ignore_errors=True)
-            if AGY_BRAIN_DIR.is_dir():
-                for nb in set(os.listdir(AGY_BRAIN_DIR)) - existing_brains:
-                    tpath = AGY_BRAIN_DIR / nb / ".system_generated" / "logs" / "transcript.jsonl"
-                    if tpath.is_file():
-                        first = tpath.open("r", encoding="utf-8", errors="ignore").readline()
-                        if INTERNAL_MARKER in first:
-                            cleaned_cids.add(nb)
-                            shutil.rmtree(AGY_BRAIN_DIR / nb, ignore_errors=True)
-            conv_pb_dir = HOME / ".gemini" / "antigravity-cli" / "conversations"
-            conv_sum_db = HOME / ".gemini" / "antigravity-cli" / "conversation_summaries.db"
-            for ccid in cleaned_cids:
-                pb_file = conv_pb_dir / f"{ccid}.pb"
-                if pb_file.is_file():
-                    pb_file.unlink(missing_ok=True)
-            if cleaned_cids and conv_sum_db.is_file():
-                sconn = sqlite3.connect(str(conv_sum_db), timeout=3.0)
-                sconn.executemany(
-                    "DELETE FROM conversation_summaries WHERE conversation_id = ?",
-                    [(c,) for c in cleaned_cids],
-                )
-                sconn.commit()
-                sconn.close()
-        except Exception:
-            pass
+        with contextlib.suppress(OSError):
+            tmp_log.unlink(missing_ok=True)
+        with contextlib.suppress(Exception):
+            cleaned = _discover_new_worker_cids(existing_brains, existing_convs, ephemeral_cid=ephemeral_cid)
+            purge_ephemeral_conversations(cleaned)
 
 
 def load_history_workspace_map(conn: sqlite3.Connection) -> dict[str, str]:
@@ -1824,6 +1936,42 @@ def _merge_legacy_memory_dirs(conn: sqlite3.Connection, fix: bool) -> tuple[list
     return [f"{src.name} -> {dst.name}" for src, dst in legacy_dirs], merged_count
 
 
+def _scan_leaked_worker_conversations(
+    gemini_root: Path = HOME / ".gemini",
+    products: tuple[str, ...] = AGY_PRODUCTS,
+) -> tuple[set[str], int]:
+    """Scan agy conversation DBs and summaries for leaked [AGY_INTERNAL_WORKER] sessions and 0-step stubs."""
+    leaked: set[str] = set()
+    zero_step_cids: set[str] = set()
+    for prod in products:
+        pdir = gemini_root / prod
+        sum_db = pdir / "conversation_summaries.db"
+        if sum_db.is_file():
+            with contextlib.suppress(Exception):
+                with contextlib.closing(sqlite3.connect(f"file:{sum_db}?mode=ro", uri=True, timeout=1.0)) as sconn:
+                    for (cid_val,) in sconn.execute(
+                        "SELECT conversation_id FROM conversation_summaries WHERE preview LIKE ?",
+                        (f"%{INTERNAL_MARKER}%",),
+                    ):
+                        cstr = str(cid_val or "").strip()
+                        if UUID_RE.match(cstr):
+                            leaked.add(cstr)
+                    for (cid_val,) in sconn.execute(
+                        "SELECT conversation_id FROM conversation_summaries WHERE step_count = 0"
+                    ):
+                        cstr = str(cid_val or "").strip()
+                        if UUID_RE.match(cstr):
+                            zero_step_cids.add(cstr)
+        cdir = pdir / "conversations"
+        if cdir.is_dir():
+            for db_file in cdir.glob("*.db"):
+                cid_stem = db_file.stem
+                if UUID_RE.match(cid_stem) and cid_stem not in leaked:
+                    if _db_step0_has_marker(db_file):
+                        leaked.add(cid_stem)
+    return leaked, len(zero_step_cids - leaked)
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     cwd = args.cwd or os.getcwd()
     repo_dir = resolve_workspace_root(cwd)
@@ -1889,7 +2037,20 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         else:
             print(f"  [PASS] 0 drifted memory notes ({len(drift_items)} checked)")
 
-    # 5. Recent session delivery rate
+    # 5. Leaked internal worker & empty stub sessions
+    leaked_workers, zero_step_stubs = _scan_leaked_worker_conversations()
+    if args.fix and leaked_workers:
+        purged = purge_ephemeral_conversations(leaked_workers)
+        log_event(f"[DOCTOR-PURGE] workers={purged}")
+        print(f"  [FIXED] Purged {purged} leaked {INTERNAL_MARKER} session(s)")
+    elif leaked_workers:
+        print(f"  [WARN] {len(leaked_workers)} historical leaked {INTERNAL_MARKER} session(s) present — run with --fix to purge")
+    else:
+        print(f"  [PASS] 0 leaked {INTERNAL_MARKER} sessions")
+    if zero_step_stubs:
+        print(f"  [INFO] {zero_step_stubs} empty 0-step CLI stub session(s) in conversation_summaries (created when bare 'agy' opens before '/resume')")
+
+    # 6. Recent session delivery rate
     recs = _collect_usage_records(conn, target_slug=slug, limit=8)
     v_cnt = sum(1 for r in recs if r["startup_status"] == "VERIFIED")
     d_cnt = sum(1 for r in recs if "DROPPED" in r["startup_status"] or "PANIC" in r["startup_status"])
