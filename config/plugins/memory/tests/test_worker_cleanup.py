@@ -3,10 +3,13 @@
 
 from __future__ import annotations
 
+import fcntl
 import importlib.machinery
 import importlib.util
+import os
 import sqlite3
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from typing import Any
@@ -353,6 +356,87 @@ class WorkerCleanupTests(unittest.TestCase):
             ),
             "Untitled Session",
         )
+
+    def test_reap_zero_step_stubs_respects_locks_age_and_artifacts(self) -> None:
+        dead_old_stub = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        locked_stub = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+        recent_stub = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+        stale_summary_has_steps = "dddddddd-dddd-dddd-dddd-dddddddddddd"
+        stub_with_artifact = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"
+        now = time.time()
+
+        with tempfile.TemporaryDirectory(prefix="agy_zero_stub_reap_") as tmp:
+            root = Path(tmp)
+            cli_dir = root / "antigravity-cli"
+            _create_summaries_db(cli_dir / "conversation_summaries.db")
+
+            # 1. Dead old 0-step stub with empty brain dir
+            _seed_session_artifacts(cli_dir, dead_old_stub, step0_payload=None, step_count=0)
+            (cli_dir / "brain" / dead_old_stub).mkdir(parents=True, exist_ok=True)
+            os.utime(cli_dir / "conversations" / f"{dead_old_stub}.db", (now - 1200, now - 1200))
+
+            # 2. Old 0-step stub actively locked via presence flock
+            _seed_session_artifacts(cli_dir, locked_stub, step0_payload=None, with_lock=True, step_count=0)
+            os.utime(cli_dir / "conversations" / f"{locked_stub}.db", (now - 1200, now - 1200))
+
+            # 3. Recent 0-step stub younger than min_age_sec
+            _seed_session_artifacts(cli_dir, recent_stub, step0_payload=None, step_count=0)
+            os.utime(cli_dir / "conversations" / f"{recent_stub}.db", (now - 30, now - 30))
+
+            # 4. Stale summary (step_count=0) whose DB actually contains steps
+            _seed_session_artifacts(cli_dir, stale_summary_has_steps, step0_payload=b"real user message", step_count=0)
+            os.utime(cli_dir / "conversations" / f"{stale_summary_has_steps}.db", (now - 1200, now - 1200))
+
+            # 5. Old 0-step stub with a non-empty brain artifact
+            _seed_session_artifacts(cli_dir, stub_with_artifact, step0_payload=None, step_count=0)
+            os.utime(cli_dir / "conversations" / f"{stub_with_artifact}.db", (now - 1200, now - 1200))
+            art = cli_dir / "brain" / stub_with_artifact / "draft.md"
+            art.parent.mkdir(parents=True, exist_ok=True)
+            art.write_text("notes\n", encoding="utf-8")
+
+            lock_fd = os.open(str(cli_dir / "presence" / f"{locked_stub}.lock"), os.O_RDWR)
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                reapable, protected = agent_memory._find_reapable_zero_step_stubs(
+                    gemini_root=root,
+                    products=("antigravity-cli",),
+                    min_age_sec=600.0,
+                    now=now,
+                    open_cids=set(),
+                )
+                self.assertEqual(reapable, {dead_old_stub})
+                self.assertEqual(protected, 2)
+
+                purged = agent_memory.purge_ephemeral_conversations(
+                    reapable,
+                    gemini_root=root,
+                    products=("antigravity-cli",),
+                )
+                self.assertEqual(purged, 1)
+            finally:
+                with sqlite3.connect(cli_dir / "conversation_summaries.db") as conn:
+                    self.assertEqual(
+                        conn.execute(
+                            "SELECT count(*) FROM conversation_summaries WHERE conversation_id = ?",
+                            (dead_old_stub,),
+                        ).fetchone()[0],
+                        0,
+                    )
+                    for kept_cid in (locked_stub, recent_stub, stale_summary_has_steps, stub_with_artifact):
+                        self.assertTrue((cli_dir / "conversations" / f"{kept_cid}.db").is_file())
+                        self.assertEqual(
+                            conn.execute(
+                                "SELECT count(*) FROM conversation_summaries WHERE conversation_id = ?",
+                                (kept_cid,),
+                            ).fetchone()[0],
+                            1,
+                        )
+                self.assertFalse((cli_dir / "brain" / dead_old_stub).exists())
+                self.assertFalse((cli_dir / "conversations" / f"{dead_old_stub}.db").exists())
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                finally:
+                    os.close(lock_fd)
 
 
 if __name__ == "__main__":

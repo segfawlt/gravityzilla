@@ -11,7 +11,7 @@ Lessons referenced 3+ times. Promotion is a user decision.
 
 ## integration-issues/
 
-- [Ephemeral agy worker sessions require SQLite cleanup and log/mode isolation](./integration-issues/agy-ephemeral-worker-sqlite-cleanup.md) — Purge `conversations/<cid>.db*`, WAL/SHM, locks, and FTS rows across agy product dirs and isolate `--log-file` + `--mode plan` for internal worker calls. `#agy #worker #sqlite #cleanup #cli-log #json-schema`
+- [Ephemeral agy worker sessions and 0-step CLI stubs require SQLite/flock-guarded cleanup](./integration-issues/agy-ephemeral-worker-sqlite-cleanup.md) — Purge `conversations/<cid>.db*`, WAL/SHM, locks, and FTS rows across agy product dirs, isolate `--log-file` + `--mode plan` for workers, and reap unlocked/artifact-free `0-step` CLI stubs after a grace window. `#agy #worker #sqlite #cleanup #cli-log #json-schema #flock #zero-step-stubs`
 
 ## logic-errors/
 

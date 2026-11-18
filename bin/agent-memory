@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime as dt
+import errno
 import fcntl
 import glob
 import json
@@ -841,6 +842,12 @@ def cmd_sync(args: argparse.Namespace) -> int:
 
     try:
         conn = open_db()
+        with contextlib.suppress(Exception):
+            reapable_stubs, _ = _find_reapable_zero_step_stubs(min_age_sec=600.0)
+            if reapable_stubs:
+                purged_stubs = purge_ephemeral_conversations(reapable_stubs)
+                if purged_stubs:
+                    log_event(f"[REAP-STUBS] purged={purged_stubs}")
         now = dt.datetime.now(dt.timezone.utc).timestamp()
         min_idle = 0 if args.force else MIN_IDLE_SEC
         target_slug = cwd_to_slug(args.cwd) if args.cwd else None
@@ -1972,6 +1979,149 @@ def _scan_leaked_worker_conversations(
     return leaked, len(zero_step_cids - leaked)
 
 
+def _collect_open_agy_cids(
+    gemini_root: Path = HOME / ".gemini",
+    products: tuple[str, ...] = AGY_PRODUCTS,
+) -> set[str]:
+    """Return conversation UUIDs currently opened by any running process under conversations/ or presence/."""
+    open_cids: set[str] = set()
+    if not Path("/proc").is_dir():
+        return open_cids
+    prefixes: list[str] = []
+    for prod in products:
+        pdir = gemini_root / prod
+        roots = {str(pdir)}
+        with contextlib.suppress(OSError):
+            roots.add(str(pdir.resolve()))
+        for root_str in roots:
+            prefixes.append(f"{root_str}/conversations/")
+            prefixes.append(f"{root_str}/presence/")
+    with contextlib.suppress(OSError):
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            fd_dir = f"/proc/{entry}/fd"
+            with contextlib.suppress(OSError):
+                for fd_name in os.listdir(fd_dir):
+                    with contextlib.suppress(OSError):
+                        target = os.readlink(f"{fd_dir}/{fd_name}")
+                        if any(target.startswith(pfx) for pfx in prefixes):
+                            cand = Path(target).name[:36]
+                            if UUID_RE.match(cand):
+                                open_cids.add(cand)
+    return open_cids
+
+
+def _is_presence_locked(lock_path: Path) -> bool:
+    """Return True if an existing presence lock file is actively held via flock."""
+    if not lock_path.is_file():
+        return False
+    try:
+        fd = os.open(str(lock_path), os.O_RDONLY)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with contextlib.suppress(OSError):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    except OSError as exc:
+        if exc.errno in (errno.EACCES, errno.EAGAIN, getattr(errno, "EWOULDBLOCK", errno.EAGAIN)):
+            return True
+        return True
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+
+
+def _find_reapable_zero_step_stubs(
+    gemini_root: Path = HOME / ".gemini",
+    products: tuple[str, ...] = AGY_PRODUCTS,
+    min_age_sec: float = 600.0,
+    now: float | None = None,
+    open_cids: set[str] | None = None,
+) -> tuple[set[str], int]:
+    """Identify abandoned 0-step CLI stubs safe to reap, returning (reapable_cids, active_or_recent_count)."""
+    now_ts = time.time() if now is None else now
+    active_open = (
+        _collect_open_agy_cids(gemini_root=gemini_root, products=products)
+        if open_cids is None
+        else open_cids
+    )
+
+    candidates: set[str] = set()
+    excluded_cids: set[str] = set()
+    for prod in products:
+        sum_db = gemini_root / prod / "conversation_summaries.db"
+        if not sum_db.is_file():
+            continue
+        with contextlib.suppress(Exception):
+            with contextlib.closing(sqlite3.connect(f"file:{sum_db}?mode=ro", uri=True, timeout=1.0)) as sconn:
+                for (cid_val,) in sconn.execute(
+                    "SELECT conversation_id FROM conversation_summaries "
+                    "WHERE step_count = 0 AND title = '' AND preview = '' AND parent_conversation_id = ''"
+                ):
+                    cstr = str(cid_val or "").strip()
+                    if UUID_RE.match(cstr):
+                        candidates.add(cstr)
+                for (cid_val,) in sconn.execute(
+                    "SELECT conversation_id FROM conversation_summaries "
+                    "WHERE preview LIKE ? OR step_count != 0 OR title != '' OR preview != '' OR parent_conversation_id != ''",
+                    (f"%{INTERNAL_MARKER}%",),
+                ):
+                    cstr = str(cid_val or "").strip()
+                    if UUID_RE.match(cstr):
+                        excluded_cids.add(cstr)
+
+    reapable: set[str] = set()
+    protected_count = 0
+    for cid in sorted(candidates - excluded_cids):
+        is_non_stub = False
+        is_protected = cid in active_open
+        for prod in products:
+            pdir = gemini_root / prod
+            bdir = pdir / "brain" / cid
+            if bdir.exists():
+                with contextlib.suppress(OSError):
+                    if any(p.is_file() for p in bdir.rglob("*")):
+                        is_non_stub = True
+                        break
+            db_path = pdir / "conversations" / f"{cid}.db"
+            if db_path.is_file():
+                try:
+                    if db_path.stat().st_size > 0:
+                        with contextlib.closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=0.5)) as cconn:
+                            row = cconn.execute("SELECT count(*) FROM steps").fetchone()
+                        if row is None or int(row[0]) != 0:
+                            is_non_stub = True
+                            break
+                        if _db_step0_has_marker(db_path):
+                            is_non_stub = True
+                            break
+                except Exception:
+                    is_non_stub = True
+                    break
+            if _is_presence_locked(pdir / "presence" / f"{cid}.lock"):
+                is_protected = True
+            if db_path.is_file():
+                with contextlib.suppress(OSError):
+                    if (now_ts - db_path.stat().st_mtime) < min_age_sec:
+                        is_protected = True
+            elif bdir.exists():
+                with contextlib.suppress(OSError):
+                    if (now_ts - bdir.stat().st_mtime) < min_age_sec:
+                        is_protected = True
+        if is_non_stub:
+            continue
+        if is_protected:
+            protected_count += 1
+            continue
+        reapable.add(cid)
+    return reapable, protected_count
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     cwd = args.cwd or os.getcwd()
     repo_dir = resolve_workspace_root(cwd)
@@ -2038,7 +2188,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             print(f"  [PASS] 0 drifted memory notes ({len(drift_items)} checked)")
 
     # 5. Leaked internal worker & empty stub sessions
-    leaked_workers, zero_step_stubs = _scan_leaked_worker_conversations()
+    leaked_workers, _zero_step_total = _scan_leaked_worker_conversations()
     if args.fix and leaked_workers:
         purged = purge_ephemeral_conversations(leaked_workers)
         log_event(f"[DOCTOR-PURGE] workers={purged}")
@@ -2047,8 +2197,16 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print(f"  [WARN] {len(leaked_workers)} historical leaked {INTERNAL_MARKER} session(s) present — run with --fix to purge")
     else:
         print(f"  [PASS] 0 leaked {INTERNAL_MARKER} sessions")
-    if zero_step_stubs:
-        print(f"  [INFO] {zero_step_stubs} empty 0-step CLI stub session(s) in conversation_summaries (created when bare 'agy' opens before '/resume')")
+
+    reapable_stubs, protected_stubs = _find_reapable_zero_step_stubs(min_age_sec=60.0)
+    if args.fix and reapable_stubs:
+        purged_stubs = purge_ephemeral_conversations(reapable_stubs)
+        log_event(f"[DOCTOR-PURGE-STUBS] stubs={purged_stubs} kept_active={protected_stubs}")
+        print(f"  [FIXED] Purged {purged_stubs} abandoned 0-step CLI stub session(s) ({protected_stubs} active/recent kept)")
+    elif reapable_stubs:
+        print(f"  [WARN] {len(reapable_stubs)} abandoned 0-step CLI stub session(s) present ({protected_stubs} active/recent) — run with --fix to purge")
+    else:
+        print(f"  [PASS] 0 abandoned 0-step CLI stubs ({protected_stubs} active/recent kept)")
 
     # 6. Recent session delivery rate
     recs = _collect_usage_records(conn, target_slug=slug, limit=8)
