@@ -1,4 +1,5 @@
 // Combine transcript facts with the agent-reported intent, subagents/swarm, context, and watchdog into one payload.
+import { createHash } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
@@ -585,7 +586,11 @@ export function resolveOverview({ conversationId = '', etag = '' } = {}, dirs = 
   const brain = brainDirOf(conv, dirs);
   if (!brain) return { conversationId: conv || null, overview: null };
   const overview = buildOverview(brain);
-  const nextEtag = JSON.stringify(overview);
+  const stable = {
+    ...overview,
+    watchdog: overview.watchdog ? { ...overview.watchdog, elapsedMs: 0 } : null,
+  };
+  const nextEtag = createHash('sha1').update(JSON.stringify(stable)).digest('hex').slice(0, 16);
   if (etag && etag === nextEtag) return { conversationId: conv, unchanged: true, etag: nextEtag };
   return { conversationId: conv, overview, etag: nextEtag };
 }

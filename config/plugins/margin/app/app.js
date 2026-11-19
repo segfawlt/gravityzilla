@@ -12,7 +12,7 @@
   const SEP = ' ' + String.fromCodePoint(0x00B7) + ' ';
 
   const $ = (id) => document.getElementById(id);
-  const POLL_MS = 2000;
+  const POLL_MS = 5000;
   const PROTOCOL = '2026-01-26';
   const ID_RE = /^[0-9a-f-]{8,64}$/i;
   const isSidecar = Boolean(window.sidecar || /^https?:$|^plugin:$/.test(location.protocol));
@@ -62,6 +62,7 @@
     pinned: false,
     lastOk: 0,
     polling: false,
+    reconnecting: false,
     etag: '',
     expandedSteps: new Set(),
     userScrolled: false,
@@ -817,16 +818,24 @@
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const r = await res.json();
       state.lastOk = Date.now();
+      const wasReconnecting = state.reconnecting;
+      state.reconnecting = false;
       if (r.overview) {
         state.etag = r.etag || '';
         render(r.overview);
-      } else if (!r.unchanged) {
+      } else if (r.unchanged) {
+        if (wasReconnecting && state.ov) renderStatus(state.ov);
+      } else {
         $('status-text').textContent = 'Idle';
         $('empty-note').hidden = false;
         $('empty-note').textContent = 'Send a message to start. The overview fills in as the agent works.';
       }
     } catch {
-      if (Date.now() - state.lastOk > 6000) $('status-text').textContent = 'Reconnecting';
+      state.etag = '';
+      if (state.lastOk > 0 && Date.now() - state.lastOk > 12000) {
+        state.reconnecting = true;
+        renderStatus({ ...(state.ov || {}), status: 'reconnecting' });
+      }
     } finally {
       state.polling = false;
     }
@@ -842,9 +851,13 @@
         arguments: state.conv ? { conversation_id: state.conv } : {},
       });
       state.lastOk = Date.now();
+      state.reconnecting = false;
       onResult(r, true);
     } catch {
-      if (Date.now() - state.lastOk > 6000) $('status-text').textContent = 'Reconnecting';
+      if (state.lastOk > 0 && Date.now() - state.lastOk > 12000) {
+        state.reconnecting = true;
+        renderStatus({ ...(state.ov || {}), status: 'reconnecting' });
+      }
     } finally {
       state.polling = false;
     }
@@ -852,7 +865,7 @@
 
   // Live 1s client timer updates for status & watchdog ticker
   setInterval(() => {
-    if (state.ov) {
+    if (state.ov && !state.reconnecting) {
       renderStatus(state.ov);
       renderTelemetry(state.ov);
     }

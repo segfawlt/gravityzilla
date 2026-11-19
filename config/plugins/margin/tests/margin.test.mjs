@@ -510,7 +510,7 @@ test('resolveOverview supports ETag caching and conversation fallback, and appHt
   const first = resolveOverview({ conversationId: 'invalid-id' }, dirs);
   assert.equal(first.conversationId, CONV);
   assert.equal(first.overview.ask, 'first ask');
-  assert.ok(first.etag);
+  assert.match(first.etag, /^[0-9a-f]{16}$/);
 
   const cached = resolveOverview({ conversationId: CONV, etag: first.etag }, dirs);
   assert.equal(cached.unchanged, true);
