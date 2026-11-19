@@ -7,78 +7,49 @@
   <style>:focus-visible { outline: 2px solid var(--accent, #1a73e8); } /*APP_CSS*/</style>
 </head>
 <body>
-  <main id="root" aria-live="polite">
-    <!-- Pinned Header + Telemetry Strip -->
-    <header class="header" id="header">
+  <main id="root" class="shell" aria-live="polite">
+    <!-- Top Status Header -->
+    <header class="topbar" id="header">
       <div class="status-row" id="status-row">
         <div class="status-left">
           <span class="status-dot" id="status-dot" aria-hidden="true"></span>
-          <span class="status-text" id="status-text">Idle</span>
+          <h1 class="status-text" id="status-text">Idle</h1>
         </div>
         <span class="step-summary-pill" id="step-summary-pill" hidden></span>
       </div>
 
-      <div class="telemetry-bar" id="telemetry-bar">
-        <!-- Context Size Gauge -->
-        <div class="telemetry-chip context-chip" id="context-chip" tabindex="0" role="group" aria-label="Context size">
-          <div class="chip-top">
-            <span class="chip-label">Context</span>
-            <span class="chip-value" id="context-val">—</span>
-          </div>
-          <div class="gauge-track" id="context-bar" role="progressbar" aria-label="Context usage" aria-valuemin="0" aria-valuemax="100">
-            <div class="gauge-fill" id="context-fill"></div>
-          </div>
-          <div class="tooltip" id="context-tooltip">Context usage telemetry</div>
-        </div>
-
-        <!-- Watchdog Live Timer -->
-        <div class="telemetry-chip watchdog-chip" id="watchdog-chip" tabindex="0" role="group" aria-label="Watchdog timer">
-          <div class="chip-top">
-            <span class="chip-label">Watchdog</span>
-            <span class="chip-value" id="watchdog-val">—</span>
-          </div>
-          <div class="watchdog-sub" id="watchdog-sub">
-            <span class="watchdog-meta" id="watchdog-meta">Idle</span>
-            <span class="watchdog-alert-badge" id="watchdog-alert-badge" hidden>!</span>
-          </div>
-          <div class="tooltip" id="watchdog-tooltip">Watchdog telemetry</div>
-        </div>
+      <!-- Planning next turn banner (when stale planning state is active) -->
+      <div class="planning-banner" id="planning-banner" hidden>
+        <span class="planning-glyph" aria-hidden="true">◐</span>
+        <span class="planning-text">Planning next turn…</span>
       </div>
     </header>
 
-    <!-- Planning next turn banner (when stale planning state is active) -->
-    <div class="planning-banner" id="planning-banner" hidden>
-      <span class="planning-glyph" aria-hidden="true">◐</span>
-      <span class="planning-text">Planning next turn…</span>
-    </div>
-
-    <!-- Main Content Stream (dims during stale planning state) -->
+    <!-- Scrollable Editorial Stream (dims during stale planning state) -->
     <div class="content" id="content">
       <!-- Ask Section -->
-      <section id="sec-ask" class="sec" hidden>
-        <div class="sec-header">
-          <h2>Ask</h2>
-          <button type="button" class="btn-text-action" id="ask-toggle-btn" aria-label="Toggle full ask">More</button>
+      <section id="sec-ask" class="sec row-sec" hidden>
+        <h2 class="row-label">Ask</h2>
+        <div class="row-body">
+          <p id="ask" class="ask-text clamp" tabindex="0" role="button" aria-expanded="false"></p>
+          <button type="button" class="btn-text-action" id="ask-toggle-btn" aria-label="Toggle full ask" hidden>Show more</button>
         </div>
-        <p id="ask" class="ask-text clamp" tabindex="0" role="button" aria-expanded="false"></p>
       </section>
 
       <!-- Take Section -->
-      <section id="sec-take" class="sec" hidden>
-        <div class="sec-header">
-          <h2>Take</h2>
-        </div>
-        <div class="take-card">
+      <section id="sec-take" class="sec row-sec" hidden>
+        <h2 class="row-label">Take</h2>
+        <div class="row-body take-flow">
           <span class="take-chip" id="take-chip">
             <span class="take-glyph" id="take-glyph"></span>
             <span class="take-label" id="take-label"></span>
           </span>
-          <p id="take-why" class="take-why"></p>
+          <span id="take-why" class="take-why"></span>
         </div>
       </section>
 
       <!-- Plan Section -->
-      <section id="sec-plan" class="sec" hidden>
+      <section id="sec-plan" class="sec block-sec" hidden>
         <div class="sec-header">
           <h2>Plan</h2>
           <span class="plan-summary" id="plan-summary"></span>
@@ -90,18 +61,16 @@
       </section>
 
       <!-- Verdict Section -->
-      <section id="sec-verdict" class="sec" hidden>
-        <div class="sec-header">
-          <h2>Verdict</h2>
-        </div>
-        <div class="verdict-card">
+      <section id="sec-verdict" class="sec row-sec" hidden>
+        <h2 class="row-label">Result</h2>
+        <div class="row-body verdict-flow">
           <span class="verdict-icon" id="verdict-icon" aria-hidden="true"></span>
           <p id="verdict" class="verdict-text"></p>
         </div>
       </section>
 
       <!-- Used Section -->
-      <section id="sec-used" class="sec" hidden>
+      <section id="sec-used" class="sec block-sec" hidden>
         <div class="sec-header">
           <h2>Used</h2>
         </div>
@@ -112,7 +81,27 @@
       <p id="empty-note" class="empty-note" hidden></p>
     </div>
 
-    <!-- Interactive Drill-Down Sheet / Modal (claudzilla 1:1) -->
+    <!-- Pinned Bottom Telemetry Footer (Context + Watchdog) -->
+    <footer class="telemetry-footer" id="telemetry-bar">
+      <div class="gauge-track" id="context-bar" role="progressbar" aria-label="Context usage" aria-valuemin="0" aria-valuemax="100">
+        <div class="gauge-fill" id="context-fill"></div>
+      </div>
+      <div class="telemetry-grid">
+        <div class="telemetry-chip context-chip" id="context-chip" tabindex="0" role="group" aria-label="Context size">
+          <span class="chip-label">Context</span>
+          <span class="chip-value" id="context-val">—</span>
+          <div class="tooltip" id="context-tooltip">Context usage telemetry</div>
+        </div>
+        <div class="telemetry-chip watchdog-chip" id="watchdog-chip" tabindex="0" role="group" aria-label="Watchdog timer">
+          <span class="chip-label">Watchdog <span class="watchdog-alert-badge" id="watchdog-alert-badge" hidden>!</span></span>
+          <span class="chip-value" id="watchdog-val">—</span>
+          <span class="watchdog-meta" id="watchdog-meta" hidden>Idle</span>
+          <div class="tooltip" id="watchdog-tooltip">Watchdog telemetry</div>
+        </div>
+      </div>
+    </footer>
+
+    <!-- Interactive Drill-Down Sheet / Modal -->
     <div class="drawer-backdrop" id="drawer-backdrop" hidden></div>
     <aside class="details-drawer" id="details-drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title" tabindex="-1" hidden>
       <div class="drawer-header">

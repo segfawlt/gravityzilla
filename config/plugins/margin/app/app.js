@@ -310,7 +310,7 @@
         : (ctx.maxTokens ? Math.round((ctx.tokens / ctx.maxTokens) * 100) : null);
 
       if (ctx.maxTokens && pct !== null) {
-        ctxVal.textContent = `${fmtTokens(ctx.tokens)} / ${fmtTokens(ctx.maxTokens)}` + SEP + `${pct}%`;
+        ctxVal.textContent = `${fmtTokens(ctx.tokens)}` + SEP + `${pct}%`;
         const clampedPct = Math.min(Math.max(pct, 0), 100);
         ctxFill.style.width = `${clampedPct}%`;
         ctxBar.setAttribute('aria-valuenow', String(clampedPct));
@@ -593,7 +593,7 @@
     askEl.classList.toggle('open', state.askExpanded);
     askEl.classList.toggle('clamp', !state.askExpanded);
     askEl.setAttribute('aria-expanded', String(state.askExpanded));
-    askBtn.textContent = state.askExpanded ? 'Less' : 'More';
+    askBtn.textContent = state.askExpanded ? 'Show less' : 'Show more';
     askBtn.hidden = !(state.askExpanded || askEl.scrollHeight > askEl.clientHeight + 1);
 
     // 2. Take Section
@@ -640,24 +640,19 @@
         const li = el('li', 'step-row');
         li.dataset.status = s.status;
 
-        const mainDiv = el('div', 'step-main');
         const glyphSpan = el('span', 'step-glyph');
         if (s.status === 'completed') glyphSpan.textContent = CHECK;
         else if (s.status === 'in_progress') glyphSpan.textContent = CIRCLE_DOT;
-        else glyphSpan.textContent = CIRCLE_OPEN;
+        else glyphSpan.textContent = String(stepNum);
 
         const contentDiv = el('div', 'step-content');
-        const headerLine = el('div', 'step-header-line');
-        const badge = el('span', 'step-index-badge');
-        if (s.status === 'in_progress') badge.textContent = `Step ${stepNum}` + SEP + 'Now';
-        else badge.textContent = `#${stepNum}`;
-
-        headerLine.append(badge);
-
+        const stepLine = el('div', 'step-line');
         const textSpan = el('span', 'step-text', s.text);
-        contentDiv.append(headerLine, textSpan);
-        mainDiv.append(glyphSpan, contentDiv);
-        li.append(mainDiv);
+        stepLine.append(textSpan);
+        if (s.status === 'in_progress') {
+          stepLine.append(el('span', 'step-now-tag', 'Now'));
+        }
+        contentDiv.append(stepLine);
 
         if (s.status === 'in_progress') {
           activeStepEl = li;
@@ -670,10 +665,8 @@
           const visibleAgents = isExpanded ? agents : agents.slice(0, 3);
 
           const ul = el('ul', 'agent-tree');
-          visibleAgents.forEach((ag, aIdx) => {
-            const isLast = aIdx === visibleAgents.length - 1;
+          visibleAgents.forEach((ag) => {
             const agRow = el('li', 'agent-row');
-            const branch = el('span', 'tree-branch', isLast && agents.length <= 3 ? '└─' : '├─');
             const agGlyph = el('span', 'agent-glyph', AGENT_GLYPHS[ag.status] || CIRCLE_DASH);
             agGlyph.dataset.status = ag.status || 'running';
             agGlyph.title = `Status: ${ag.status}`;
@@ -682,7 +675,7 @@
             const agDesc = el('span', 'agent-desc', ag.description || '');
             agDesc.title = ag.description || '';
 
-            agRow.append(branch, agGlyph, agName, agDesc);
+            agRow.append(agGlyph, agName, agDesc);
             if (ag.model || ag.type) {
               const fullModel = ag.model || ag.type;
               let disp = fullModel;
@@ -694,7 +687,7 @@
             }
             ul.append(agRow);
           });
-          li.append(ul);
+          contentDiv.append(ul);
 
           if (agents.length > 3) {
             const toggleBtn = el('button', 'agents-toggle-btn');
@@ -708,10 +701,11 @@
               else state.expandedSteps.add(stepNum);
               render(state.ov);
             });
-            li.append(toggleBtn);
+            contentDiv.append(toggleBtn);
           }
         }
 
+        li.append(glyphSpan, contentDiv);
         return li;
       }));
 
@@ -801,7 +795,7 @@
     askEl.classList.toggle('open', state.askExpanded);
     askEl.classList.toggle('clamp', !state.askExpanded);
     askEl.setAttribute('aria-expanded', String(state.askExpanded));
-    askBtn.textContent = state.askExpanded ? 'Less' : 'More';
+    askBtn.textContent = state.askExpanded ? 'Show less' : 'Show more';
     askBtn.hidden = !(state.askExpanded || askEl.scrollHeight > askEl.clientHeight + 1);
   }
 
