@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Overview</title>
+  <style>/*APP_CSS*/</style>
+</head>
+<body>
+  <main id="root" aria-live="polite">
+    <header class="status" id="status">
+      <span class="dot" id="dot"></span>
+      <span class="status-label" id="status-label">Connecting</span>
+      <span class="status-meta" id="status-meta"></span>
+    </header>
+    <section id="sec-ask" class="sec" hidden>
+      <h2>Ask</h2>
+      <p id="ask" class="clamp"></p>
+    </section>
+    <section id="sec-take" class="sec" hidden>
+      <h2>Take</h2>
+      <div class="take">
+        <span class="chip" id="take-chip"></span>
+        <p id="take-why"></p>
+      </div>
+    </section>
+    <section id="sec-plan" class="sec" hidden>
+      <h2>Plan <span class="count" id="plan-count"></span></h2>
+      <div class="bar" role="progressbar" id="plan-bar" aria-valuemin="0" aria-valuemax="100"><span id="plan-fill"></span></div>
+      <ol id="steps"></ol>
+    </section>
+    <section id="sec-verdict" class="sec" hidden>
+      <h2>Verdict</h2>
+      <p id="verdict"></p>
+    </section>
+    <section id="sec-used" class="sec" hidden>
+      <h2>Used</h2>
+      <ul id="used" class="used"></ul>
+      <ul id="files" class="files"></ul>
+    </section>
+    <p id="empty" class="empty" hidden></p>
+  </main>
+  <script>/*APP_JS*/</script>
+</body>
+</html>

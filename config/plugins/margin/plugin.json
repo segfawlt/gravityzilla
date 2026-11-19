@@ -1,0 +1,10 @@
+{
+  "name": "margin",
+  "displayName": "Margin Overview Pane",
+  "version": "0.1.0",
+  "description": "Right-side Overview pane for the main agent chat: live status, the ask, the agent's take, plan progress, verdict, and what it used. Fed by a hidden margin_intent MCP tool plus the conversation transcript.",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "Open the Margin overview pane"
+  ]
+}
