@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Minimal dependency-free MCP stdio server exposing one tool: margin_intent.
 // The rules live in the tool description, so no always-on prompt rule is needed.
-import { readdirSync, readFileSync, statSync, existsSync } from 'node:fs';
+import { readdirSync, readFileSync, statSync, existsSync, realpathSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
@@ -164,7 +164,16 @@ export function dispatch(msg) {
   }
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+function isMain() {
+  if (!process.argv[1]) return false;
+  try {
+    return fileURLToPath(import.meta.url) === realpathSync(process.argv[1]);
+  } catch {
+    return false;
+  }
+}
+
+if (isMain()) {
   createInterface({ input: process.stdin }).on('line', (line) => {
     if (!line.trim()) return;
     let msg;
