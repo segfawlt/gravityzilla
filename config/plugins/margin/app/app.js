@@ -120,24 +120,33 @@
       root.dataset.theme = cs;
       return;
     }
-    const candidates = [
-      root.style.getPropertyValue('--background'),
-      getComputedStyle(root).getPropertyValue('--background'),
-      getComputedStyle(root).backgroundColor,
-      root.style.getPropertyValue('--bg'),
-      getComputedStyle(root).getPropertyValue('--bg'),
-    ];
-    for (const c of candidates) {
-      const lum = parseColorLum(c);
-      if (lum !== null) {
-        root.dataset.theme = lum < 0.5 ? 'dark' : 'light';
-        return;
-      }
+
+    // Check inline variables explicitly injected on root
+    const bg = root.style.getPropertyValue('--background') || root.style.getPropertyValue('--bg');
+    const bgLum = parseColorLum(bg);
+    if (bgLum !== null) {
+      const mode = bgLum < 0.5 ? 'dark' : 'light';
+      root.dataset.theme = mode;
+      root.style.colorScheme = mode;
+      return;
     }
+
+    const fg = root.style.getPropertyValue('--foreground') || root.style.getPropertyValue('--fg');
+    const fgLum = parseColorLum(fg);
+    if (fgLum !== null) {
+      const mode = fgLum > 0.5 ? 'dark' : 'light';
+      root.dataset.theme = mode;
+      root.style.colorScheme = mode;
+      return;
+    }
+
+    // Default to system / OS color scheme preference
     if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
       root.dataset.theme = 'dark';
+      root.style.colorScheme = 'dark';
     } else {
       root.dataset.theme = 'light';
+      root.style.colorScheme = 'light';
     }
   }
 

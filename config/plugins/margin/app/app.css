@@ -1,68 +1,84 @@
 /* Google Workspace / Cloud Console / Material 3 utility design system for Margin Overview */
-/* avoid-ai-design-ignore-file: T1 */
 :root {
   color-scheme: light dark;
 
-  /* Google style tokens (light default) */
-  --bg: var(--background, #f8f9fa);
-  --fg: var(--foreground, #202124);
-  --surface: var(--card, #ffffff);
-  --muted: var(--muted-foreground, #5f6368);
-  --line: var(--border, #dadce0);
-  --accent: var(--primary, #1a73e8);
-  --accent-hover: #174ea6;
-  --on-accent: #ffffff;
-
-  --ok: var(--color-text-success, #1e8e3e);
-  --warn: var(--color-text-warning, #e37400);
-  --bad: var(--color-text-danger, #d93025);
-
-  --surface-hover: color-mix(in srgb, var(--fg) 6%, var(--surface));
-  --surface-raised: color-mix(in srgb, var(--fg) 4%, var(--surface));
-  --accent-soft: color-mix(in srgb, var(--accent) 12%, transparent);
-  --ok-soft: color-mix(in srgb, var(--ok) 14%, transparent);
-  --warn-soft: color-mix(in srgb, var(--warn) 14%, transparent);
-  --bad-soft: color-mix(in srgb, var(--bad) 14%, transparent);
-
-  /* avoid-ai-design-ignore: T1 -- User explicit request: match Antigravity desktop app font stack (Inter) */
-  --font: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif;
-  --font-display: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-  --mono: 'SF Mono', 'Cascadia Code', 'Fira Code', Consolas, 'Roboto Mono', ui-monospace, monospace;
+  --font: var(--font-family, var(--vscode-font-family, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif));
+  --font-display: var(--font-family, var(--vscode-font-family, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif));
+  --mono: var(--editor-font-family, var(--vscode-editor-font-family, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace));
   --radius-card: 8px;
   --radius-chip: 6px;
   --radius-pill: 999px;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) {
-    --bg: var(--background, #1f1f1f);
-    --fg: var(--foreground, #e8eaed);
-    --surface: var(--card, #292a2d);
-    --muted: var(--muted-foreground, #9aa0a6);
-    --line: var(--border, #3c4043);
-    --accent: var(--primary, #8ab4f8);
-    --accent-hover: #aecbfa;
-    --on-accent: #202124;
+/* Light theme tokens: Guaranteed high contrast (>= 14:1 text, >= 5.5:1 muted) */
+:root,
+:root[data-theme="light"] {
+  --bg: #f8f9fa;
+  --fg: #202124;
+  --surface: #ffffff;
+  --muted: #5f6368;
+  --line: #dadce0;
+  --accent: #1a73e8;
+  --accent-hover: #174ea6;
+  --on-accent: #ffffff;
 
-    --ok: var(--color-text-success, #81c995);
-    --warn: var(--color-text-warning, #fdd663);
-    --bad: var(--color-text-danger, #f28b82);
-  }
+  --ok: #1e8e3e;
+  --warn: #e37400;
+  --bad: #d93025;
+
+  --surface-hover: #f1f3f4;
+  --surface-raised: #f8f9fa;
+  --accent-soft: rgba(26, 115, 232, 0.12);
+  --ok-soft: rgba(30, 142, 62, 0.12);
+  --warn-soft: rgba(227, 116, 0, 0.12);
+  --bad-soft: rgba(217, 48, 37, 0.12);
 }
 
+/* Dark theme tokens: Guaranteed high contrast (>= 13:1 text, >= 6:1 muted) */
 :root[data-theme="dark"] {
-  --bg: var(--background, #1f1f1f);
-  --fg: var(--foreground, #e8eaed);
-  --surface: var(--card, #292a2d);
-  --muted: var(--muted-foreground, #9aa0a6);
-  --line: var(--border, #3c4043);
-  --accent: var(--primary, #8ab4f8);
+  --bg: #1f1f1f;
+  --fg: #e8eaed;
+  --surface: #292a2d;
+  --muted: #9aa0a6;
+  --line: #3c4043;
+  --accent: #8ab4f8;
   --accent-hover: #aecbfa;
   --on-accent: #202124;
 
-  --ok: var(--color-text-success, #81c995);
-  --warn: var(--color-text-warning, #fdd663);
-  --bad: var(--color-text-danger, #f28b82);
+  --ok: #81c995;
+  --warn: #fdd663;
+  --bad: #f28b82;
+
+  --surface-hover: #35363a;
+  --surface-raised: #303134;
+  --accent-soft: rgba(138, 180, 248, 0.16);
+  --ok-soft: rgba(129, 201, 149, 0.16);
+  --warn-soft: rgba(253, 214, 99, 0.16);
+  --bad-soft: rgba(242, 139, 130, 0.16);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #1f1f1f;
+    --fg: #e8eaed;
+    --surface: #292a2d;
+    --muted: #9aa0a6;
+    --line: #3c4043;
+    --accent: #8ab4f8;
+    --accent-hover: #aecbfa;
+    --on-accent: #202124;
+
+    --ok: #81c995;
+    --warn: #fdd663;
+    --bad: #f28b82;
+
+    --surface-hover: #35363a;
+    --surface-raised: #303134;
+    --accent-soft: rgba(138, 180, 248, 0.16);
+    --ok-soft: rgba(129, 201, 149, 0.16);
+    --warn-soft: rgba(253, 214, 99, 0.16);
+    --bad-soft: rgba(242, 139, 130, 0.16);
+  }
 }
 
 * { box-sizing: border-box; }

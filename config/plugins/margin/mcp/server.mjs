@@ -24,9 +24,8 @@ export function appHtml({ sidecar = false } = {}) {
   if (sidecar) {
     html = html.replace('<style>', '<script src="/preload.js"></script>\n  <style>');
   }
-  const css = read('fonts.css') + '\n' + read('app.css');
   return html
-    .replace('/*APP_CSS*/', () => css)
+    .replace('/*APP_CSS*/', () => read('app.css'))
     .replace('/*APP_JS*/', () => read('app.js'));
 }
 
