@@ -1,27 +1,27 @@
-/* Host theme variables (MCP Apps spec names) are applied inline on <html> by app.js.
+/* Host theme variables (Sidecar preload.js and MCP Apps spec) are applied inline on <html>.
    Fallbacks below only apply when a token is missing. */
 :root {
   color-scheme: light dark;
-  --bg: var(--color-background-primary, #fafafa);
-  --fg: var(--color-text-primary, #1f2328);
-  --surface: var(--color-background-secondary, #ffffff);
-  --muted: var(--color-text-secondary, #596069);
-  --line: var(--color-border-primary, #d8dce1);
-  --accent: var(--color-text-info, #1a64d6);
+  --bg: var(--background, var(--color-background-primary, #fafafa));
+  --fg: var(--foreground, var(--color-text-primary, #1f2328));
+  --surface: var(--card, var(--color-background-secondary, #ffffff));
+  --muted: var(--muted-foreground, var(--color-text-secondary, #596069));
+  --line: var(--border, var(--color-border-primary, #d8dce1));
+  --accent: var(--primary, var(--color-text-info, #1a64d6));
   --ok: var(--color-text-success, #1f8a4c);
   --warn: var(--color-text-warning, #9a6700);
   --bad: var(--color-text-danger, #c4352c);
-  --font: var(--font-sans, system-ui, sans-serif);
-  --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  --font: var(--font-family, var(--font-sans, system-ui, sans-serif));
+  --mono: var(--editor-font-family, ui-monospace, SFMono-Regular, Menlo, monospace);
 }
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: var(--color-background-primary, #14161a);
-    --fg: var(--color-text-primary, #e6e8eb);
-    --surface: var(--color-background-secondary, #1b1e23);
-    --muted: var(--color-text-secondary, #a3a9b3);
-    --line: var(--color-border-primary, #2b3037);
-    --accent: var(--color-text-info, #6aa5ff);
+    --bg: var(--background, var(--color-background-primary, #14161a));
+    --fg: var(--foreground, var(--color-text-primary, #e6e8eb));
+    --surface: var(--card, var(--color-background-secondary, #1b1e23));
+    --muted: var(--muted-foreground, var(--color-text-secondary, #a3a9b3));
+    --line: var(--border, var(--color-border-primary, #2b3037));
+    --accent: var(--primary, var(--color-text-info, #6aa5ff));
     --ok: var(--color-text-success, #4cbf7a);
     --warn: var(--color-text-warning, #e0a43a);
     --bad: var(--color-text-danger, #e5584f);

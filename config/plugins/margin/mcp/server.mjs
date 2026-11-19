@@ -1,14 +1,16 @@
 #!/usr/bin/env node
 // Minimal dependency-free MCP stdio server exposing one tool: margin_intent.
 // The rules live in the tool description, so no always-on prompt rule is needed.
-import { readdirSync, readFileSync, statSync, existsSync, realpathSync } from 'node:fs';
+import { readFileSync, realpathSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
 import { appDataDirs, brainDirOf, ID_RE, intentPath, transcriptPath } from '../lib/paths.mjs';
 import { merge, readIntent, writeIntent, STANCES, STEP_STATES } from '../lib/intent.mjs';
 import { readRows, summarize } from '../lib/transcript.mjs';
-import { buildOverview } from '../lib/overview.mjs';
+import { buildOverview, newestConversation } from '../lib/overview.mjs';
+
+export { newestConversation };
 
 const APP_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'app');
 const APP_URI = 'ui://margin/overview.html';
@@ -16,9 +18,13 @@ const APP_MIME = 'text/html;profile=mcp-app';
 const CONTENT_FIELDS = ['wants', 'take', 'steps', 'now', 'verdict'];
 
 /** One self-contained HTML document (the host CSP blocks external scripts/styles). Read per request so edits are live. */
-export function appHtml() {
+export function appHtml({ sidecar = false } = {}) {
   const read = (f) => readFileSync(join(APP_DIR, f), 'utf-8');
-  return read('index.html')
+  let html = read('index.html');
+  if (sidecar) {
+    html = html.replace('<style>', '<script src="/preload.js"></script>\n  <style>');
+  }
+  return html
     .replace('/*APP_CSS*/', () => read('app.css'))
     .replace('/*APP_JS*/', () => read('app.js'));
 }
@@ -38,7 +44,7 @@ const TOOL = {
   description: DESCRIPTION,
   _meta: {
     ui: { resourceUri: APP_URI },
-    'com.google.antigravity/ui': { entrypoints: [{ type: 'aux_pane', title: 'Overview' }] },
+    'com.google.antigravity/ui': { entrypoints: [{ type: 'auxPane', title: 'Overview' }] },
   },
   inputSchema: {
     type: 'object',
@@ -77,24 +83,6 @@ const OVERVIEW_TOOL = {
   inputSchema: { type: 'object', properties: { conversation_id: { type: 'string' } } },
   _meta: { ui: { resourceUri: APP_URI, visibility: ['app'] } },
 };
-
-/** Newest-modified conversation transcript: the fallback when the model omits/garbles its id. */
-export function newestConversation(dirs = appDataDirs()) {
-  let best = null;
-  for (const d of dirs) {
-    const root = join(d, 'brain');
-    let names = [];
-    try { names = readdirSync(root); } catch { continue; }
-    for (const n of names) {
-      if (!ID_RE.test(n)) continue;
-      const t = transcriptPath(join(root, n));
-      if (!existsSync(t)) continue;
-      const m = statSync(t).mtimeMs;
-      if (!best || m > best.m) best = { id: n, m };
-    }
-  }
-  return best?.id ?? null;
-}
 
 function resolveConv(raw, dirs) {
   const id = String(raw ?? '');

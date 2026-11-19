@@ -4,10 +4,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { merge } from '../lib/intent.mjs';
-import { buildOverview } from '../lib/overview.mjs';
+import { buildOverview, resolveOverview } from '../lib/overview.mjs';
 import { brainDirOf, intentPath } from '../lib/paths.mjs';
 import { stripUserText, summarize } from '../lib/transcript.mjs';
-import { handleCall, handleOverview, newestConversation } from '../mcp/server.mjs';
+import { appHtml, handleCall, handleOverview, newestConversation } from '../mcp/server.mjs';
 import { CONV, generic, makeBrain, planner, user } from './fixtures.mjs';
 
 const T0 = '2026-01-01T10:00:00Z';
@@ -126,10 +126,33 @@ test('stdio protocol: initialize, tools (model-visible vs app-only), app resourc
   assert.deepEqual(Object.keys(by[1].result.capabilities).sort(), ['resources', 'tools']);
   const [intent, overview] = by[2].result.tools;
   assert.equal(intent._meta.ui.resourceUri, 'ui://margin/overview.html');
-  assert.equal(intent._meta['com.google.antigravity/ui'].entrypoints[0].type, 'aux_pane');
+  assert.equal(intent._meta['com.google.antigravity/ui'].entrypoints[0].type, 'auxPane');
   assert.deepEqual(overview._meta.ui.visibility, ['app']);
   const c = by[3].result.contents[0];
   assert.equal(c.mimeType, 'text/html;profile=mcp-app');
   assert.ok(c.text.includes('ui/initialize') && !c.text.includes('/*APP_JS*/') && !c.text.includes('/*APP_CSS*/'));
   assert.ok(by[4].error && by[5].error);
+});
+
+test('resolveOverview supports ETag caching and conversation fallback, and appHtml injects preload.js for sidecars', () => {
+  const home = mkdtempSync(join(tmpdir(), 'margin-'));
+  const { dirs } = makeBrain(home, [user(0, 'first ask', T0), planner(1, [], T0)]);
+  const first = resolveOverview({ conversationId: 'invalid-id' }, dirs);
+  assert.equal(first.conversationId, CONV);
+  assert.equal(first.overview.ask, 'first ask');
+  assert.ok(first.etag);
+
+  const cached = resolveOverview({ conversationId: CONV, etag: first.etag }, dirs);
+  assert.equal(cached.unchanged, true);
+  assert.equal(cached.overview, undefined);
+
+  makeBrain(home, [user(0, 'first ask', T0), planner(1, [], T0), user(2, 'second ask', T1)]);
+  const updated = resolveOverview({ conversationId: CONV, etag: first.etag }, dirs);
+  assert.equal(updated.unchanged, undefined);
+  assert.equal(updated.overview.ask, 'second ask');
+
+  const mcpDoc = appHtml();
+  const sidecarDoc = appHtml({ sidecar: true });
+  assert.equal(mcpDoc.includes('/preload.js'), false);
+  assert.equal(sidecarDoc.includes('<script src="/preload.js"></script>'), true);
 });

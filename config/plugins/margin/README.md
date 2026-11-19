@@ -5,14 +5,13 @@ the agent's take, plan progress, verdict, and what it used. Modeled on claudzill
 
 ## How it works
 
-It is an [MCP App](https://github.com/modelcontextprotocol/ext-apps): one dependency-free Node
-stdio server (`mcp/server.mjs`) that serves both the tools and the pane UI (`app/`).
+The plugin combines two lightweight Node pieces sharing the same `app/` UI and `lib/` readers:
 
 | Piece | Role |
 | --- | --- |
-| `margin_intent` (model-visible) | The agent reports `wants`, `take`, `steps`, `now`, `verdict`. The rules live in the tool description, so no always-on prompt rule. Declares an `aux_pane` entrypoint, so the pane auto-opens after a call and appears in the pane "+" menu. |
-| `margin_overview` (app-only) | The pane polls it every 2 s. Merges the intent file with facts derived from `transcript.jsonl`. |
-| `lib/transcript.mjs` | Deterministic status (planning, working, done, stopped), ASK, and USED counts (no model needed). |
+| `sidecars/margin/` (UI sidecar) | Serves the right-pane **Overview** tab (`SIDECAR_UI_ENTRYPOINT_AUX_PANE`) via `sidecar_sdk` and exposes `GET /api/overview`, polling `transcript.jsonl` + `intent.json`. Appears in the side pane `+` menu and opens via `[Overview](sidecar://margin/margin/)`. |
+| `mcp/server.mjs` (`margin_intent`) | Model-visible MCP tool where the agent reports `wants`, `take`, `steps`, `now`, `verdict`. Also serves the MCP App `ui://margin/overview.html` resource (`auxPane` entrypoint) when `enable-mcp-apps` is enabled. |
+| `lib/overview.mjs` & `lib/transcript.mjs` | Deterministic status (`planning`, `working`, `done`, `stopped`), ASK, USED counts, and ETag-cached `resolveOverview`. |
 | `lib/intent.mjs` | Validate and merge reports; a new user message starts a clean turn. |
 
 Intent is stored at `<brain>/<conversation>/.system_generated/margin/intent.json`.
@@ -25,8 +24,7 @@ reading or plan was reported. Intent from an earlier user message is never shown
 ## Limits
 
 - Desktop only. The `agy` CLI has no pane; `agy -p` did not load plugin MCP servers in our test.
-- The pane learns its conversation from the agent's `conversation_id`. Opened via "+" before any call, it
-  falls back to the most recently active conversation.
+- The pane learns its conversation from the host (`window.sidecar.conversationId` or `conversation_id`). Opened standalone before any call, it falls back to the most recently active conversation.
 - Disable with `agy plugin disable margin` if CLI sessions waste tokens calling the tool.
 
 ## Tests

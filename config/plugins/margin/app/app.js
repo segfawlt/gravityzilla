@@ -5,8 +5,10 @@
   const USED = { files: 'Files', shell: 'Shell', web: 'Web', agents: 'Agents', other: 'Other' };
   const POLL_MS = 2000;
   const PROTOCOL = '2026-01-26';
-  const state = { ov: null, conv: '', pinned: false, lastOk: 0, polling: false };
+  const state = { ov: null, conv: '', pinned: false, lastOk: 0, polling: false, etag: '' };
   const ID_RE = /^[0-9a-f-]{8,64}$/i;
+  const isSidecar = Boolean(window.sidecar || /^https?:$|^plugin:$/.test(location.protocol));
+  const urlParams = new URLSearchParams(location.search);
 
   // ---- Minimal MCP Apps (SEP-1865) view bridge: JSON-RPC 2.0 over postMessage ----
   let nextId = 1;
@@ -153,7 +155,35 @@
     }
   }
 
+  async function pollSidecar() {
+    if (state.polling) return;
+    state.polling = true;
+    try {
+      const q = new URLSearchParams({ etag: state.etag });
+      const conv = window.sidecar?.conversationId || urlParams.get('conversationId') || '';
+      if (conv) q.set('conversationId', conv);
+      const f = window.sidecar?.fetch ? window.sidecar.fetch.bind(window.sidecar) : fetch;
+      const res = await f(`/api/overview?${q}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const r = await res.json();
+      state.lastOk = Date.now();
+      if (r.overview) {
+        state.etag = r.etag || '';
+        render(r.overview);
+      } else if (!r.unchanged) {
+        $('status-label').textContent = 'Idle';
+        $('empty').hidden = false;
+        $('empty').textContent = 'Send a message to start. The overview fills in as the agent works.';
+      }
+    } catch {
+      if (Date.now() - state.lastOk > 6000) $('status-label').textContent = 'Reconnecting';
+    } finally {
+      state.polling = false;
+    }
+  }
+
   async function poll() {
+    if (isSidecar) return pollSidecar();
     if (state.polling) return;
     state.polling = true;
     try {
@@ -170,8 +200,13 @@
   $('ask').addEventListener('click', () => $('ask').classList.toggle('open'));
   $('ask').classList.add('clamp');
   setInterval(() => { if (state.ov) renderStatus(state.ov); }, 1000);
-  // Short grace so the agent's tool-input/result (with the exact conversation id) can arrive first.
-  connect().then(() => { setTimeout(poll, 500); setInterval(poll, POLL_MS); }).catch(() => {
-    $('status-label').textContent = 'Not connected';
-  });
+  if (isSidecar) {
+    poll();
+    setInterval(poll, POLL_MS);
+  } else {
+    // Short grace so the agent's tool-input/result (with the exact conversation id) can arrive first.
+    connect().then(() => { setTimeout(poll, 500); setInterval(poll, POLL_MS); }).catch(() => {
+      $('status-label').textContent = 'Not connected';
+    });
+  }
 })();
