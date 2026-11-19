@@ -29,13 +29,16 @@ export function appHtml({ sidecar = false } = {}) {
     .replace('/*APP_JS*/', () => read('app.js'));
 }
 
-const DESCRIPTION = `Pinned Overview panel the user watches beside the chat. Silent bookkeeping: never mention this tool or the panel in your reply.
+const DESCRIPTION = `Pinned Overview panel the user watches beside the chat. Silent bookkeeping: never mention this tool or the panel in your reply, and write wants, take, steps, and verdict in the user's language.
 Rules:
-1. Call it FIRST in every turn (each new user message), before any other tool, with conversation_id (the UUID that is the last directory of your artifact/scratch path, .../brain/<conversation_id>/), wants (one line restating what the user asked), and take.
-2. take = your honest reading of the request: stance fine | concern | against | unsure, label (max 16 chars), why (one short sentence). Use concern/against when the approach is flawed, risky or an XY problem.
-3. Add steps (3-8 short items) only when the work has 2+ real steps. Re-send steps only when the plan changes.
-4. At the start of each step call again with just {conversation_id, now: <0-based index of the step you start>}.
-5. In your last turn action call with {conversation_id, verdict} (one or two sentences: what was done and what the user should know).
+1. Call FIRST in every turn (each new user message), before any other tool, with conversation_id (the UUID in your .../brain/<conversation_id>/ path), wants (1-2 lines restating what the user asked), take, and steps (when 2+ real steps).
+2. take = your reaction to the ask BEFORE any work (never the answer itself):
+   - stance: fine = do as asked; concern = doable but has a real risk, XY problem, or better way; against = ask user to reconsider first (irreversible, data loss, bypasses review/CI/safeguard, or breaks a stated rule — pick against over concern whenever one holds); unsure = cannot judge yet without checking a source.
+   - label: required, 1-3 words, max 16 chars, no mood words. Examples — fine: "clear", "small fix"; concern: "risky", "overkill", "check first"; against: "breaks rule", "data loss"; unsure: "needs repro", "unclear goal"; question asks (no edits): verb + target like "check labels", "read session" (never "question" or "answer").
+   - why: one short clause (~60 chars) stating the reason or the input you will check.
+3. Add steps (2-8 short items) when the turn has 2+ real steps, with now: 0 to mark step 1 active. When a step spawns subagents or swarm workers, list their role/worker names or descriptions in that step's agents array. Re-send wants/take/steps only when the plan changes.
+4. At the start of each next step, ping {conversation_id, now: <0-based step index>} (e.g. now: 1 when starting step 2, now: 2 when starting step 3) so the live progress badge updates immediately.
+5. At the end of the turn, call {conversation_id, verdict} (1-2 sentences: what changed and what was verified); a clean final answer also closes remaining steps automatically.
 Omitted fields keep their previous value within the same user message.`;
 
 const TOOL = {
@@ -50,25 +53,33 @@ const TOOL = {
     type: 'object',
     properties: {
       conversation_id: { type: 'string', description: 'Conversation UUID from your brain/<id> artifact path.' },
-      wants: { type: 'string', description: 'One line: what the user is asking for.' },
+      wants: { type: 'string', description: '1-2 lines restating what the user is asking for.' },
       take: {
         type: 'object',
         properties: {
           stance: { type: 'string', enum: STANCES },
-          label: { type: 'string', description: 'Max 16 chars, e.g. "Sound plan".' },
-          why: { type: 'string', description: 'One short sentence.' },
+          label: { type: 'string', description: '1-3 words, max 16 chars (e.g. "clear", "check first", "breaks rule", "needs repro").' },
+          why: { type: 'string', description: 'One short clause (~60 chars): the reason or source to check.' },
         },
-        required: ['stance', 'label', 'why'],
+        required: ['stance', 'label'],
       },
       steps: {
         type: 'array',
         items: {
           type: 'object',
-          properties: { text: { type: 'string' }, status: { type: 'string', enum: STEP_STATES } },
+          properties: {
+            text: { type: 'string' },
+            status: { type: 'string', enum: STEP_STATES },
+            agents: {
+              type: 'array',
+              items: { type: 'string' },
+              description: 'Subagent roles/names or descriptions spawned for this step.',
+            },
+          },
           required: ['text'],
         },
       },
-      now: { type: 'integer', description: '0-based index of the step starting now.' },
+      now: { type: 'integer', minimum: 0, description: '0-based index of the step starting now (0 for step 1, 1 for step 2, ...).' },
       verdict: { type: 'string', description: 'Final outcome, set once at the end of the turn.' },
     },
     required: ['conversation_id'],

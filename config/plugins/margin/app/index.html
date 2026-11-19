@@ -4,41 +4,126 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Overview</title>
-  <style>/*APP_CSS*/</style>
+  <style>:focus-visible { outline: 2px solid var(--accent, #1a73e8); } /*APP_CSS*/</style>
 </head>
 <body>
   <main id="root" aria-live="polite">
-    <header class="status" id="status">
-      <span class="dot" id="dot"></span>
-      <span class="status-label" id="status-label">Connecting</span>
-      <span class="status-meta" id="status-meta"></span>
-    </header>
-    <section id="sec-ask" class="sec" hidden>
-      <h2>Ask</h2>
-      <p id="ask" class="clamp"></p>
-    </section>
-    <section id="sec-take" class="sec" hidden>
-      <h2>Take</h2>
-      <div class="take">
-        <span class="chip" id="take-chip"></span>
-        <p id="take-why"></p>
+    <!-- Pinned Header + Telemetry Strip -->
+    <header class="header" id="header">
+      <div class="status-row" id="status-row">
+        <div class="status-left">
+          <span class="status-dot" id="status-dot" aria-hidden="true"></span>
+          <span class="status-text" id="status-text">Idle</span>
+        </div>
+        <span class="step-summary-pill" id="step-summary-pill" hidden></span>
       </div>
-    </section>
-    <section id="sec-plan" class="sec" hidden>
-      <h2>Plan <span class="count" id="plan-count"></span></h2>
-      <div class="bar" role="progressbar" id="plan-bar" aria-valuemin="0" aria-valuemax="100"><span id="plan-fill"></span></div>
-      <ol id="steps"></ol>
-    </section>
-    <section id="sec-verdict" class="sec" hidden>
-      <h2>Verdict</h2>
-      <p id="verdict"></p>
-    </section>
-    <section id="sec-used" class="sec" hidden>
-      <h2>Used</h2>
-      <ul id="used" class="used"></ul>
-      <ul id="files" class="files"></ul>
-    </section>
-    <p id="empty" class="empty" hidden></p>
+
+      <div class="telemetry-bar" id="telemetry-bar">
+        <!-- Context Size Gauge -->
+        <div class="telemetry-chip context-chip" id="context-chip" tabindex="0" role="group" aria-label="Context size">
+          <div class="chip-top">
+            <span class="chip-label">Context</span>
+            <span class="chip-value" id="context-val">—</span>
+          </div>
+          <div class="gauge-track" id="context-bar" role="progressbar" aria-label="Context usage" aria-valuemin="0" aria-valuemax="100">
+            <div class="gauge-fill" id="context-fill"></div>
+          </div>
+          <div class="tooltip" id="context-tooltip">Context usage telemetry</div>
+        </div>
+
+        <!-- Watchdog Live Timer -->
+        <div class="telemetry-chip watchdog-chip" id="watchdog-chip" tabindex="0" role="group" aria-label="Watchdog timer">
+          <div class="chip-top">
+            <span class="chip-label">Watchdog</span>
+            <span class="chip-value" id="watchdog-val">—</span>
+          </div>
+          <div class="watchdog-sub" id="watchdog-sub">
+            <span class="watchdog-meta" id="watchdog-meta">Idle</span>
+            <span class="watchdog-alert-badge" id="watchdog-alert-badge" hidden>!</span>
+          </div>
+          <div class="tooltip" id="watchdog-tooltip">Watchdog telemetry</div>
+        </div>
+      </div>
+    </header>
+
+    <!-- Planning next turn banner (when stale planning state is active) -->
+    <div class="planning-banner" id="planning-banner" hidden>
+      <span class="planning-glyph" aria-hidden="true">◐</span>
+      <span class="planning-text">Planning next turn…</span>
+    </div>
+
+    <!-- Main Content Stream (dims during stale planning state) -->
+    <div class="content" id="content">
+      <!-- Ask Section -->
+      <section id="sec-ask" class="sec" hidden>
+        <div class="sec-header">
+          <h2>Ask</h2>
+          <button type="button" class="btn-text-action" id="ask-toggle-btn" aria-label="Toggle full ask">More</button>
+        </div>
+        <p id="ask" class="ask-text clamp" tabindex="0" role="button" aria-expanded="false"></p>
+      </section>
+
+      <!-- Take Section -->
+      <section id="sec-take" class="sec" hidden>
+        <div class="sec-header">
+          <h2>Take</h2>
+        </div>
+        <div class="take-card">
+          <span class="take-chip" id="take-chip">
+            <span class="take-glyph" id="take-glyph"></span>
+            <span class="take-label" id="take-label"></span>
+          </span>
+          <p id="take-why" class="take-why"></p>
+        </div>
+      </section>
+
+      <!-- Plan Section -->
+      <section id="sec-plan" class="sec" hidden>
+        <div class="sec-header">
+          <h2>Plan</h2>
+          <span class="plan-summary" id="plan-summary"></span>
+        </div>
+        <div class="plan-bar-track" role="progressbar" id="plan-bar" aria-label="Plan progress" aria-valuemin="0" aria-valuemax="100">
+          <div class="plan-bar-fill" id="plan-fill"></div>
+        </div>
+        <ol id="steps" class="step-list"></ol>
+      </section>
+
+      <!-- Verdict Section -->
+      <section id="sec-verdict" class="sec" hidden>
+        <div class="sec-header">
+          <h2>Verdict</h2>
+        </div>
+        <div class="verdict-card">
+          <span class="verdict-icon" id="verdict-icon" aria-hidden="true"></span>
+          <p id="verdict" class="verdict-text"></p>
+        </div>
+      </section>
+
+      <!-- Used Section -->
+      <section id="sec-used" class="sec" hidden>
+        <div class="sec-header">
+          <h2>Used</h2>
+        </div>
+        <div id="used-list" class="used-grid"></div>
+      </section>
+
+      <!-- Empty / Status Note -->
+      <p id="empty-note" class="empty-note" hidden></p>
+    </div>
+
+    <!-- Interactive Drill-Down Sheet / Modal (claudzilla 1:1) -->
+    <div class="drawer-backdrop" id="drawer-backdrop" hidden></div>
+    <aside class="details-drawer" id="details-drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title" tabindex="-1" hidden>
+      <div class="drawer-header">
+        <div class="drawer-title-group">
+          <h3 id="drawer-title" class="drawer-title">Details</h3>
+          <span class="drawer-count-badge" id="drawer-count">0 items</span>
+        </div>
+        <button type="button" class="drawer-close-btn" id="drawer-close-btn" aria-label="Close details">×</button>
+      </div>
+      <div class="drawer-body" id="drawer-body"></div>
+    </aside>
   </main>
   <script>/*APP_JS*/</script>
 </body>

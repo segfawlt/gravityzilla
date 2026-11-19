@@ -1,20 +1,17 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S python3 -S
 """
 agy-statusline: Fast (<15ms) local harness HUD for Antigravity CLI (agy).
 Stacks cleanly with agy's built-in status line (stack_with_default: true)
-to surface Git/Worktrees, Persistent Advisor state, Instant Diagnostics,
-and toggleable MCP plugin state (Playwright).
+to surface Git/Worktrees, Context Window usage, Instant Diagnostics,
+Watchdog telemetry, and toggleable MCP plugin state (Playwright).
 """
 
 from __future__ import annotations
 
 import json
 import os
-import re
-import subprocess
 import sys
 import time
-from pathlib import Path
 
 RESET = "\033[0m"
 DIM = "\033[2m"
@@ -23,89 +20,170 @@ YELLOW = "\033[33m"
 RED = "\033[31m"
 CYAN = "\033[36m"
 
-HOME = Path.home()
-AGENTS_DIR = HOME / ".agents"
-GEMINI_CONFIG_DIR = HOME / ".gemini" / "config"
+AGY_PRODUCTS = ("antigravity-cli", "antigravity", "antigravity-ide")
+INITIAL_TAIL_BYTES = 65_536
+STEP_BACK_BYTES = 262_144
 
-LOG_LINE_RE = re.compile(
-    r"^\[(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] \[(?P<tag>[^\]]+)\] watched=(?P<wcid>[0-9a-f]+)\b(?P<rest>.*)$"
-)
-DUR_RE = re.compile(r"\b(\d+(?:\.\d+)?)s\b")
-ISSUES_RE = re.compile(r"\bissues=(\d+)\b")
+_CONFIG_CACHE: tuple[str, dict] | None = None
 
 
-def read_json(path: Path) -> dict:
+class TranscriptContext:
+    __slots__ = ("tokens", "has_checkpoint_reset", "from_reported_pr")
+
+    def __init__(self, tokens: int, has_checkpoint_reset: bool, from_reported_pr: bool) -> None:
+        self.tokens = tokens
+        self.has_checkpoint_reset = has_checkpoint_reset
+        self.from_reported_pr = from_reported_pr
+
+
+def _home_dir() -> str:
+    return os.environ.get("HOME") or os.path.expanduser("~")
+
+
+def _agents_dir() -> str:
+    return os.path.join(_home_dir(), ".agents")
+
+
+def _gemini_config_dir() -> str:
+    return os.path.join(_home_dir(), ".gemini", "config")
+
+
+def _is_safe_cid(cid: str) -> bool:
+    return bool(cid) and all(c.isalnum() or c in "._-" for c in cid)
+
+
+def read_json(path: str | os.PathLike[str]) -> dict:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
     except Exception:
         return {}
 
 
-def short_model(name: str) -> str:
-    n = (name or "").lower()
-    if "argon" in n:
-        return "argon"
-    if "flash-lite" in n or "lite" in n:
-        return "flash-lite"
-    if "flash" in n:
-        return "flash"
-    if "pro" in n:
-        return "pro"
-    if "sonnet" in n:
-        return "sonnet"
-    if "opus" in n:
-        return "opus"
-    return n.split("-")[-1][:10] if n else "auto"
+def _read_global_config() -> dict:
+    global _CONFIG_CACHE
+    cfg_path = os.path.join(_gemini_config_dir(), "config.json")
+    if _CONFIG_CACHE is not None and _CONFIG_CACHE[0] == cfg_path:
+        return _CONFIG_CACHE[1]
+    cfg = read_json(cfg_path)
+    _CONFIG_CACHE = (cfg_path, cfg)
+    return cfg
 
 
 def is_plugin_enabled(plugin_name: str, default: bool = True) -> bool:
-    cfg = read_json(GEMINI_CONFIG_DIR / "config.json")
+    cfg = _read_global_config()
     plugins = cfg.get("plugins")
     if isinstance(plugins, dict) and plugin_name in plugins:
         entry = plugins[plugin_name]
         if isinstance(entry, dict) and "enabled" in entry:
             return bool(entry["enabled"])
-    pjson = read_json(GEMINI_CONFIG_DIR / "plugins" / plugin_name / "plugin.json")
+    pjson = read_json(os.path.join(_gemini_config_dir(), "plugins", plugin_name, "plugin.json"))
     if "disabled" in pjson:
         return not bool(pjson["disabled"])
     return default
 
 
-def find_git_root(start: Path) -> tuple[Path, Path, Path] | None:
+def find_git_root(start: str | os.PathLike[str]) -> tuple[str, str, str] | None:
     """Return (worktree_root, git_dir, common_git_dir) using pure filesystem lookups."""
     try:
-        cur = start.resolve()
+        cur = os.path.realpath(os.fspath(start))
     except Exception:
         return None
-    if cur.is_file():
-        cur = cur.parent
+    if os.path.isfile(cur):
+        cur = os.path.dirname(cur)
 
-    for d in (cur, *cur.parents):
-        dot_git = d / ".git"
-        if dot_git.is_dir():
-            return d, dot_git, dot_git
-        if dot_git.is_file():
+    while True:
+        dot_git = os.path.join(cur, ".git")
+        if os.path.isdir(dot_git):
+            return cur, dot_git, dot_git
+        if os.path.isfile(dot_git):
             try:
-                raw = dot_git.read_text(encoding="utf-8").strip()
+                with open(dot_git, "r", encoding="utf-8") as fh:
+                    raw = fh.read().strip()
                 if raw.startswith("gitdir:"):
-                    git_dir = (d / raw.split(":", 1)[1].strip()).resolve()
-                    commondir_file = git_dir / "commondir"
-                    if commondir_file.is_file():
-                        common_rel = commondir_file.read_text(encoding="utf-8").strip()
-                        common_dir = (git_dir / common_rel).resolve()
+                    git_rel = raw.split(":", 1)[1].strip()
+                    git_dir = os.path.realpath(os.path.join(cur, git_rel))
+                    commondir_file = os.path.join(git_dir, "commondir")
+                    if os.path.isfile(commondir_file):
+                        with open(commondir_file, "r", encoding="utf-8") as cfh:
+                            common_rel = cfh.read().strip()
+                        common_dir = os.path.realpath(os.path.join(git_dir, common_rel))
                     else:
                         common_dir = git_dir
-                    return d, git_dir, common_dir
+                    return cur, git_dir, common_dir
             except Exception:
                 return None
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
     return None
 
 
-def build_git_segment(cwd: str, touched_paths: list[str]) -> str | None:
-    info = find_git_root(Path(cwd)) if cwd else None
-    if info is None:
+def _git_is_dirty_fast(wt_root: str) -> bool:
+    import select
+
+    rfd = wfd = -1
+    pid = -1
+    try:
+        rfd, wfd = os.pipe()
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        try:
+            file_actions = [
+                (os.POSIX_SPAWN_CLOSE, rfd),
+                (os.POSIX_SPAWN_DUP2, wfd, 1),
+                (os.POSIX_SPAWN_DUP2, devnull, 2),
+                (os.POSIX_SPAWN_CLOSE, wfd),
+                (os.POSIX_SPAWN_CLOSE, devnull),
+            ]
+            argv = ["git", "-C", wt_root, "status", "--porcelain", "-uno", "--no-optional-locks"]
+            pid = os.posix_spawnp("git", argv, os.environ, file_actions=file_actions)
+        finally:
+            os.close(devnull)
+        os.close(wfd)
+        wfd = -1
+
+        ready, _, _ = select.select([rfd], [], [], 0.06)
+        if not ready:
+            try:
+                os.kill(pid, 9)
+            except OSError:
+                pass
+            return False
+        chunk = os.read(rfd, 256)
+        _, status = os.waitpid(pid, 0)
+        pid = -1
+        return status == 0 and bool(chunk.strip())
+    except Exception:
+        return False
+    finally:
+        if rfd >= 0:
+            try:
+                os.close(rfd)
+            except OSError:
+                pass
+        if wfd >= 0:
+            try:
+                os.close(wfd)
+            except OSError:
+                pass
+        if pid > 0:
+            try:
+                os.waitpid(pid, os.WNOHANG)
+            except OSError:
+                pass
+
+
+def build_git_segment(
+    cwd: str,
+    touched_paths: list[str] | None = None,
+    payload: dict | None = None,
+) -> str | None:
+    info = find_git_root(cwd) if cwd else None
+    if info is None and touched_paths:
         for tp in reversed(touched_paths[-8:]):
-            info = find_git_root(Path(tp))
+            info = find_git_root(tp)
             if info is not None:
                 break
     if info is None:
@@ -114,7 +192,8 @@ def build_git_segment(cwd: str, touched_paths: list[str]) -> str | None:
     wt_root, git_dir, common_dir = info
     branch = "HEAD"
     try:
-        head = (git_dir / "HEAD").read_text(encoding="utf-8").strip()
+        with open(os.path.join(git_dir, "HEAD"), "r", encoding="utf-8") as fh:
+            head = fh.read().strip()
         if head.startswith("ref: refs/heads/"):
             branch = head[len("ref: refs/heads/") :]
         elif len(head) >= 7:
@@ -123,165 +202,66 @@ def build_git_segment(cwd: str, touched_paths: list[str]) -> str | None:
         pass
 
     extra_wts = 0
-    wt_admin = common_dir / "worktrees"
-    if wt_admin.is_dir():
+    wt_admin = os.path.join(common_dir, "worktrees")
+    if os.path.isdir(wt_admin):
         try:
-            extra_wts = sum(1 for x in wt_admin.iterdir() if x.is_dir())
+            with os.scandir(wt_admin) as it:
+                extra_wts = sum(1 for entry in it if entry.is_dir())
         except Exception:
             extra_wts = 0
 
-    dirty = ""
-    try:
-        proc = subprocess.run(
-            ["git", "-C", str(wt_root), "status", "--porcelain", "-uno", "--no-optional-locks"],
-            capture_output=True,
-            text=True,
-            timeout=0.06,
-        )
-        if proc.returncode == 0 and proc.stdout.strip():
-            dirty = f"{YELLOW}*{RESET}"
-    except Exception:
-        pass
+    vcs = payload.get("vcs") if isinstance(payload, dict) else None
+    if isinstance(vcs, dict) and "dirty" in vcs and vcs.get("type") in (None, "git"):
+        is_dirty = bool(vcs.get("dirty"))
+    else:
+        is_dirty = _git_is_dirty_fast(wt_root)
 
+    dirty = f"{YELLOW}*{RESET}" if is_dirty else ""
     wt_badge = f" {DIM}(+{extra_wts} wt){RESET}" if extra_wts > 0 else ""
     return f"{CYAN}git:{RESET} {branch}{dirty}{wt_badge}"
-
-
-def tail_advisor_log(cid_short: str) -> dict | None:
-    """Scan last 8KB of advisor.log for latest event matching this session (or live review)."""
-    log_path = AGENTS_DIR / "advisor" / "advisor.log"
-    if not log_path.is_file():
-        return None
-    try:
-        size = log_path.stat().st_size
-        with log_path.open("rb") as f:
-            if size > 8192:
-                f.seek(size - 8192)
-            raw = f.read().decode("utf-8", errors="replace")
-    except Exception:
-        return None
-
-    lines = raw.splitlines()
-    latest_for_cid: dict | None = None
-    active_starts: dict[str, dict] = {}
-    now = time.time()
-
-    for line in lines:
-        m = LOG_LINE_RE.match(line)
-        if not m:
-            continue
-        tag = m.group("tag")
-        wcid = m.group("wcid")
-        rest = m.group("rest")
-        ts_epoch = 0.0
-        try:
-            ts_epoch = time.mktime(time.strptime(m.group("ts"), "%Y-%m-%d %H:%M:%S"))
-        except Exception:
-            pass
-
-        entry = {"tag": tag, "wcid": wcid, "rest": rest, "ts": ts_epoch}
-        if tag.startswith("START "):
-            active_starts[wcid] = entry
-        else:
-            active_starts.pop(wcid, None)
-
-        if cid_short and wcid == cid_short:
-            latest_for_cid = entry
-
-    # If ANY review (Lead or child subagent) started within the last 95s and hasn't finished yet:
-    for wcid, st in active_starts.items():
-        if st["ts"] and (now - st["ts"]) <= 95:
-            if not cid_short or wcid == cid_short or "(subagent:" in st["rest"]:
-                return {"live": True, **st}
-
-    return latest_for_cid
-
-
-def build_advisor_segment(cid: str, sess: dict) -> tuple[str, list[str]]:
-    touched = sess.get("touched_paths") if isinstance(sess.get("touched_paths"), list) else []
-    if not is_plugin_enabled("advisor", True):
-        return f"{DIM}adv: off{RESET}", touched
-
-    state = read_json(AGENTS_DIR / "advisor" / "state.json")
-    if not state.get("enabled", True):
-        return f"{DIM}adv: off{RESET}", touched
-
-    mod = short_model(str(sess.get("advisor_model") or state.get("model") or ""))
-    fails = int(sess.get("consecutive_advisor_failures") or 0)
-    if fails >= 3:
-        return f"{RED}adv: latched ({fails}/3 err){RESET}", touched
-
-    cid_short = cid[:8] if cid else ""
-    log_hit = tail_advisor_log(cid_short)
-
-    if log_hit and log_hit.get("live"):
-        sub = "sub" if "(subagent:" in log_hit.get("rest", "") else mod
-        return f"{YELLOW}adv: reviewing… ({sub}){RESET}", touched
-
-    mutated = bool(sess.get("mutated_since_stop"))
-    if log_hit and not log_hit.get("live"):
-        tag = log_hit["tag"]
-        rest = log_hit["rest"]
-        dur_m = DUR_RE.search(rest)
-        dur = f" {dur_m.group(1)}s" if dur_m else ""
-
-        if tag.startswith("REVISE"):
-            iss_m = ISSUES_RE.search(rest)
-            n_iss = iss_m.group(1) if iss_m else "!"
-            if mutated:
-                return f"{CYAN}adv: staged{RESET} {DIM}(last ⚠×{n_iss}){RESET}", touched
-            return f"{YELLOW}adv: ⚠ revise×{n_iss}{dur}{RESET}", touched
-
-        if tag.startswith("PIVOT"):
-            return f"{YELLOW}adv: ↻ pivot{dur}{RESET}", touched
-
-        if tag.startswith("PASS"):
-            if mutated:
-                return f"{CYAN}adv: staged{RESET} {DIM}(last ✓{dur}){RESET}", touched
-            return f"{GREEN}adv: ✓ pass{RESET}{DIM}{dur}{RESET}", touched
-
-        if tag.startswith("SKIP/ERROR"):
-            return f"{YELLOW}adv: err ({fails}/3){RESET}", touched
-
-    if mutated:
-        n_files = len(touched)
-        files_hint = f" · {n_files}f" if n_files else ""
-        return f"{CYAN}adv: staged{RESET}{DIM} ({mod}{files_hint}){RESET}", touched
-
-    revs = int(state.get("reviews_run") or 0)
-    caught = int(state.get("issues_caught") or 0)
-    stats_str = f"{revs} rev" + (f", {caught}!" if caught else "")
-    return f"{GREEN}adv:{RESET} {mod} {DIM}({stats_str}){RESET}", touched
 
 
 def build_diagnostics_segment(cid: str) -> str:
     if not is_plugin_enabled("diagnostics", True):
         return f"{DIM}diag: off{RESET}"
-    state = read_json(AGENTS_DIR / "diagnostics" / "state.json")
+    agents_dir = _agents_dir()
+    state = read_json(os.path.join(agents_dir, "diagnostics", "state.json"))
     if not state.get("enabled", True):
         return f"{DIM}diag: off{RESET}"
 
-    if cid:
-        pend = read_json(AGENTS_DIR / "diagnostics" / "pending" / f"{cid}.json")
+    if cid and _is_safe_cid(cid):
+        pend = read_json(os.path.join(agents_dir, "diagnostics", "pending", f"{cid}.json"))
         unfixed = pend.get("active_unfixed")
-        if isinstance(unfixed, list) and len(unfixed) > 0:
-            return f"{RED}diag: ✗ {len(unfixed)} err{RESET}"
-        if isinstance(unfixed, dict) and len(unfixed) > 0:
+        if isinstance(unfixed, (list, dict)) and len(unfixed) > 0:
             return f"{RED}diag: ✗ {len(unfixed)} err{RESET}"
 
     return f"{GREEN}diag: ✓{RESET}"
 
 
+def _fmt_turn_elapsed(seconds: float) -> str:
+    sec = max(0, int(seconds))
+    if sec < 60:
+        return f"{sec}s"
+    mins, rem_s = divmod(sec, 60)
+    if mins < 60:
+        return f"{mins}m{rem_s:02d}s"
+    hours, rem_m = divmod(mins, 60)
+    return f"{hours}h{rem_m:02d}m"
+
+
 def build_watchdog_segment(cid: str) -> str:
     if not is_plugin_enabled("watchdog", True):
         return f"{DIM}watch: off{RESET}"
-    wd_dir = Path(os.environ.get("AGY_WATCHDOG_HOME") or (AGENTS_DIR / "watchdog"))
-    state = read_json(wd_dir / "state.json")
+    wd_dir = os.path.expanduser(
+        os.environ.get("AGY_WATCHDOG_HOME") or os.path.join(_agents_dir(), "watchdog")
+    )
+    state = read_json(os.path.join(wd_dir, "state.json"))
     if not state.get("enabled", True):
         return f"{DIM}watch: off{RESET}"
 
-    if cid:
-        sess = read_json(wd_dir / "sessions" / f"{cid}.json")
+    counters = ""
+    if cid and _is_safe_cid(cid):
+        sess = read_json(os.path.join(wd_dir, "sessions", f"{cid}.json"))
         alert = sess.get("last_alert")
         if isinstance(alert, dict):
             kind = str(alert.get("kind") or "")
@@ -296,7 +276,21 @@ def build_watchdog_segment(cid: str) -> str:
             if kind == "loop" and age <= 90:
                 return f"{YELLOW}watch: ↻ {detail}{RESET}"
 
-    return f"{GREEN}watch: ✓{RESET}"
+        steps = int(sess.get("turn_step_count") or 0)
+        tools = int(sess.get("turn_tool_count") or 0)
+        try:
+            turn_started = float(sess.get("turn_started_epoch") or 0.0)
+        except (TypeError, ValueError):
+            turn_started = 0.0
+        parts: list[str] = []
+        if steps > 0 or tools > 0:
+            parts.append(f"{steps}s/{tools}t")
+        if turn_started > 0.0:
+            parts.append(_fmt_turn_elapsed(time.time() - turn_started))
+        if parts:
+            counters = f" {DIM}({' · '.join(parts)}){RESET}"
+
+    return f"{GREEN}watch: ✓{RESET}{counters}"
 
 
 def build_playwright_segment() -> str:
@@ -305,20 +299,339 @@ def build_playwright_segment() -> str:
     return f"{DIM}pw: off{RESET}"
 
 
+def _safe_int(val: object) -> int:
+    try:
+        return max(0, int(val or 0))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0
+
+
+def _fmt_tokens(tokens: int) -> str:
+    if tokens >= 1_000_000:
+        return f"{tokens / 1_000_000:.2f}M"
+    if tokens >= 100_000:
+        return f"{tokens / 1_000:.0f}k"
+    if tokens >= 1_000:
+        return f"{tokens / 1_000:.1f}k"
+    return f"{tokens}"
+
+
+def _fmt_limit_tokens(tokens: int) -> str:
+    if tokens >= 1_000_000:
+        if tokens == 1_048_576:
+            return "1M"
+        millions = tokens / 1_000_000
+        if abs(millions - round(millions)) < 1e-6:
+            return f"{int(round(millions))}M"
+        return f"{millions:.1f}M"
+    if tokens >= 1_000 and tokens % 1_000 == 0:
+        return f"{tokens // 1_000}k"
+    return _fmt_tokens(tokens)
+
+
+def _candidate_transcript_paths(cid: str, payload: dict) -> list[str]:
+    paths: list[str] = []
+    raw_tp = payload.get("transcript_path") or payload.get("transcriptPath")
+    if isinstance(raw_tp, str) and raw_tp.strip():
+        tp = os.path.expanduser(raw_tp.strip().strip('"'))
+        paths.append(tp)
+
+    if cid and _is_safe_cid(cid):
+        cli_data_dir = os.environ.get("AGY_CLI_DATA_DIR")
+        if cli_data_dir:
+            paths.append(
+                os.path.join(
+                    os.path.expanduser(cli_data_dir),
+                    "brain",
+                    cid,
+                    ".system_generated",
+                    "logs",
+                    "transcript.jsonl",
+                )
+            )
+        home = _home_dir()
+        for prod in AGY_PRODUCTS:
+            paths.append(
+                os.path.join(
+                    home,
+                    ".gemini",
+                    prod,
+                    "brain",
+                    cid,
+                    ".system_generated",
+                    "logs",
+                    "transcript.jsonl",
+                )
+            )
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for p in paths:
+        if p not in seen:
+            seen.add(p)
+            deduped.append(p)
+    return deduped
+
+
+def _iter_file_lines_reversed(path: str):
+    """Yield complete raw lines (bytes) from end of file to start, across arbitrary line/file sizes."""
+    with open(path, "rb") as fh:
+        fh.seek(0, os.SEEK_END)
+        offset = fh.tell()
+        if offset <= 0:
+            return
+
+        carry = b""
+        chunk_size = INITIAL_TAIL_BYTES
+        while offset > 0:
+            read_len = min(chunk_size, offset)
+            offset -= read_len
+            fh.seek(offset)
+            chunk = fh.read(read_len)
+            buf = chunk + carry
+            parts = buf.split(b"\n")
+            if offset > 0:
+                carry = parts[0]
+                complete = parts[1:]
+            else:
+                carry = b""
+                complete = parts
+
+            for raw_line in reversed(complete):
+                if raw_line:
+                    yield raw_line
+
+            chunk_size = STEP_BACK_BYTES
+
+        if carry:
+            yield carry
+
+
+def _estimate_raw_lines_tokens(raw_lines: list[bytes]) -> int:
+    total_chars = 0
+    for raw in raw_lines:
+        try:
+            d = json.loads(raw.decode("utf-8", errors="replace"))
+        except Exception:
+            continue
+        if not isinstance(d, dict):
+            continue
+        for key in ("content", "thinking"):
+            val = d.get(key)
+            if isinstance(val, str):
+                total_chars += len(val)
+        tcalls = d.get("tool_calls")
+        if isinstance(tcalls, (list, dict)) and tcalls:
+            try:
+                total_chars += len(json.dumps(tcalls, separators=(",", ":")))
+            except Exception:
+                pass
+    return (total_chars + 3) // 4 if total_chars > 0 else 0
+
+
+def _scan_jsonl_bundle_reversed(files_newest_first: list[str], cid: str) -> TranscriptContext | None:
+    trailing_raw: list[bytes] = []
+    saw_tokenless_pr = False
+    saw_any_line = False
+
+    for fpath in files_newest_first:
+        try:
+            for raw_line in _iter_file_lines_reversed(fpath):
+                stripped = raw_line.strip()
+                if not stripped:
+                    continue
+                saw_any_line = True
+
+                if b'"PLANNER_RESPONSE"' not in stripped and b'"CHECKPOINT"' not in stripped:
+                    if len(trailing_raw) < 512:
+                        trailing_raw.append(stripped)
+                    continue
+
+                try:
+                    d = json.loads(stripped.decode("utf-8", errors="replace"))
+                except Exception:
+                    continue
+                if not isinstance(d, dict):
+                    continue
+
+                rtype = d.get("type")
+                if rtype == "CHECKPOINT" and d.get("source") in (None, "SYSTEM"):
+                    # Compaction reset boundary: pre-checkpoint history is discarded, and
+                    # CHECKPOINT.input_tokens/cache_read_tokens are pre-compaction summarizer inputs.
+                    cp_tokens = _safe_int(d.get("output_tokens"))
+                    if cp_tokens <= 0:
+                        cp_content = d.get("content")
+                        if isinstance(cp_content, str) and cp_content:
+                            cp_tokens = (len(cp_content) + 3) // 4
+                    trailing_est = _estimate_raw_lines_tokens(trailing_raw)
+                    return TranscriptContext(
+                        tokens=cp_tokens + trailing_est,
+                        has_checkpoint_reset=True,
+                        from_reported_pr=False,
+                    )
+
+                if rtype == "PLANNER_RESPONSE":
+                    if (
+                        d.get("subagent_id")
+                        or d.get("parent_conversation_id")
+                        or d.get("source") not in (None, "MODEL")
+                    ):
+                        continue
+                    row_cid = d.get("conversation_id") or d.get("conversationId")
+                    if cid and isinstance(row_cid, str) and row_cid and row_cid != cid:
+                        continue
+
+                    in_tok = _safe_int(d.get("input_tokens"))
+                    cr_tok = _safe_int(
+                        d.get("cache_read_tokens")
+                        if "cache_read_tokens" in d
+                        else d.get("cache_read_input_tokens")
+                    )
+                    cw_tok = _safe_int(
+                        d.get("cache_write_tokens")
+                        if "cache_write_tokens" in d
+                        else d.get("cache_creation_input_tokens")
+                    )
+                    out_tok = _safe_int(d.get("output_tokens"))
+                    ctx = in_tok + cr_tok + cw_tok + out_tok
+                    if ctx > 0:
+                        return TranscriptContext(
+                            tokens=ctx,
+                            has_checkpoint_reset=False,
+                            from_reported_pr=True,
+                        )
+                    saw_tokenless_pr = True
+                    if len(trailing_raw) < 512:
+                        trailing_raw.append(stripped)
+        except Exception:
+            continue
+
+    if not saw_any_line:
+        return None
+
+    est = _estimate_raw_lines_tokens(trailing_raw) if saw_tokenless_pr else 0
+    return TranscriptContext(tokens=est, has_checkpoint_reset=False, from_reported_pr=False)
+
+
+def _read_transcript_context_info(cid: str, payload: dict) -> TranscriptContext | None:
+    for tpath in _candidate_transcript_paths(cid, payload):
+        if os.path.isfile(tpath):
+            res = _scan_jsonl_bundle_reversed([tpath], cid)
+            if res is not None:
+                return res
+        chunks_dir = os.path.join(os.path.dirname(tpath), "chunks", "transcript")
+        if os.path.isdir(chunks_dir):
+            try:
+                chunk_files = sorted(
+                    (
+                        os.path.join(chunks_dir, entry.name)
+                        for entry in os.scandir(chunks_dir)
+                        if entry.is_file() and entry.name.endswith(".jsonl")
+                    ),
+                    reverse=True,
+                )
+            except Exception:
+                chunk_files = []
+            if chunk_files:
+                res = _scan_jsonl_bundle_reversed(chunk_files, cid)
+                if res is not None:
+                    return res
+    return None
+
+
+def _read_transcript_context_tokens(cid: str, payload: dict) -> int:
+    info = _read_transcript_context_info(cid, payload)
+    return info.tokens if info is not None else 0
+
+
+def _extract_current_usage_tokens(cw: dict) -> int:
+    cu = cw.get("current_usage")
+    if not isinstance(cu, dict):
+        return 0
+    return (
+        _safe_int(cu.get("input_tokens"))
+        + _safe_int(
+            cu.get("cache_read_input_tokens")
+            if "cache_read_input_tokens" in cu
+            else cu.get("cache_read_tokens")
+        )
+        + _safe_int(
+            cu.get("cache_creation_input_tokens")
+            if "cache_creation_input_tokens" in cu
+            else cu.get("cache_write_tokens")
+        )
+        + _safe_int(cu.get("output_tokens"))
+    )
+
+
+def build_context_segment(cid: str, payload: dict) -> str:
+    cw = payload.get("context_window") if isinstance(payload.get("context_window"), dict) else {}
+    max_tokens = _safe_int(
+        cw.get("context_window_size") or cw.get("max_context_tokens") or cw.get("maxTokens")
+    )
+    cu_tokens = _extract_current_usage_tokens(cw)
+    tr = _read_transcript_context_info(cid, payload)
+
+    ctx_tokens = 0
+    if tr is not None and tr.has_checkpoint_reset:
+        # In agy CLI, applyCompactionInfo does not clear LatestGeneratorMetadata, so stdin
+        # current_usage/total_input_tokens still hold pre-compaction counts until the next turn.
+        ctx_tokens = tr.tokens
+    elif cu_tokens > 0:
+        ctx_tokens = cu_tokens
+    elif tr is not None and tr.from_reported_pr:
+        ctx_tokens = tr.tokens
+    else:
+        # Provider omitted per-step Usage (e.g. custom OpenAI-compatible model) or mid-first-turn:
+        # use Cortex's pre-call EstimatedTokensUsed in total_input_tokens before char/4 fallback.
+        total_in = _safe_int(cw.get("total_input_tokens"))
+        if total_in > 0:
+            ctx_tokens = total_in
+        elif tr is not None and tr.tokens > 0:
+            ctx_tokens = tr.tokens
+        elif max_tokens > 0 and isinstance(cw.get("used_percentage"), (int, float)):
+            used_pct = float(cw["used_percentage"])
+            if used_pct > 0:
+                ctx_tokens = int(round((used_pct / 100.0) * max_tokens))
+
+    if ctx_tokens <= 0:
+        return f"{DIM}ctx: —{RESET}"
+
+    used_label = _fmt_tokens(ctx_tokens)
+    if max_tokens > 0:
+        max_label = _fmt_limit_tokens(max_tokens)
+        pct = int(round((ctx_tokens * 100.0) / max_tokens))
+        label = f"{used_label}/{max_label} ({pct}%)"
+        ratio = ctx_tokens / max_tokens
+        if ratio >= 0.85:
+            return f"{RED}ctx: {label}{RESET}"
+        if ratio >= 0.50:
+            return f"{YELLOW}ctx: {label}{RESET}"
+        return f"{CYAN}ctx:{RESET} {label}"
+
+    if ctx_tokens >= 180_000:
+        return f"{RED}ctx: {used_label}{RESET}"
+    if ctx_tokens >= 100_000:
+        return f"{YELLOW}ctx: {used_label}{RESET}"
+    return f"{CYAN}ctx:{RESET} {used_label}"
+
+
 def main() -> int:
     payload: dict = {}
     if not sys.stdin.isatty():
         try:
             raw = sys.stdin.read()
             if raw.strip():
-                payload = json.loads(raw)
+                loaded = json.loads(raw)
+                if isinstance(loaded, dict):
+                    payload = loaded
         except Exception:
             payload = {}
 
     cid = str(
-        payload.get("session_id")
-        or payload.get("conversation_id")
+        payload.get("conversation_id")
         or payload.get("conversationId")
+        or payload.get("session_id")
         or ""
     )
     ws = payload.get("workspace") if isinstance(payload.get("workspace"), dict) else {}
@@ -329,17 +642,13 @@ def main() -> int:
         or os.getcwd()
     )
 
-    sess: dict = {}
-    if cid:
-        sess = read_json(AGENTS_DIR / "advisor" / "sessions" / f"{cid}.json")
-
-    adv_seg, touched = build_advisor_segment(cid, sess)
-    git_seg = build_git_segment(cwd, touched)
+    git_seg = build_git_segment(cwd, payload=payload)
+    ctx_seg = build_context_segment(cid, payload)
     diag_seg = build_diagnostics_segment(cid)
     watch_seg = build_watchdog_segment(cid)
     pw_seg = build_playwright_segment()
 
-    parts = [p for p in (git_seg, adv_seg, diag_seg, watch_seg, pw_seg) if p]
+    parts = [p for p in (git_seg, ctx_seg, diag_seg, watch_seg, pw_seg) if p]
     sep = f" {DIM}│{RESET} "
     sys.stdout.write(sep.join(parts) + "\n")
     return 0
