@@ -39,7 +39,7 @@ When an error surfaces deep in the call stack (empty path, `undefined` field, wr
 ## 4. Flaky & State-Polluted Tests
 
 - **Condition waiting over `sleep`:** Never fix async test races by bumping `sleep()` / `setTimeout()` delays (unless explicitly testing timer/debounce durations). Poll or await the observable state transition (`waitFor(() => condition)` with a clear timeout message).
-- **Suite pollution ("passes alone, fails together"):** When a test fails only alongside other tests due to leaked files, DB rows, mocks, or env vars, bisect the offending test file with `./scripts/find-polluter.sh <polluted_path_or_marker> '<test_glob>'`.
+- **Suite pollution ("passes alone, fails together"):** When a test fails only alongside other tests due to leaked files, DB rows, mocks, or env vars, bisect the offending test file with `~/.agents/skills/systematic-debugging/scripts/find-polluter.sh <polluted_path_or_marker> '<test_glob>'`.
 
 ---
 

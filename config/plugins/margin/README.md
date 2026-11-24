@@ -1,62 +1,52 @@
 # margin
 
-Right-side **Overview** pane for the main agent chat in Antigravity Desktop: live status, the ask,
-the agent's take, plan progress, verdict, context window usage, watchdog timer, and what it used.
-Built in a crisp, ultra-readable **Google style** (Google Workspace / Cloud Console / Material 3 utility
-aesthetic) with full 1:1 `claudzilla` Overview feature parity.
+Right-pane **Overview** sidecar and MCP App for Antigravity, aligned with Claude Code's Margin workflow: prompt-derived **Session** & **Topic**, the **Ask**, inline **Take**, live **Plan** with nested subagents/swarm workers, **Used** tool ledger, and live Context + Watchdog telemetry.
 
 ## Overview UI Features
 
-1. **Pinned Header & Telemetry Strip**:
-   - **Live Status Indicator**: `◐ Planning…`, `● Working`, `◌ Waiting on N agents`, `✓ Done`, `■ Stopped`, `Idle`.
-   - **Step Summary Chip**: Right-aligned live summary pill (`2 done · on 3 of 5` during progress, `5/5 steps` on done).
-   - **Context Window Gauge**: Live usage (`171.2k / 1.0M · 17%`) with thin 3px fill bar (Google blue `#1a73e8`/`#8ab4f8`, amber >=65%, red >=85%) and multi-tier tooltip (`Model`, `Input`, `Cache`, `Output`, `Total`).
-   - **Watchdog Live Timer**: Client timer ticking every 1s during active turns (`1m 04s · 6s/8t`), frozen at final duration on done/stopped, with semantic amber/red warning badge on stall/loop alerts.
-
-2. **Stale/Planning Dim State (`claudzilla` 1:1)**:
-   - When a turn starts (`status === 'planning'` and not yet reported), the previous turn's intent renders softly dimmed (`opacity: 0.58`) beneath a `"Planning next turn…"` banner until the current turn's `margin_intent` arrives.
-
-3. **Ask & Take Sections**:
-   - **Ask**: 4-line clamped summary (`wants || ask`) with click-to-expand and hover tooltip showing raw user ask.
-   - **Take**: Semantic tonal chip with stance glyph (`✓ clear`, `! check first`, `✗ breaks rule`, `? unclear goal`) and crisp `why` rationale sentence.
-
-4. **Plan Section — Highlighted Active Task & Nested Subagents**:
-   - Header shows live progress summary (`2 done · on 3 of 5`) and Google blue progress bar.
-   - **Active Task Row**: Elevated container in soft Google blue (`color-mix(in srgb, var(--accent) 10%, var(--surface))`), `●` active indicator, bold `Step k · Now` badge, high-contrast primary text, and auto-scroll tracking.
-   - **Completed Steps**: Green `✓` glyph and clean, readable text (no strikethrough).
-   - **Nested Subagents**: Swarm workers rendered with tree connectors (`├─`, `└─`), live status glyphs (`◌`, `✓`, `✗`, `■`, `○`), description, and model/type tags. Steps with >3 agents fold cleanly behind an interactive `Show N more agents` button.
-
-5. **Verdict Section**:
-   - High-contrast outcome card with green check badge when `verdict` is delivered.
-
-6. **Used Section & Drill-Down Details Drawer (`claudzilla` 1:1)**:
-   - Category rows (`Files`, `Memory`, `Skills`, `Shell`, `Web`, `Agents`) displaying main count, muted `+N` subagent count, recent file/tool preview, and chevron affordance.
-   - Clicking any category row slides up an in-pane **Details Drawer** (closes on `Esc`, backdrop click, or `×` button) grouping operations by reader (`Main agent`, subagents), with repeat badges (`×2`), source badges (`read_file`, `bash`), external links for web, and clickable file rows triggering `window.sidecar?.ui?.toggleAuxPane({ tabType: 'fileView', uri: 'file://' + item.name })`.
+1. **Session & Topic (`0 ms` prompt-only reader):**
+   - `PreInvocation` (`bin/agy-watch`) and Overview open/poll spawn a detached background worker (`lib/topics-worker.mjs`) reading only explicit user prompts (`USER_EXPLICIT`) to write `.system_generated/margin/topics.json` (with ephemeral `agy` worker cleanup so `"Untitled Session"` entries never leak into history).
+   - **Session** summarizes the overall goal as a telegraphic fragment (`<= 8` words), showing `updating…` or `update failed` inline when active or failed.
+   - **Topic** shows the latest work topic (`<= 5` words; `updating…` on first turn) with a `show all` button opening the **Topics** modal newest-first when 2+ topics exist.
+2. **Stale Planning & Turn Group:**
+   - When a new prompt arrives and Margin has not reported yet, `Ask` / `Take` / `Plan` dim (`is-stale`) over the previous turn's report alongside a `Planning…` banner while **Session** and **Topic** stay full brightness.
+3. **Unified `Ask` / `Take` / `Plan` / `Result` / `Used` Grid (`54px 1fr`):**
+   - **Ask** renders the agent's telegraphic `wants` summary (`<= 60` chars) always expanded (no line clamp, no toggle, no raw-prompt fallback).
+   - **Take** renders inline (`✓ clear`, `! check first: <reason>`, `✗ data loss`, `? needs repro: <source>`) with no pill border and `<= 40`-char reasons. On questions without edits, `take` names the source to check rather than leaking the expected answer.
+   - **Plan** lists terse verb+noun steps (`<= 40` chars) with `✓` / `●` / `○` glyphs using **1-based** `now` progress (`now: 1` for step 1). Clean turn completion closes remaining steps automatically unless the turn's `Result` paused for user input or hit a blocker (`needs_input` / `blocked`). Subagents and `.system_generated/swarm/members.json` workers nest along a `1px` vertical guide rail (`.agent-tree`), folding past 3 with `… N more` / `… less`.
+   - **Result** renders end-of-turn `Outcome` triage (`✓ clear`, `? needs input`, `! caveats` / `! unverified`, `✗ blocked` / `✗ check failed`) with telegraphic `<= 65`-char summaries, combining instant deterministic transcript facts (`N file(s) edited · checks passed / no check run / check failed`) with an asynchronous detached Flash pass (`lib/outcome-worker.mjs`) triggered on `Stop` and Overview poll. Hard execution guardrails prevent false-green `clear` results when edits lack checks, checks fail, or questions were asked.
+   - **Used** renders compact interactive rows (`files`, `memory`, `learnings`, `skills`, `shell`, `web`, `agents`) with counts, `Google Sans Code` filename previews (prefixing saved memories and captured learnings with `--ok` `+slug`), and hover `›` chevrons. Clicking any row opens the **Inspection Sheet** (`Details Drawer`) with dimmed directory paths (`Main`/`@worker` headers when multiple readers contribute), `Esc` / backdrop dismiss, external `↗` links, and Antigravity `fileView` clicks. `Memory` splits main items into `Captured & extracted` (`agent-memory` `memory.db` rollouts, memory writes, `remember` notes) vs `Read` (reads + `search`/`drift`), and `Learnings` splits main items into `Captured` (session-wide `agy-compound` `audit.jsonl` and `docs/learnings/*` writes) vs `Read`, both with 2-line summary excerpts; clicking opens the file in a new tab (`fileView` or `/api/memory-view`) and hover `peek` reads it inline (`memory-doc`).
+4. **Unified HUD Footer (`1000 ms` polling):**
+   - Single flat footer (`.hud-footer#telemetry-bar`) combining the `1.5px` Context gauge rail, a live status row (spinner glyph for `working…`, `◐ planning…`, `◌ waiting · N agent(s)`, `✓ done at HH:MM`, `? needs input at HH:MM`, `! caveats at HH:MM`, `✗ blocked at HH:MM`, `■ stopped at HH:MM`; wording trims as the pane narrows) with `done/total steps` beside it and the `ctx` chip right-aligned, and a second row holding the `watchdog` chip (`9s · 2 steps · 3 tools`, segments drop as the pane narrows); the chips open the **Session Telemetry** sheet.
+5. **Antigravity Hub Typography (`DESIGN.md`):**
+   - Uses embedded `Google Sans Flex` (Latin, Latin-Ext, Vietnamese with preserved `unicode-range` slices in `app/fonts.css`) and `Google Sans Code` on code/path elements alongside the Google Light/Dark ink palette.
 
 ## Architecture
 
-The plugin combines two lightweight Node pieces sharing the same `app/` UI and `lib/` readers:
+| Component | Role |
+|---|---|
+| `rules/AGENTS.md` | Auto-loaded Margin protocol (`call_mcp_tool` inline schema for Plan Mode + Step 1, plain-language wording rules, pre-work `take` rules, 1-based `now`, no end-of-turn call). |
+| `mcp/server.mjs` | Data-only stdio MCP server exposing `margin_intent` (no inline MCP App UI; Overview renders solely in the right-hand sidecar via `sidecars/margin/`). |
+| `sidecars/margin/` | Serves the right-pane **Overview** tab and `GET /api/overview` with ETag caching. |
+| `desktop-patch/patch.mjs` (`agy-desktop-patch`) | Reversible Antigravity Desktop `app.asar` patcher (`apply`, `status`, `check`, `restore`) bundling `top-bar`, `overview`, and `model-search`. |
+| `desktop-patch/lib/` (`asar.mjs`, `overview.mjs`) | Zero-dependency ASAR repacker and sandbox-safe renderer preload hook powering `agy-desktop-patch`. |
+| `lib/agy-worker.mjs` | Shared ephemeral `agy --mode plan` prompt runner with cross-product SQLite/brain cleanup. |
+| `lib/topics.mjs` & `lib/topics-worker.mjs` | Prompt-only `Session` / `Topic` prompt templates (`OVERVIEW_ASK`, `LATEST_ASK`, `overviewMerge`), incremental/merge state updates, and background worker. |
+| `lib/outcome.mjs` & `lib/outcome-worker.mjs` | Instant deterministic `Result` extraction (`extractTurnExecution`, `buildHeuristicOutcome`, `mergeOutcome` guardrails) plus detached Flash worker triggered on `Stop`/poll writing `outcome.json`. |
+| `lib/intent.mjs` | Strict `readTake`, 1-based `applyNow` (tolerating `now: 0` with `steps`), and `{ prevAnswered }` merge state persisted to `intent.json`. |
+| `lib/transcript.mjs` & `lib/overview.mjs` | Transcript derivation (`status`, `ask`, `used`, `usedDetails`, `context`), swarm/subagent tree hanging (`hang`), Watchdog metrics, and ETag assembly. |
+| `lib/memory.mjs` | Read-only session memory (`memory.db` rollouts, `agent-memory` CLI) and learnings (`audit.jsonl`, `docs/learnings/*`) aggregation, plus allowlisted HTML/JSON doc viewer. |
+| `app/` | Single-bundle HTML/CSS/JS panel + inlined `fonts.css` (`Google Sans Flex` / `Google Sans Code`) supporting MCP Apps JSON-RPC and HTTP sidecar polling (`1000 ms`). Design contract in `DESIGN.md`. |
 
-| Piece | Role |
-| --- | --- |
-| `app/` (`index.html`, `app.css`, `app.js`) | Google Workspace / Material 3 utility UI for both Sidecar and MCP Apps transports. |
-| `sidecars/margin/` (UI sidecar) | Serves the right-pane **Overview** tab (`SIDECAR_UI_ENTRYPOINT_AUX_PANE`) via `sidecar_sdk` and exposes `GET /api/overview`, polling `transcript.jsonl` + `intent.json` with ETag caching. Appears in the side pane `+` menu and opens via `[Overview](sidecar://margin/margin/)`. |
-| `mcp/server.mjs` (`margin_intent`) | Model-visible MCP tool where the agent reports `wants`, `take`, `steps`, `now`, `verdict`. Also serves the MCP App `ui://margin/overview.html` resource (`auxPane` entrypoint) when `enable-mcp-apps` is enabled. |
-| `lib/overview.mjs` & `lib/transcript.mjs` | Deterministic status (`planning`, `working`, `waiting_agents`, `done`, `stopped`), ASK, USED counts, subagent discovery, and ETag-cached `resolveOverview`. |
-| `lib/intent.mjs` | Validate and merge reports; a new user message starts a clean turn. |
+## Auto-Open Overview in Antigravity Desktop
 
-Intent is stored at `<brain>/<conversation>/.system_generated/margin/intent.json`.
+Apply or revert the renderer preload patch (`~/.local/bin/agy-desktop-patch`) when Antigravity Desktop is closed (`agy-desktop-patch` auto-elevates with `sudo` when writing system paths):
 
-## Design Verification & Anti-Slop Compliance
-
-- **`avoid-ai-design`**: 0 findings (`P0 0 · P1 0 · P2 0`) via `node <skill>/scripts/detect.mjs app/`.
-- **`taste-skill`**: 0 FAIL via `node <skill>/scripts/lint.mjs --app app/`.
-- **Pre-rendered Preview Screenshots** (`380x780`, headless Chromium):
-  - `/tmp/margin-ui-check-working-light.png` (working turn "2 done · on 3 of 5", subagents, context gauge, watchdog)
-  - `/tmp/margin-ui-check-working-dark.png` (dark theme counterpart)
-  - `/tmp/margin-ui-check-done-verdict-dark.png` (turn completed, 5/5 steps, verdict card)
-  - `/tmp/margin-ui-check-used-modal-light.png` (interactive Used drill-down drawer, light)
-  - `/tmp/margin-ui-check-used-modal-dark.png` (interactive Used drill-down drawer, dark)
+```bash
+agy-desktop-patch status
+agy-desktop-patch apply --only overview
+agy-desktop-patch restore
+```
 
 ## Tests
 

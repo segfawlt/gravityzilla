@@ -41,6 +41,18 @@ Run the matching command via `run_command` based on the user's request (`$ARGUME
   ```bash
   ~/.local/bin/agent-memory model gemini-3.8-flash-low
   ```
+- **Inspect live memory usage & recalled items** (`/memory usage`):
+  ```bash
+  ~/.local/bin/agent-memory usage
+  ```
+- **Run diagnostics & repair stale indexes/folders** (`/memory doctor`):
+  ```bash
+  ~/.local/bin/agent-memory doctor --fix
+  ```
+- **View structured memory hook & sync logs** (`/memory logs`):
+  ```bash
+  ~/.local/bin/agent-memory logs -n 40
+  ```
 
 ## Operating Rules
 

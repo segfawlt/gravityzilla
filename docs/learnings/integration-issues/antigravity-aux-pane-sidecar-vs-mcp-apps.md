@@ -31,10 +31,12 @@ Add a UI sidecar (`sidecars/margin/sidecar.json` + `main.mjs`) alongside `mcp/se
 
 1. Declare `"has_web_ui": true` and `"entrypoint": "SIDECAR_UI_ENTRYPOINT_AUX_PANE"` in `sidecars/<name>/sidecar.json`.
 2. Serve the HTML page via `SidecarApp` (`sidecar_sdk`), injecting `<script src="/preload.js"></script>` when rendered for the sidecar so `window.sidecar` (`conversationId`, `fetch` with `X-Sidecar-Token`, theme CSS variables `--background`, `--foreground`, etc.) is active.
-3. Have `app.js` detect `window.sidecar || /^https?:$|^plugin:$/.test(location.protocol)` to poll `/api/overview` over HTTP with ETag caching (`resolveOverview`), while preserving the MCP Apps `ui/initialize` + `tools/call` `postMessage` path when `enable-mcp-apps` is active.
-4. Keep `_meta["com.google.antigravity/ui"].entrypoints` using camelCase `"auxPane"` in `mcp/server.mjs`.
+3. Have `app.js` detect `window.sidecar || /^https?:$|^plugin:$/.test(location.protocol)` to poll `/api/overview` over HTTP with ETag caching (`resolveOverview`).
+4. Do NOT leave `_meta.ui.resourceUri` or `_meta["com.google.antigravity/ui"]` on a sidecar-only MCP tool once the sidecar is active (as of Antigravity `44.9.1`, `_meta.ui` embeds an inline iframe into every chat turn; see [Leaving `_meta.ui.resourceUri` on a sidecar-backed MCP tool renders unwanted inline chat iframes](./mcp-app-meta-on-sidecar-tool-renders-inline-chat-iframe.md)). When authoring an actual inline MCP App tool, keep camelCase `"auxPane"` in entrypoints.
 
 ## Verification
 
 - `agy plugin validate --strict` outputs `mcpServers 1 · sidecars 1` and passes.
 - `lsrpc GetSidecars '{}'` confirms `margin/margin` reaches `SIDECAR_STATUS_RUNNING` with `entrypoint: "SIDECAR_UI_ENTRYPOINT_AUX_PANE"` and serves live `/api/overview` JSON and `/preload.js` (HTTP 200) through the sidecar gateway.
+
+Related: [Antigravity Desktop Side Panel Pin Tab Skips Auto-Open and Default Active Tab Selection](./antigravity-desktop-aux-pane-pin-vs-auto-open.md).

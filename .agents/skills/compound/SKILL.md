@@ -36,6 +36,15 @@ Then require at least two "yes" answers:
 
 If either gate fails, do not write. Report: `No learning captured — <reason>.`
 
+### Multi-Lesson Sessions (Capture All Distinct Lessons)
+
+When a session solves **multiple** distinct bugs, invariants, workarounds, or design decisions:
+
+1. Enumerate every substantive change made during the session before judging any of them.
+2. Evaluate the Strict Gate **independently per distinct root cause or pattern** — never stop after writing just one file or fold unrelated fixes into a single vague note.
+3. Write or update one `docs/learnings/<category>/<slug>.md` file per qualifying distinct lesson (`1..N` files), updating `docs/learnings/README.md` once for all additions/updates.
+4. For each fix that did not qualify, state its specific skip reason (`agy-compound skip "<item>: <reason>"` when recording routine skips).
+
 ## Storage
 
 Write `docs/learnings/<category>/<slug>.md` at the repository root. Use a descriptive 3–6 word
@@ -214,9 +223,10 @@ glossary only with explicit user approval.
 
 ### 5. Check discoverability
 
-Verify that the repository's `AGENTS.md` (or `CLAUDE.md`) points agents to
-`docs/learnings/README.md` and names the `compound` trigger. If it does not, report the
-integration gap and suggest the two lines below. Do not edit project instructions unless the user
+Verify that either global instructions (`GEMINI.md`) or the repository's `AGENTS.md` (or `CLAUDE.md`)
+points agents to `docs/learnings/README.md` and names the `compound` trigger. If neither does,
+report the integration gap and suggest adding the two lines below (in `GEMINI.md` for all repos or
+`AGENTS.md` when repo portability is needed). Do not edit persistent instructions unless the user
 explicitly asks.
 
 ```markdown
@@ -232,6 +242,8 @@ one. Reading for inventory, audit, or overlap detection does not count.
 At three references, add or update its `## Promote Candidates` bullet in
 `docs/learnings/README.md`. Promotion is still a user decision. Promotion targets:
 
+- Structural enforcement via `/correct` (architecture, stronger types, lint/CI check whose error
+  names the fix, or regression test) when the repeated pitfall can be made impossible in code.
 - A short path-scoped guardrail in `.agents/rules/<topic>.md` when the lesson applies to specific
   files (preferred — it loads only when matching files are touched; see the frontmatter format in
   `compound-refresh`).
@@ -240,6 +252,25 @@ At three references, add or update its `## Promote Candidates` bullet in
 Never promote automatically.
 
 ## Completion Output
+
+After writing/updating learnings (or determining none qualify), record or skip via `~/.local/bin/agy-compound` so the audit trail stays complete:
+
+```bash
+# After writing/updating 1..N learning files:
+~/.local/bin/agy-compound record --files docs/learnings/<cat>/<slug1>.md ... --summary "<concise note>"
+
+# Or if all fixes were strictly routine/trivial:
+~/.local/bin/agy-compound skip "<item>: <reason>"
+```
+
+CLI debugging subcommands (`~/.local/bin/agy-compound`):
+
+- `status` — show gate mode, learnings index health, promote candidates, and audit tallies
+- `audit [-n 15] [--all]` — audit turns (read-only vs substantive edits vs captured/skipped/missed)
+- `doctor` — verify `Stop` hook wiring, frontmatter/reference format, and index completeness
+- `extract [--dry-run]` — manually extract `1..N` candidate learnings from a transcript
+- `logs [-n 40]` — tail `compound.log`
+- `on` / `off` / `mode <gate|auto>` — toggle Stop-hook compound check
 
 New document:
 

@@ -11,6 +11,8 @@ date: 2026-11-19
 
 ## Problem
 
+Related: [Host theme-change inline :root CSS variables override sidecar --muted text tokens](./sidecar-host-css-variable-collision.md).
+
 1. In an Antigravity Desktop `SIDECAR_UI_ENTRYPOINT_AUX_PANE` webview, CSS dark-mode `@media (prefers-color-scheme: dark)` rules rendered white text (`#e8eaed`) on a bright `#fafafa` background when the host ran dark theme on a light-OS desktop or before CSS variables arrived.
 2. Updating helper modules (`lib/*.mjs`) imported by a running `sidecars/<name>/main.mjs` left the live sidecar serving stale cached ESM exports even after `RefreshMcpServers` or `app/*` static file edits.
 

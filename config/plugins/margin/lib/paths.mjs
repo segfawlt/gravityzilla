@@ -39,4 +39,7 @@ export function brainDirOf(conv, dirs = appDataDirs()) {
 }
 
 export const transcriptPath = (brain) => join(brain, '.system_generated', 'logs', 'transcript.jsonl');
+export const transcriptFullPath = (brain) => join(brain, '.system_generated', 'logs', 'transcript_full.jsonl');
 export const intentPath = (brain) => join(brain, '.system_generated', 'margin', 'intent.json');
+export const topicsPath = (brain) => join(brain, '.system_generated', 'margin', 'topics.json');
+export const outcomePath = (brain) => join(brain, '.system_generated', 'margin', 'outcome.json');

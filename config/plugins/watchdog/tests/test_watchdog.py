@@ -17,6 +17,7 @@ import os
 import signal
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -24,8 +25,9 @@ import unittest
 from pathlib import Path
 from typing import Any
 
-WATCH_BIN = Path(os.environ.get("AGY_WATCH_BIN") or "/home/domixi/.local/bin/agy-watch")
-STATUSLINE_BIN = Path(os.environ.get("AGY_STATUSLINE_BIN") or "/home/domixi/.local/bin/agy-statusline")
+REPO_ROOT = Path(__file__).resolve().parents[4]
+WATCH_BIN = Path(os.environ.get("AGY_WATCH_BIN") or (REPO_ROOT / "bin" / "agy-watch"))
+STATUSLINE_BIN = Path(os.environ.get("AGY_STATUSLINE_BIN") or (REPO_ROOT / "bin" / "agy-statusline"))
 
 
 class WatchdogTestCase(unittest.TestCase):
@@ -44,6 +46,9 @@ class WatchdogTestCase(unittest.TestCase):
         self.env["AGY_CLI_DATA_DIR"] = str(self.cli_dir)
         self.env["AGY_WATCHDOG_POLL_S"] = "0.1"
         self.env["AGY_WATCHDOG_IDLE_TICKS"] = "2"
+        self.env["AGY_WATCHDOG_NO_MARGIN_NUDGE"] = "1"
+        self.env["AGY_WATCHDOG_NO_TOPICS_SPAWN"] = "1"
+        self.env["AGY_WATCHDOG_NO_OUTCOME_SPAWN"] = "1"
 
         # Pre-hold watcher.lock for hook unit tests so daemon-loop isn't spawned
         # into temp directories that tearDown deletes immediately.
@@ -946,6 +951,365 @@ class WatchdogTestCase(unittest.TestCase):
                     proc.stdout.close()
                 if proc.stderr is not None:
                     proc.stderr.close()
+
+    def test_9_step_vs_parallel_tool_counting_and_batch_threshold(self) -> None:
+        cid = "cid-step-0009"
+        # 1. Start turn with 1 pre-invocation + 4 parallel tool calls -> 1 step, 4 tools, turn_started_epoch set
+        rc, _, _ = self._run_watch(
+            "pre-invocation-hook",
+            {"conversationId": cid, "cwd": "/tmp/demo", "lastUserInput": "Fix four bugs"},
+        )
+        self.assertEqual(rc, 0)
+        for i in range(4):
+            self._run_watch(
+                "pre-tool-hook",
+                {
+                    "conversationId": cid,
+                    "cwd": "/tmp/demo",
+                    "stepIdx": i + 2,
+                    "toolCall": {"id": f"par-{i}", "name": "read_file", "args": {"Path": f"/tmp/demo/f{i}.py"}},
+                },
+            )
+            self._run_watch(
+                "post-tool-hook",
+                {
+                    "conversationId": cid,
+                    "cwd": "/tmp/demo",
+                    "stepIdx": i + 2,
+                    "toolCall": {"id": f"par-{i}", "name": "read_file", "args": {"Path": f"/tmp/demo/f{i}.py"}},
+                },
+            )
+
+        sess_path = self.wd_home / "sessions" / f"{cid}.json"
+        sess = json.loads(sess_path.read_text(encoding="utf-8"))
+        self.assertEqual(sess["turn_step_count"], 1)
+        self.assertEqual(sess["turn_tool_count"], 4)
+        self.assertGreater(float(sess["turn_started_epoch"]), 0.0)
+
+        # Backdate turn_started_epoch by 75s to verify clean timer formatting in agy-statusline
+        sess["turn_started_epoch"] = time.time() - 75.0
+        sess_path.write_text(json.dumps(sess), encoding="utf-8")
+
+        t0 = time.monotonic()
+        p_sl = subprocess.run(
+            [str(STATUSLINE_BIN)],
+            input=json.dumps({"conversationId": cid, "cwd": "/tmp/demo"}),
+            capture_output=True,
+            text=True,
+            env=self.env,
+            timeout=2,
+        )
+        dt_ms = (time.monotonic() - t0) * 1000
+        self.assertEqual(p_sl.returncode, 0)
+        self.assertIn("watch: ✓", p_sl.stdout)
+        self.assertIn("1s/4t", p_sl.stdout)
+        self.assertIn("1m1", p_sl.stdout)
+        self.assertLess(dt_ms, 200)
+
+        # 2. Simulate parallel tool batch jumping past 45 tools (44 -> 47) and verify warning fires on next step
+        sess["turn_tool_count"] = 47
+        sess["warned_step_45"] = False
+        sess_path.write_text(json.dumps(sess), encoding="utf-8")
+        rc, out, _ = self._run_watch(
+            "pre-invocation-hook",
+            {"conversationId": cid, "cwd": "/tmp/demo", "lastUserInput": "Fix four bugs"},
+        )
+        self.assertEqual(rc, 0)
+        parsed = json.loads(out)
+        injected = parsed.get("injectSteps", [{}])[0].get("systemMessage", {}).get("systemMessage", "")
+        self.assertIn("Turn step check:", injected)
+        self.assertIn("47 tool calls", injected)
+
+        # 3. Simulate rejected pre-tool-hook (no post-tool-hook) leaving orphaned inflight tool + sync stall alert
+        self._run_watch(
+            "pre-tool-hook",
+            {
+                "conversationId": cid,
+                "stepIdx": 99,
+                "cwd": "/tmp/demo",
+                "toolCall": {
+                    "id": "call-denied",
+                    "name": "run_command",
+                    "args": {"CommandLine": "rm -rf /tmp/nonexistent"},
+                },
+            },
+        )
+        sess = json.loads(sess_path.read_text(encoding="utf-8"))
+        sess["last_alert"] = {"kind": "stall", "detail": "run_command 163s", "ts": time.time()}
+        sess_path.write_text(json.dumps(sess), encoding="utf-8")
+
+        rc, _, _ = self._run_watch(
+            "pre-invocation-hook",
+            {"conversationId": cid, "cwd": "/tmp/demo", "lastUserInput": "Fix four bugs"},
+        )
+        self.assertEqual(rc, 0)
+        sess = json.loads(sess_path.read_text(encoding="utf-8"))
+        self.assertEqual(sess["inflight_tools"], {})
+        self.assertIsNone(sess["last_alert"])
+
+        p_sl2 = subprocess.run(
+            [str(STATUSLINE_BIN)],
+            input=json.dumps({"conversationId": cid, "cwd": "/tmp/demo"}),
+            capture_output=True,
+            text=True,
+            env=self.env,
+            timeout=2,
+        )
+        self.assertEqual(p_sl2.returncode, 0)
+        self.assertIn("watch: ✓", p_sl2.stdout)
+        self.assertNotIn("watch: ⚠", p_sl2.stdout)
+
+    def test_10_statusline_renders_context_size(self) -> None:
+        cid = "cid-ctx-0010"
+
+        # 1. Empty / no transcript -> placeholder
+        p_empty = subprocess.run(
+            [str(STATUSLINE_BIN)],
+            input=json.dumps({"conversationId": cid, "cwd": "/tmp"}),
+            capture_output=True,
+            text=True,
+            env=self.env,
+            timeout=2,
+        )
+        self.assertEqual(p_empty.returncode, 0)
+        self.assertIn("ctx: —", p_empty.stdout)
+
+        # 2. context_window.current_usage in payload (<100k)
+        p_cw = subprocess.run(
+            [str(STATUSLINE_BIN)],
+            input=json.dumps(
+                {
+                    "conversationId": cid,
+                    "cwd": "/tmp",
+                    "context_window": {
+                        "current_usage": {
+                            "input_tokens": 15000,
+                            "cache_read_input_tokens": 28000,
+                            "cache_creation_input_tokens": 1500,
+                            "output_tokens": 500,
+                        }
+                    },
+                }
+            ),
+            capture_output=True,
+            text=True,
+            env=self.env,
+            timeout=2,
+        )
+        self.assertEqual(p_cw.returncode, 0)
+        self.assertIn("ctx:\033[0m 45.0k", p_cw.stdout)
+
+        # 3. Transcript tail fallback (100k..179k -> yellow)
+        log_dir = self.cli_dir / "brain" / cid / ".system_generated" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        tpath = log_dir / "transcript.jsonl"
+        tpath.write_text(
+            "\n".join(
+                [
+                    json.dumps({"step_index": 0, "type": "USER_INPUT", "content": "hi"}),
+                    json.dumps(
+                        {
+                            "step_index": 1,
+                            "type": "PLANNER_RESPONSE",
+                            "input_tokens": 2868,
+                            "cache_read_tokens": 154944,
+                            "output_tokens": 483,
+                        }
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        p_tr_med = subprocess.run(
+            [str(STATUSLINE_BIN)],
+            input=json.dumps({"conversationId": cid, "cwd": "/tmp"}),
+            capture_output=True,
+            text=True,
+            env=self.env,
+            timeout=2,
+        )
+        self.assertEqual(p_tr_med.returncode, 0)
+        self.assertIn("\033[33mctx: 158k\033[0m", p_tr_med.stdout)
+
+        # 4. Transcript tail >= 180k -> red
+        with tpath.open("a", encoding="utf-8") as fh:
+            fh.write(
+                json.dumps(
+                    {
+                        "step_index": 2,
+                        "type": "PLANNER_RESPONSE",
+                        "input_tokens": 20000,
+                        "cache_read_tokens": 185000,
+                        "output_tokens": 1000,
+                    }
+                )
+                + "\n"
+            )
+        p_tr_high = subprocess.run(
+            [str(STATUSLINE_BIN)],
+            input=json.dumps({"conversationId": cid, "cwd": "/tmp"}),
+            capture_output=True,
+            text=True,
+            env=self.env,
+            timeout=2,
+        )
+        self.assertEqual(p_tr_high.returncode, 0)
+        self.assertIn("\033[31mctx: 206k\033[0m", p_tr_high.stdout)
+
+    def test_11_git_safety_guard_env_force_push_and_reset(self) -> None:
+        cid = "cid-git-guard-0011"
+        repo = self.tmp / "git_repo"
+        repo.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "-C", str(repo), "init"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test User"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.invalid"], check=True, capture_output=True)
+        (repo / "README.md").write_text("# Test Repo\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-m", "chore: initial"], check=True, capture_output=True)
+
+        self._run_watch("pre-invocation-hook", {"conversationId": cid, "lastUserInput": "Test git guard", "cwd": str(repo)})
+
+        def run_git_pretool(cmd_str: str, call_id: str) -> dict[str, Any]:
+            rc, out, _ = self._run_watch(
+                "pre-tool-hook",
+                {
+                    "conversationId": cid,
+                    "stepIdx": 2,
+                    "cwd": str(repo),
+                    "toolCall": {"id": call_id, "name": "run_command", "args": {"CommandLine": cmd_str}},
+                },
+            )
+            self.assertEqual(rc, 0)
+            return json.loads(out)
+
+        # 1. Secret .env staged -> commit denied
+        (repo / ".env").write_text("SECRET=123\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "-f", ".env"], check=True, capture_output=True)
+        resp_env = run_git_pretool('git commit -m "feat: add env"', "g1")
+        self.assertEqual(resp_env["decision"], "deny")
+        self.assertIn(".env", resp_env["reason"])
+
+        # Unstage .env, stage .env.example -> commit allowed
+        subprocess.run(["git", "-C", str(repo), "restore", "--staged", ".env"], check=True, capture_output=True)
+        (repo / ".env").unlink()
+        (repo / ".env.example").write_text("SECRET=\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", ".env.example"], check=True, capture_output=True)
+        resp_ex = run_git_pretool('git commit -m "feat: example"', "g2")
+        self.assertEqual(resp_ex["decision"], "allow")
+        subprocess.run(["git", "-C", str(repo), "commit", "-m", "feat: example"], check=True, capture_output=True)
+
+        # 2. Raw force-push denied; --force-with-lease allowed
+        resp_fp1 = run_git_pretool("git push origin main --force", "g3")
+        self.assertEqual(resp_fp1["decision"], "deny")
+        self.assertIn("--force-with-lease", resp_fp1["reason"])
+
+        resp_fp2 = run_git_pretool("git push -f origin feat/x", "g4")
+        self.assertEqual(resp_fp2["decision"], "deny")
+
+        resp_lease = run_git_pretool("git push --force-with-lease origin feat/x", "g5")
+        self.assertEqual(resp_lease["decision"], "allow")
+
+        # 3. git reset --hard with dirty tracked file denied unless explicitly allowed
+        (repo / "README.md").write_text("# Dirty change\n", encoding="utf-8")
+        resp_rst = run_git_pretool("git reset --hard HEAD", "g6")
+        self.assertEqual(resp_rst["decision"], "deny")
+        self.assertIn("README.md", resp_rst["reason"])
+
+        resp_rst_ok = run_git_pretool("AGY_GIT_GUARD_ALLOW_RESET=1 git reset --hard HEAD", "g7")
+        self.assertEqual(resp_rst_ok["decision"], "allow")
+
+        # 4. Quoted git commands inside commit messages do not false-trigger
+        resp_quoted = run_git_pretool('git commit -m "fix: handle git reset --hard and git push --force in parser"', "g8")
+        self.assertEqual(resp_quoted["decision"], "allow")
+
+    def test_12_margin_pre_invocation_nudge_and_missed_turn(self) -> None:
+        cid = "11111111-2222-3333-4444-555555555555"
+        env_margin = {
+            **self.env,
+            "AGY_WATCHDOG_NO_MARGIN_NUDGE": "0",
+            "AGY_WATCHDOG_MARGIN_ENABLED": "1",
+        }
+
+        def run_pre(payload: dict[str, Any]) -> dict[str, Any]:
+            proc = subprocess.run(
+                [sys.executable, str(WATCH_BIN), "pre-invocation-hook"],
+                input=json.dumps(payload),
+                text=True,
+                capture_output=True,
+                env=env_margin,
+                timeout=10,
+                check=True,
+            )
+            return json.loads(proc.stdout or "{}")
+
+        # Turn 1: fresh turn gets Step-1 Margin Overview reminder
+        r1 = run_pre({"conversationId": cid, "lastUserInput": "Fix auth bug"})
+        msg1 = ((r1.get("injectSteps") or [{}])[0].get("systemMessage") or {}).get("systemMessage", "")
+        self.assertIn("Margin Overview (Step 1)", msg1)
+        self.assertIn("now: 1", msg1)
+
+        # Turn 2 without writing intent.json in Turn 1: flags missed last turn
+        r2 = run_pre({"conversationId": cid, "lastUserInput": "Now check tests"})
+        msg2 = ((r2.get("injectSteps") or [{}])[0].get("systemMessage") or {}).get("systemMessage", "")
+        self.assertIn("Margin missed last turn", msg2)
+
+        # Subagents never get Margin nudges
+        sub_cid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        r_sub = run_pre({"conversationId": sub_cid, "parentConversationId": cid, "lastUserInput": "Explore repo"})
+        self.assertEqual(r_sub, {})
+
+        # Simulate writing fresh intent.json -> step 2 does NOT spam Margin reminder
+        ip = self.cli_dir / "brain" / cid / ".system_generated" / "margin" / "intent.json"
+        ip.parent.mkdir(parents=True, exist_ok=True)
+        ip.write_text(json.dumps({"userStep": 2, "wants": "Check tests", "updatedAt": "2099-01-01T00:00:00.000Z"}), encoding="utf-8")
+        r2_step2 = run_pre({"conversationId": cid, "lastUserInput": "Now check tests"})
+        self.assertEqual(r2_step2, {})
+
+    def test_13_stop_hook_spawns_margin_outcome_worker(self) -> None:
+        cid = "22222222-3333-4444-5555-666666666666"
+        brain = self.cli_dir / "brain" / cid
+        logs = brain / ".system_generated" / "logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        (logs / "transcript.jsonl").write_text('{"step_index":0,"type":"USER_INPUT"}\n', encoding="utf-8")
+
+        fake_bin = self.tmp / "fake_bin"
+        fake_bin.mkdir(parents=True, exist_ok=True)
+        marker = self.tmp / "outcome_spawn_args.txt"
+        fake_node = fake_bin / "node"
+        fake_node.write_text(
+            f"#!/usr/bin/env python3\nimport sys, pathlib\npathlib.Path({str(marker)!r}).write_text(' '.join(sys.argv[1:]))\n",
+            encoding="utf-8",
+        )
+        fake_node.chmod(0o755)
+
+        env_stop = {
+            **self.env,
+            "AGY_WATCHDOG_NO_OUTCOME_SPAWN": "0",
+            "AGY_WATCHDOG_MARGIN_ENABLED": "1",
+            "PATH": f"{fake_bin}:{self.env.get('PATH', '')}",
+        }
+        proc = subprocess.run(
+            [sys.executable, str(WATCH_BIN), "stop-hook"],
+            input=json.dumps({"conversationId": cid, "fullyIdle": True, "terminationReason": "NO_TOOL_CALL"}),
+            text=True,
+            capture_output=True,
+            env=env_stop,
+            timeout=10,
+            check=True,
+        )
+        self.assertEqual(json.loads(proc.stdout or "{}"), {"decision": "stop"})
+
+        # Wait briefly for detached stub to write its argv
+        for _ in range(30):
+            if marker.is_file():
+                break
+            time.sleep(0.05)
+        self.assertTrue(marker.is_file(), "expected stop-hook to spawn outcome-worker.mjs")
+        spawn_args = marker.read_text(encoding="utf-8")
+        self.assertIn("outcome-worker.mjs", spawn_args)
+        self.assertIn(f"--brain {brain}", spawn_args)
+        self.assertIn("--spawn", spawn_args)
 
 
 if __name__ == "__main__":

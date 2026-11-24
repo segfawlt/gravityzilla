@@ -72,13 +72,14 @@ EXTRACT_SCHEMA: dict[str, Any] = {
     "required": ["lessons"],
 }
 WS_RE = re.compile(r"\s+")
-MD_LINK_RE = re.compile(r"\[[^\]]+\]\(([^)#]+\.md)(?:#[^)]+)?\)")
-REF_HEADING_RE = re.compile(r"(?m)^##\s+References\s*\n+(\d+)\b")
+MD_LINK_RE = re.compile(r"\[(?:[^\[\]]|\[[^\]]*\])+\]\(([^)#]+\.md)(?:#[^)]+)?\)")
+REF_HEADING_RE = re.compile(r"(?m)^##\s+References\s*\n+(\d+)\s*$")
 RTK_PREFIX_RE = re.compile(r"^\s*rtk\s+(?:bypass\s+)?")
 
 DEFAULT_STATE: dict[str, Any] = {
     "enabled": True,
     "mode": "gate",
+    "verify_gate": True,
     "model": "gemini-3.8-flash-low",
     "bounces": 0,
     "captures": 0,
@@ -95,8 +96,29 @@ MUTATING_FILE_TOOLS = {
     "apply_patch",
 }
 
+SHELL_VERB_MUTATION_RE = re.compile(
+    r"(?:^|[;&|]\s*)(?:rm|mv|cp|chmod|chown|mkdir|touch|ln|install|sed\s+(?:-\w+\s+)*(?:-[A-Za-z]*i\b|--in-place)|perl\s+(?:-\w+\s+)*-[A-Za-z]*i\b|tee\s+(?:-\w+\s+)*(?!/dev/|/tmp/)[^\s;&|]+|git\s+(?:apply|checkout|restore|reset|merge|rebase|cherry-pick))\b"
+)
+SHELL_REDIRECT_TARGET_RE = re.compile(r"(?<![-=<&\d])[12]?>>?\s*(?!/dev/|/tmp/)([^\s&>;|)]+)")
 SHELL_MUTATION_RE = re.compile(
-    r"(?:^|[;&|]\s*)(?:rm|mv|cp|chmod|chown|mkdir|touch|ln|install|sed\s+-i|perl\s+-pi|tee|git\s+(?:apply|checkout|restore|reset|merge|rebase|cherry-pick))\b|(?<![-=<&\d])[12]?>>?\s*[^\s&>]"
+    rf"{SHELL_VERB_MUTATION_RE.pattern}|{SHELL_REDIRECT_TARGET_RE.pattern}"
+)
+
+NON_CHECK_VERBS = frozenset({
+    "cd", "pwd", "ls", "cat", "head", "tail", "find", "fd", "rg", "grep", "ag", "ack",
+    "echo", "printf", "true", "false", "sleep", "which", "whereis", "type", "stat",
+    "file", "wc", "sort", "uniq", "cut", "tr", "dirname", "basename", "realpath", "readlink",
+    "mkdir", "rm", "mv", "cp", "touch", "chmod", "chown", "ln", "rmdir", "tee",
+    "jq", "yq", "xargs", "sed", "awk", "perl", "pkill", "kill", "killall", "ps", "pgrep",
+    "lsof", "ss", "netstat", "date", "uname", "whoami", "id", "hostname", "df", "du",
+    "free", "uptime", "export", "unset", "source", ".",
+})
+SHELL_WRAPPERS = frozenset({"timeout", "nohup", "env", "command", "nice", "stdbuf", "setsid"})
+SHELL_KEYWORDS = frozenset({"if", "then", "elif", "else", "do", "time", "!", "{"})
+WIP_QUESTION_RE = re.compile(r"\?\s*(?:[`'\"*_)]*\s*)$")
+COMPLETION_CLAIM_RE = re.compile(
+    r"\b(?:all tests pass|tests? pass(?:ed|es)?|fixed and verified|implementation complete)\b",
+    re.IGNORECASE,
 )
 
 IGNORED_REPO_PREFIXES = ("docs/api/", ".git/", "node_modules/", "dist/", "build/", ".next/", "coverage/")
@@ -184,6 +206,7 @@ def load_session(cid: str) -> dict[str, Any]:
     base: dict[str, Any] = {
         "cid": cid,
         "bounced_turn_key": "",
+        "verify_bounced_turn_key": "",
         "bounced_at_planner_steps": 0,
         "bounced_at_ts": 0.0,
         "finalized_turn_key": "",
@@ -271,32 +294,96 @@ def _rel_to_repo(p: Path, repo_root: Path | None) -> str | None:
     return None
 
 
-def is_mutating_command(cmd: str, repo_root: Path | None = None) -> bool:
+def _split_shell_segments(cmd: str) -> list[str]:
     stripped = RTK_PREFIX_RE.sub("", (cmd or "").strip())
     if not stripped:
-        return False
-    # Strip heredoc bodies and inline `-c`/`-e` quoted code strings so operators inside code snippets aren't treated as shell mutations
+        return []
     cleaned = re.sub(r"<<[-~]?\s*['\"]?(\w+)['\"]?.*?(?:\n\1\b|$)", " HEREDOC ", stripped, flags=re.S)
     cleaned = re.sub(r"\s-(?:c|e)\s+(?:'[^']*'|\"(?:\\.|[^\"])*\")", " -c INLINE_CODE", cleaned, flags=re.S)
-    for raw_seg in re.split(r"(?:&&|\|\||;|\n)", cleaned):
-        seg = raw_seg.strip()
-        if not seg:
-            continue
+    return [raw_seg.strip() for raw_seg in re.split(r"(?:&&|\|\||;|\n)", cleaned) if raw_seg.strip()]
+
+
+def is_mutating_command(cmd: str, repo_root: Path | None = None) -> bool:
+    for seg in _split_shell_segments(cmd):
         lower = seg.lower()
         if "agy-compound" in lower or "agent-memory" in lower:
             continue
         seg_unquoted = re.sub(r"'[^']*'|\"(?:\\.|[^\"])*\"", " QUOTED ", seg)
-        if not SHELL_MUTATION_RE.search(seg_unquoted):
+        # Strip harmless /dev/(null|stdout|stderr) redirections before testing file redirects.
+        seg_no_null = re.sub(r"(?:[12]|&)?>>?\s*/dev/(?:null|stdout|stderr)\b", " ", seg_unquoted)
+        verb_hit = bool(SHELL_VERB_MUTATION_RE.search(seg_no_null))
+        redir_targets = SHELL_REDIRECT_TARGET_RE.findall(seg_no_null)
+        if not verb_hit and not redir_targets:
             continue
         if repo_root is not None:
-            abs_paths = re.findall(r"(?:/[^\s\"';&|)]+|~/[^\s\"';&|)]+)", seg)
-            if abs_paths and all(
-                (rp is None or _rel_to_repo(rp, repo_root) is None)
-                for rp in (_resolve_candidate_path(p, str(repo_root)) for p in abs_paths)
-            ):
-                continue
+            if not verb_hit and redir_targets:
+                # Redirect-only hit (e.g. find <repo> > /tmp/out): scope check to redirect targets, not read args.
+                if all(
+                    (rp is None or _rel_to_repo(rp, repo_root) is None)
+                    for rp in (_resolve_candidate_path(t, str(repo_root)) for t in redir_targets)
+                ):
+                    continue
+            else:
+                abs_paths = re.findall(r"(?:(?<=^)|(?<=[\s=]))(?:/[^\s\"';&|)]+|~/[^\s\"';&|)]+)", seg_unquoted)
+                if abs_paths and all(
+                    (rp is None or _rel_to_repo(rp, repo_root) is None)
+                    for rp in (_resolve_candidate_path(p, str(repo_root)) for p in abs_paths)
+                ):
+                    continue
         return True
     return False
+
+
+def _segment_command_tokens(seg: str) -> list[str]:
+    seg_clean = RTK_PREFIX_RE.sub("", seg.strip())
+    tokens = [t.strip("\"'") for t in seg_clean.split() if t.strip("\"'")]
+    idx = 0
+    while idx < len(tokens):
+        tok = tokens[idx]
+        if tok in SHELL_KEYWORDS or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tok):
+            idx += 1
+            continue
+        if tok in SHELL_WRAPPERS:
+            idx += 1
+            while idx < len(tokens) and tokens[idx].startswith("-"):
+                idx += 1
+            if tok == "timeout" and idx < len(tokens) and re.match(r"^\d+[smhd]?$", tokens[idx]):
+                idx += 1
+            continue
+        break
+    return tokens[idx:]
+
+
+def _is_verification_segment(seg: str) -> bool:
+    lower = seg.lower()
+    if "agy-compound" in lower or "agent-memory" in lower:
+        return False
+    tokens = _segment_command_tokens(seg)
+    if not tokens:
+        return False
+    verb = Path(tokens[0]).name.lower()
+    if verb == "git":
+        return False
+    if verb == "gh":
+        sub = " ".join(t.lower() for t in tokens[1:3])
+        return sub in ("pr checks", "run view", "run watch")
+    if verb in NON_CHECK_VERBS:
+        return False
+    return bool(re.match(r"^[A-Za-z0-9_.~/-]+$", tokens[0]))
+
+
+def is_verification_command(cmd: str) -> bool:
+    return any(_is_verification_segment(seg) for seg in _split_shell_segments(cmd))
+
+
+def _cmd_ends_with_verification(cmd: str, repo_root: Path | None) -> bool:
+    verifies = False
+    for seg in _split_shell_segments(cmd):
+        if is_mutating_command(seg, repo_root):
+            verifies = False
+        elif _is_verification_segment(seg):
+            verifies = True
+    return verifies
 
 
 def _load_full_step_lookup(tpath: Path) -> dict[int, dict[str, Any]]:
@@ -339,7 +426,33 @@ def _is_internal_continuation_prompt(content: str) -> bool:
     c = (content or "").lstrip()
     return any(
         tag in c[:240]
-        for tag in ("<compound-check>", "<watchdog>", "[plan review due]", "Continue working.")
+        for tag in ("<compound-check>", "<verify-before-completion>", "<watchdog>", "[plan review due]", "Continue working.")
+    )
+
+
+def _looks_like_wip_question(text: str) -> bool:
+    s = (text or "").strip()
+    if not s or not WIP_QUESTION_RE.search(s):
+        return False
+    return not COMPLETION_CLAIM_RE.search(s)
+
+
+def _result_indicates_failure(status: str, txt_c: str) -> bool:
+    if status == "ERROR":
+        return True
+    m_code = re.search(r"Command exited with code (-?\d+)", txt_c)
+    if m_code is not None:
+        return int(m_code.group(1)) != 0
+    return any(
+        sig in txt_c
+        for sig in (
+            "Tool is running as a background task",
+            "PreToolUse:",
+            "The user doesn't want to proceed",
+            "Traceback (most recent call last)",
+            "Exit code: 1",
+            "FAIL ",
+        )
     )
 
 
@@ -412,6 +525,7 @@ def analyze_transcript_turns(
     first_system_msg = ""
     turns: list[dict[str, Any]] = []
     cur: dict[str, Any] | None = None
+    pending_verify_checks: list[bool] = []
 
     def _new_turn(prompt: str, step_idx: Any, created_at: str) -> dict[str, Any]:
         h = hashlib.sha1((prompt or "").encode("utf-8", errors="replace")).hexdigest()[:10]
@@ -425,6 +539,10 @@ def analyze_transcript_turns(
             "repo_doc_edits": [],
             "external_edits": [],
             "mutating_cmds": [],
+            "verification_cmds": [],
+            "unverified_edits": False,
+            "last_edit_target": "",
+            "last_assistant_text": "",
             "learning_doc_writes": [],
             "learning_readme_writes": [],
             "compound_action": "",
@@ -455,6 +573,7 @@ def analyze_transcript_turns(
             if cur is None or not _is_internal_continuation_prompt(content):
                 cur = _new_turn(content, entry.get("step_index"), created_at)
                 turns.append(cur)
+                pending_verify_checks = []
             continue
 
         if cur is None:
@@ -464,6 +583,16 @@ def analyze_transcript_turns(
             cur["end_ts"] = created_at
         if etype == "PLANNER_RESPONSE":
             cur["planner_steps"] += 1
+            pending_verify_checks = []
+            resp_txt = str(entry.get("content") or "").strip()
+            if resp_txt:
+                cur["last_assistant_text"] = resp_txt
+        elif pending_verify_checks:
+            is_verify_slot = pending_verify_checks.pop(0)
+            txt_c = str(entry.get("content") or "")
+            if is_verify_slot and not _result_indicates_failure(status, txt_c):
+                cur["unverified_edits"] = False
+
         if status == "ERROR":
             cur["error_steps"] += 1
         else:
@@ -485,6 +614,7 @@ def analyze_transcript_turns(
                 args = {}
 
             if tname in MUTATING_FILE_TOOLS:
+                pending_verify_checks.append(False)
                 for raw_path in _extract_tool_target_paths(tname, args):
                     rpath = _resolve_candidate_path(raw_path, cwd)
                     rel = _rel_to_repo(rpath, repo_root) if rpath else None
@@ -505,6 +635,8 @@ def analyze_transcript_turns(
                         else:
                             if rel_norm not in cur["repo_code_edits"]:
                                 cur["repo_code_edits"].append(rel_norm)
+                            cur["unverified_edits"] = True
+                            cur["last_edit_target"] = rel_norm
                     else:
                         disp = str(rpath or raw_path)
                         if disp not in cur["external_edits"]:
@@ -513,17 +645,35 @@ def analyze_transcript_turns(
             elif tname == "run_command":
                 cmd_str = _unwrap_arg_str(args.get("CommandLine"))
                 if not cmd_str:
+                    pending_verify_checks.append(False)
                     continue
                 if "agy-compound" in cmd_str:
+                    pending_verify_checks.append(False)
                     if re.search(r"\bagy-compound\s+record\b", cmd_str):
                         cur["compound_action"] = "record"
                     elif re.search(r"\bagy-compound\s+skip\b", cmd_str):
                         cur["compound_action"] = "skip"
-                elif is_mutating_command(cmd_str, repo_root):
-                    if repo_root is not None:
-                        short_cmd = WS_RE.sub(" ", cmd_str)[:120]
+                else:
+                    mutates = is_mutating_command(cmd_str, repo_root)
+                    verifies = is_verification_command(cmd_str)
+                    short_cmd = WS_RE.sub(" ", cmd_str)[:120]
+                    if mutates and repo_root is not None:
                         if short_cmd not in cur["mutating_cmds"]:
                             cur["mutating_cmds"].append(short_cmd)
+                        cur["unverified_edits"] = True
+                        cur["last_edit_target"] = short_cmd
+                        ends_with_verify = verifies and _cmd_ends_with_verification(cmd_str, repo_root)
+                        if ends_with_verify and short_cmd not in cur["verification_cmds"]:
+                            cur["verification_cmds"].append(short_cmd)
+                        pending_verify_checks.append(ends_with_verify)
+                    elif verifies:
+                        if short_cmd not in cur["verification_cmds"]:
+                            cur["verification_cmds"].append(short_cmd)
+                        pending_verify_checks.append(True)
+                    else:
+                        pending_verify_checks.append(False)
+            else:
+                pending_verify_checks.append(False)
 
     is_worker = _is_worker_session(cid, payload, first_user_prompt, first_system_msg)
     for t in turns:
@@ -563,6 +713,7 @@ def inspect_learnings_tree(repo_root: Path | None) -> dict[str, Any]:
     missing_refs: list[str] = []
     unindexed: list[str] = []
     promote_candidates: list[tuple[str, int, str]] = []
+    promoted_count = 0
 
     for p in sorted(ldir.rglob("*.md")):
         if p.name == "README.md":
@@ -576,15 +727,25 @@ def inspect_learnings_tree(repo_root: Path | None) -> dict[str, Any]:
             missing_frontmatter.append(f"{rel_from_ldir} (missing: {', '.join(missing_keys)})")
         ref_m = REF_HEADING_RE.search(content)
         refs = int(ref_m.group(1)) if ref_m else -1
+        title = str(fm.get("title") or rel_from_ldir)
+        is_promoted = "[promoted]" in title.lower()
+        if is_promoted:
+            promoted_count += 1
         if refs < 0:
             missing_refs.append(rel_from_ldir)
-        elif refs >= 3:
-            promote_candidates.append((rel_from_repo, refs, str(fm.get("title") or rel_from_ldir)))
+        elif refs >= 3 and not is_promoted:
+            promote_candidates.append((rel_from_repo, refs, title))
 
         if readme_text and rel_from_ldir not in linked_rels and rel_from_repo not in readme_text:
             unindexed.append(rel_from_ldir)
 
-        files.append({"rel": rel_from_ldir, "repo_rel": rel_from_repo, "title": fm.get("title", ""), "refs": refs})
+        files.append({
+            "rel": rel_from_ldir,
+            "repo_rel": rel_from_repo,
+            "title": fm.get("title", ""),
+            "refs": refs,
+            "promoted": is_promoted,
+        })
 
     broken_links = [
         lnk
@@ -598,6 +759,7 @@ def inspect_learnings_tree(repo_root: Path | None) -> dict[str, Any]:
         "learnings_dir": str(ldir),
         "readme_exists": readme_path.is_file(),
         "total_docs": len(files),
+        "promoted_count": promoted_count,
         "files": files,
         "unindexed": unindexed,
         "broken_links": broken_links,
@@ -768,6 +930,28 @@ def cmd_stop_hook(_args: argparse.Namespace) -> int:
 
         cur = turns[-1]
         turn_key = cur["turn_key"]
+        now = time.time()
+        edited_preview = ", ".join((cur["repo_code_edits"] or cur["mutating_cmds"])[:6])
+        more = len(cur["repo_code_edits"]) - 6
+        if more > 0:
+            edited_preview += f" (+{more} more)"
+        verify_needed = bool(
+            cur["substantive"]
+            and cur.get("unverified_edits")
+            and state.get("verify_gate", True)
+            and not _looks_like_wip_question(cur.get("last_assistant_text", ""))
+        )
+        verify_block = (
+            "<verify-before-completion>\n"
+            f"Repo code was modified ({edited_preview}) with no passing verification command run after the last edit "
+            f"(`{cur.get('last_edit_target') or edited_preview}`).\n"
+            "Run a verification check covering your change (focused test, typecheck, lint, or runtime check) "
+            "and report its real output before concluding.\n"
+            "</verify-before-completion>"
+        )
+
+        include_verify_in_bounce = False
+        verify_only_bounce = False
 
         with file_lock(session_lock_path(cid)):
             sess = load_session(cid)
@@ -781,127 +965,156 @@ def cmd_stop_hook(_args: argparse.Namespace) -> int:
                 print(stop_json)
                 return 0
 
+            prev_steps = int(sess.get("bounced_at_planner_steps") or 0)
+            prev_ts = float(sess.get("bounced_at_ts") or 0.0)
+            same_stop_pass = cur["planner_steps"] <= prev_steps and (now - prev_ts) < 15.0
+
             # If agent already created/updated docs/learnings/*.md OR invoked record/skip this turn:
             recorded_turns = sess.get("recorded_turns") or {}
             if cur["learning_doc_writes"] or cur["compound_action"] in ("record", "skip") or turn_key in recorded_turns:
-                if turn_key not in recorded_turns:
-                    if cur["compound_action"] == "skip":
-                        outc = "SKIPPED_ROUTINE"
-                        msg = "Skipped via agy-compound skip"
-                    else:
-                        outc = "CAPTURED"
-                        msg = f"Learnings written: {', '.join(cur['learning_doc_writes'])}"
+                if sess.get("verify_bounced_turn_key") == turn_key and same_stop_pass:
+                    print(stop_json)
+                    return 0
+                if verify_needed and sess.get("verify_bounced_turn_key") != turn_key and not payload.get("stopHookActive"):
+                    sess["verify_bounced_turn_key"] = turn_key
+                    sess["bounced_at_planner_steps"] = cur["planner_steps"]
+                    sess["bounced_at_ts"] = now
+                    save_session(cid, sess)
+                    verify_only_bounce = True
+                else:
+                    if turn_key not in recorded_turns:
+                        if cur["compound_action"] == "skip":
+                            outc = "SKIPPED_ROUTINE"
+                            msg = "Skipped via agy-compound skip"
+                        else:
+                            outc = "CAPTURED"
+                            msg = f"Learnings written: {', '.join(cur['learning_doc_writes'])}"
+                        _record_turn_outcome(
+                            cid,
+                            cwd,
+                            outc,
+                            files=cur["learning_doc_writes"],
+                            summary=msg,
+                            code_edits=cur["repo_code_edits"],
+                            error_steps=cur["error_steps"],
+                            turn_key=turn_key,
+                        )
+                    sess["finalized_turn_key"] = turn_key
+                    save_session(cid, sess)
+                    print(stop_json)
+                    return 0
+
+            if not verify_only_bounce:
+                # Read-only, external-only (~/.local/bin), or non-repo turn -> log & pass cleanly
+                if not cur["substantive"]:
+                    why = (
+                        "no git repository"
+                        if repo_root is None
+                        else (
+                            "docs-only / external harness edits"
+                            if (cur["repo_doc_edits"] or cur["external_edits"])
+                            else "read-only / check-only turn"
+                        )
+                    )
                     _record_turn_outcome(
                         cid,
                         cwd,
-                        outc,
-                        files=cur["learning_doc_writes"],
-                        summary=msg,
+                        "SKIPPED_READONLY",
+                        summary=why,
                         code_edits=cur["repo_code_edits"],
                         error_steps=cur["error_steps"],
                         turn_key=turn_key,
                     )
-                sess["finalized_turn_key"] = turn_key
-                save_session(cid, sess)
-                print(stop_json)
-                return 0
-
-            # Read-only, external-only (~/.local/bin), or non-repo turn -> log & pass cleanly
-            if not cur["substantive"]:
-                why = (
-                    "no git repository"
-                    if repo_root is None
-                    else (
-                        "docs-only / external harness edits"
-                        if (cur["repo_doc_edits"] or cur["external_edits"])
-                        else "read-only / check-only turn"
-                    )
-                )
-                _record_turn_outcome(
-                    cid,
-                    cwd,
-                    "SKIPPED_READONLY",
-                    summary=why,
-                    code_edits=cur["repo_code_edits"],
-                    error_steps=cur["error_steps"],
-                    turn_key=turn_key,
-                )
-                sess["finalized_turn_key"] = turn_key
-                save_session(cid, sess)
-                print(stop_json)
-                return 0
-
-            # Already bounced once on this exact user turn?
-            now = time.time()
-            if sess.get("bounced_turn_key") == turn_key:
-                prev_steps = int(sess.get("bounced_at_planner_steps") or 0)
-                prev_ts = float(sess.get("bounced_at_ts") or 0.0)
-                if cur["planner_steps"] <= prev_steps and (now - prev_ts) < 15.0:
-                    # Duplicate hook firing within the same Stop pass (relay + hooks.json): do not finalize or re-bounce
+                    sess["finalized_turn_key"] = turn_key
+                    save_session(cid, sess)
                     print(stop_json)
                     return 0
-                _record_turn_outcome(
-                    cid,
-                    cwd,
-                    "MISSED_OR_UNRECORDED",
-                    summary="Agent stopped after compound check without writing docs/learnings/ or calling record/skip",
-                    code_edits=cur["repo_code_edits"],
-                    error_steps=cur["error_steps"],
-                    turn_key=turn_key,
-                )
-                sess["finalized_turn_key"] = turn_key
-                save_session(cid, sess)
-                print(stop_json)
-                return 0
 
-            if payload.get("stopHookActive"):
-                _record_turn_outcome(
-                    cid,
-                    cwd,
-                    "MISSED_OR_UNRECORDED",
-                    summary="stopHookActive already true without compound capture/skip",
-                    code_edits=cur["repo_code_edits"],
-                    error_steps=cur["error_steps"],
-                    turn_key=turn_key,
-                )
-                sess["finalized_turn_key"] = turn_key
-                save_session(cid, sess)
-                print(stop_json)
-                return 0
+                # Already bounced once on this exact user turn?
+                if sess.get("bounced_turn_key") == turn_key:
+                    if same_stop_pass:
+                        # Duplicate hook firing within the same Stop pass (relay + hooks.json): do not finalize or re-bounce
+                        print(stop_json)
+                        return 0
+                    _record_turn_outcome(
+                        cid,
+                        cwd,
+                        "MISSED_OR_UNRECORDED",
+                        summary="Agent stopped after compound check without writing docs/learnings/ or calling record/skip",
+                        code_edits=cur["repo_code_edits"],
+                        error_steps=cur["error_steps"],
+                        turn_key=turn_key,
+                    )
+                    sess["finalized_turn_key"] = turn_key
+                    save_session(cid, sess)
+                    print(stop_json)
+                    return 0
 
-            # Substantive repo mutation without a compound check -> enforce gate or auto-extract
-            mode = str(state.get("mode") or "gate")
-            if mode == "auto":
-                _record_turn_outcome(
-                    cid,
-                    cwd,
-                    "AUTO_QUEUED",
-                    summary=f"Queued background extraction for {len(cur['repo_code_edits'])} repo files",
-                    code_edits=cur["repo_code_edits"],
-                    error_steps=cur["error_steps"],
-                    turn_key=turn_key,
-                )
-                sess["finalized_turn_key"] = turn_key
-                save_session(cid, sess)
-                _launch_auto_extract(cid, cwd)
-                print(stop_json)
-                return 0
+                if payload.get("stopHookActive"):
+                    _record_turn_outcome(
+                        cid,
+                        cwd,
+                        "MISSED_OR_UNRECORDED",
+                        summary="stopHookActive already true without compound capture/skip",
+                        code_edits=cur["repo_code_edits"],
+                        error_steps=cur["error_steps"],
+                        turn_key=turn_key,
+                    )
+                    sess["finalized_turn_key"] = turn_key
+                    save_session(cid, sess)
+                    print(stop_json)
+                    return 0
 
-            sess["bounced_turn_key"] = turn_key
-            sess["bounced_at_planner_steps"] = cur["planner_steps"]
-            sess["bounced_at_ts"] = now
-            save_session(cid, sess)
+                # Substantive repo mutation without a compound check -> enforce verify/compound gate or auto-extract
+                mode = str(state.get("mode") or "gate")
+                if mode == "auto":
+                    if sess.get("verify_bounced_turn_key") == turn_key and same_stop_pass:
+                        print(stop_json)
+                        return 0
+                    if verify_needed and sess.get("verify_bounced_turn_key") != turn_key:
+                        sess["verify_bounced_turn_key"] = turn_key
+                        sess["bounced_at_planner_steps"] = cur["planner_steps"]
+                        sess["bounced_at_ts"] = now
+                        save_session(cid, sess)
+                        verify_only_bounce = True
+                    else:
+                        _record_turn_outcome(
+                            cid,
+                            cwd,
+                            "AUTO_QUEUED",
+                            summary=f"Queued background extraction for {len(cur['repo_code_edits'])} repo files",
+                            code_edits=cur["repo_code_edits"],
+                            error_steps=cur["error_steps"],
+                            turn_key=turn_key,
+                        )
+                        sess["finalized_turn_key"] = turn_key
+                        save_session(cid, sess)
+                        _launch_auto_extract(cid, cwd)
+                        print(stop_json)
+                        return 0
+                else:
+                    sess["bounced_turn_key"] = turn_key
+                    sess["bounced_at_planner_steps"] = cur["planner_steps"]
+                    sess["bounced_at_ts"] = now
+                    if verify_needed and sess.get("verify_bounced_turn_key") != turn_key:
+                        sess["verify_bounced_turn_key"] = turn_key
+                        include_verify_in_bounce = True
+                    save_session(cid, sess)
 
         update_state(lambda s: s.__setitem__("bounces", int(s.get("bounces") or 0) + 1))
-        edited_preview = ", ".join((cur["repo_code_edits"] or cur["mutating_cmds"])[:6])
-        more = len(cur["repo_code_edits"]) - 6
-        if more > 0:
-            edited_preview += f" (+{more} more)"
+        if verify_only_bounce:
+            log_event(
+                f"[VERIFY-BOUNCE] cid={cid[:8]} edits={len(cur['repo_code_edits'])} "
+                f"target={cur.get('last_edit_target') or edited_preview}"
+            )
+            print(json.dumps({"decision": "continue", "reason": verify_block}))
+            return 0
+
         log_event(
             f"[BOUNCE] cid={cid[:8]} edits={len(cur['repo_code_edits'])} "
-            f"cmds={len(cur['mutating_cmds'])} errs={cur['error_steps']}"
+            f"cmds={len(cur['mutating_cmds'])} errs={cur['error_steps']} verify={include_verify_in_bounce}"
         )
-        reason_msg = (
+        compound_block = (
             "<compound-check>\n"
             f"Before concluding this turn, review all substantive changes made ({edited_preview}; "
             f"error_signals={cur['error_steps']}):\n"
@@ -915,6 +1128,7 @@ def cmd_stop_hook(_args: argparse.Namespace) -> int:
             "   `~/.local/bin/agy-compound skip \"<item>: <why routine>\"`\n"
             "</compound-check>"
         )
+        reason_msg = f"{verify_block}\n\n{compound_block}" if include_verify_in_bounce else compound_block
         print(json.dumps({"decision": "continue", "reason": reason_msg}))
         return 0
     except Exception as exc:
@@ -1030,7 +1244,8 @@ def cmd_status(args: argparse.Namespace) -> int:
             issues.append(f"{len(tree['missing_refs'])} missing ## References")
         if issues:
             health = "WARN: " + ", ".join(issues)
-        print(f"repo learnings ({tree['repo_root']}): {tree['total_docs']} docs | index={health}")
+        promoted_bit = f" ({tree['promoted_count']} promoted)" if tree.get("promoted_count") else ""
+        print(f"repo learnings ({tree['repo_root']}): {tree['total_docs']} docs{promoted_bit} | index={health}")
         if tree["promote_candidates"]:
             print("promote candidates (References >= 3):")
             for rel, refs, title in tree["promote_candidates"]:

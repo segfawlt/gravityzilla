@@ -1,15 +1,18 @@
 ---
 name: blast-radius
 description: >-
-  Find what a change could break outside its own diff before it ships, and prove
-  the one fact that makes it safe by running real code instead of writing it up.
-  Use for "blast radius of X", "what could this break", "is this safe to merge",
-  or reviewing a small diff you don't trust yet.
+  Find what a change could break outside its own diff — both during planning
+  before modifying shared contracts, schemas, wire/DB/cache formats, auth
+  boundaries, or core primitives, and before shipping an existing diff — and
+  prove the one fact that makes it safe by running real code instead of writing
+  it up. Use for pre-change impact checks on breaking/cross-cutting edits,
+  "blast radius of X", "what could this break", "is this safe to merge", or
+  reviewing a diff you don't trust yet.
 ---
 
 # Blast Radius
 
-Find what a change breaks somewhere else, before it ships. Read-only toward the change under review: report findings, do not fix them unless the user asks.
+Find what a planned or already-written change breaks somewhere else, before you commit to the design or ship the diff. Read-only toward repo files: report findings (and fold safety constraints into your plan when run pre-change); do not mutate production code during the check.
 
 Listing callers is not the job — `rg` does that in a second. The job is the breakage a symbol search won't show you.
 
@@ -33,7 +36,7 @@ Level 4 is usually one small script that imports the same library the app ships 
 
 ## Steps
 
-1. **Read the change.** The diff, the symbols it adds, changes, and deletes, and what it now does differently — including behavior the diff doesn't spell out. Use `git log -p`, `git blame`, and the PR/commit messages for intent.
+1. **Read the change (or proposed contract edit).** For an existing diff, inspect the symbols added, changed, and deleted — including behavior the diff doesn't spell out. For a pre-change planning check, read the current contract/schema/primitive and trace what the proposed change alters. Use `git log -p`, `git blame`, and commit messages for historical invariants.
 2. **Find the one fact it's safe because of.** Most risky-looking changes are safe because of a single fact, like "this call only drops already-dead cache entries". If it holds, most risk cases clear at once. Spend your time here, not on a long list of maybes.
 3. **Look where grep stops.**
    - Dependency source at the pinned version, plus any local patch or override.

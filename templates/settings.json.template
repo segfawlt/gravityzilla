@@ -1,6 +1,5 @@
 {
   "agentMode": "auto",
-  "model": "Gemini 3.8 Flash (Medium)",
   "notifications": true,
   "permissions": {
     "allow": [
@@ -13,9 +12,6 @@
     "enabled": true,
     "stack_with_default": true
   },
-  "toolPermission": "always-proceed",
-  "trustedWorkspaces": [
-    "{{HOME}}"
-  ],
+  "trustedWorkspaces": [],
   "verbosity": "high"
 }

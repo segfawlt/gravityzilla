@@ -29,7 +29,10 @@ import shutil
 import subprocess
 import sys
 import time
-import tomllib
+try:
+    import tomllib
+except ImportError:  # Python < 3.11
+    tomllib = None  # type: ignore[assignment]
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -437,6 +440,8 @@ def check_jsonl(text: str) -> dict[str, str] | None:
 
 
 def check_toml(text: str) -> dict[str, str] | None:
+    if tomllib is None:
+        return None
     try:
         tomllib.loads(text)
     except tomllib.TOMLDecodeError as exc:
@@ -848,12 +853,6 @@ def cmd_pre_invocation_hook(_args: argparse.Namespace) -> int:
     out = {
         "injectSteps": [
             {"ephemeralMessage": ephemeral},
-            {
-                "systemMessage": {
-                    "systemMessage": "",
-                    "metadata": {"user_markdown": badge},
-                }
-            },
         ]
     }
     print(json.dumps(out))
@@ -928,7 +927,7 @@ def detect_host_engines() -> dict[str, str]:
         ),
         "json": "python-json + " + ("bun-jsonc" if shutil.which("bun") else "strict-json"),
         "jsonl": "python-jsonl",
-        "toml": "python-tomllib",
+        "toml": "python-tomllib" if tomllib is not None else "unavailable (requires Python >= 3.11)",
         "yaml": "pyyaml" if _has_pyyaml() else ("bun-yaml" if shutil.which("bun") else "unavailable"),
         "shell": (shutil.which("bash") or shutil.which("sh") or "unavailable")
         + (" + shellcheck" if shutil.which("shellcheck") else ""),

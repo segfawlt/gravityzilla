@@ -43,6 +43,11 @@ or Chromium, and install nothing. `assets.mjs` also needs network access; it use
 
 ## Page or app screen
 
+If the project root has a `DESIGN.md`, read it first — its tokens, typography, component
+vocabulary, and layout rules override generic defaults. Update `DESIGN.md` whenever your UI
+changes introduce or retire shared primitives, alter surface layout grammar, or change tokens or
+motion (keep page-level feature inventory in status docs, never in `DESIGN.md`).
+
 Decide first which of two kinds of work this is.
 
 - **A page** is read and scrolled: a landing page, a marketing or product site, a portfolio, an

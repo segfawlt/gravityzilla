@@ -1,6 +1,6 @@
 ---
 name: stats
-description: Inspect live Antigravity quota pools, time-windowed token and request overviews (/stats, /stats 5m, /stats 1h, /stats 5h, /stats 24h, /stats today, /stats 7d, /stats days, /stats all), configure /stats preferences (/stats onboard), or launch the interactive Web Dashboard (/stats web). Triggered by /stats or when the user asks to check their token usage, quota runway, or telemetry stats. Antigravity-only: its data comes from Antigravity CLI telemetry via agy-stats; in any other harness (ZCode, Claude Code, etc.) it has no matching data and would report the wrong tool's usage — never trigger it there.
+description: Inspect live Antigravity quota pools, time-windowed token and request overviews (/stats, /stats 5m, /stats 1h, /stats 5h, /stats 24h, /stats today, /stats 7d, /stats days, /stats all), configure /stats preferences (/stats onboard), or launch the interactive Web Dashboard (/stats web). Triggered by /stats or when the user asks to check their token usage, quota runway, or telemetry stats.
 ---
 
 # Antigravity Telemetry & Quota Slash Skill (`/stats`)
@@ -13,7 +13,7 @@ This skill is used in two cases:
 
 ## Command Routing
 
-Always invoke `~/.gemini/config/plugins/stats/bin/agy-stats` directly via `run_command` (`WaitMsBeforeAsync: 5000`). Do not invoke the shell function `agy stats` inside non-interactive subshells.
+Always invoke `agy-stats` (on `PATH`, or `~/.gemini/config/plugins/stats/bin/agy-stats`) directly via `run_command` (`WaitMsBeforeAsync: 5000`). Do not invoke the shell function `agy stats` inside non-interactive subshells.
 
 ### 1. Interactive Onboarding (`/stats onboard` or `/stats settings`)
 

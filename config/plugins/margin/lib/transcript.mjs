@@ -1,12 +1,12 @@
 // Deterministic facts about a conversation, derived from transcript.jsonl.
 import { closeSync, existsSync, openSync, readFileSync, readSync, statSync } from 'node:fs';
-import { basename } from 'node:path';
+import { basename, join } from 'node:path';
 
 export const IDLE_MS = 5 * 60 * 1000;
 const TAIL_BYTES = 8 * 1024 * 1024;
 const HEAD_BYTES = 64 * 1024;
 
-export const USED_CATEGORIES = ['files', 'memory', 'skills', 'shell', 'web', 'agents', 'other'];
+export const USED_CATEGORIES = ['files', 'memory', 'learnings', 'skills', 'shell', 'web', 'agents', 'other'];
 
 export const CATEGORIES = [
   ['files', /^(read_file|view_file|view_file_outline|write_file|edit_file|replace_file_content|multi_replace_file_content|write_to_file|list_dir|find_by_name|grep_search|read_many_files|glob|grep)$/],
@@ -108,7 +108,11 @@ export function classifyPath(rawPath) {
     const m = /\/([^/]+)\/SKILL\.md$/i.exec(p);
     return { kind: 'skills', name: p, short: m ? m[1] : 'SKILL.md' };
   }
-  if (/\/\.agents\/memories(?:\/|$)|\/\.claude\/projects\/[^/]+\/memory\/|\/docs\/learnings(?:\/|$)|(?:^|\/)MEMORY\.md$/i.test(p)) {
+  if (/(?:^|\/)docs\/learnings(?:\/|$)/i.test(p)) {
+    const b = basename(p);
+    return { kind: 'learnings', name: p, short: b.replace(/\.(md|txt|json)$/i, '') || b };
+  }
+  if (/\/\.agents\/memories(?:\/|$)|\/\.claude\/projects\/[^/]+\/memory\/|(?:^|\/)MEMORY\.md$/i.test(p)) {
     const b = basename(p);
     return { kind: 'memory', name: p, short: b.replace(/\.(md|txt|json)$/i, '') || b };
   }
@@ -223,6 +227,191 @@ function shortCmd(cmd) {
   return firstSeg.length > 36 ? `${firstSeg.slice(0, 35)}…` : firstSeg;
 }
 
+function clampShort(v, max = 36) {
+  const s = String(v ?? '').replace(/[\s\x00-\x1f\x7f]+/g, ' ').trim();
+  if (!s) return '';
+  return s.length > max ? `${s.slice(0, max - 1)}…` : s;
+}
+
+function tokenizeShellSegment(seg) {
+  const tokens = [];
+  let cur = '';
+  let quote = '';
+  let hasToken = false;
+  for (let i = 0; i < seg.length; i++) {
+    const ch = seg[i];
+    if (quote) {
+      if (ch === quote) {
+        quote = '';
+      } else if (quote === '"' && ch === '\\' && i + 1 < seg.length) {
+        cur += seg[++i];
+      } else {
+        cur += ch;
+      }
+      hasToken = true;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      hasToken = true;
+    } else if (ch === '\\' && i + 1 < seg.length) {
+      cur += seg[++i];
+      hasToken = true;
+    } else if (/\s/.test(ch)) {
+      if (hasToken) {
+        tokens.push(cur);
+        cur = '';
+        hasToken = false;
+      }
+    } else {
+      cur += ch;
+      hasToken = true;
+    }
+  }
+  if (hasToken) tokens.push(cur);
+  return tokens;
+}
+
+function expandHomePath(p, home) {
+  if (!p) return '';
+  if (home && (p === '~' || p.startsWith('~/'))) return join(home, p.slice(1));
+  return p;
+}
+
+function filterLearningFiles(files) {
+  const list = Array.isArray(files) ? files.filter((f) => typeof f === 'string' && f.trim()) : [];
+  const nonReadme = list.filter((f) => !/(?:^|\/)docs\/learnings\/README\.md$/i.test(f) && basename(f).toUpperCase() !== 'README.MD');
+  return nonReadme.length ? nonReadme : list;
+}
+
+/** Parse `agent-memory` and `agy-compound` CLI invocations inside a shell command string. */
+export function parseMemoryShellCommand(cmd, home = '') {
+  if (typeof cmd !== 'string' || !cmd.trim()) return [];
+  const uses = [];
+  let shellCwd = '';
+  for (const seg of cmd.split(/&&|\|\||;|\n/)) {
+    const rawTokens = tokenizeShellSegment(seg);
+    if (!rawTokens.length) continue;
+    let idx = 0;
+    while (idx < rawTokens.length && (/^[A-Za-z_]\w*=/.test(rawTokens[idx]) || /^(?:env|rtk|python3|python)$/.test(basename(rawTokens[idx])))) {
+      idx += 1;
+    }
+    const bin = rawTokens[idx] ? basename(rawTokens[idx]) : '';
+    const args = rawTokens.slice(idx + 1);
+    if (bin === 'cd' && args[0] && !args[0].startsWith('-')) {
+      const target = expandHomePath(args[0], home);
+      shellCwd = target.startsWith('/') ? target : (shellCwd ? join(shellCwd, target) : target);
+      continue;
+    }
+    if (!args.length) continue;
+
+    if (bin === 'agent-memory') {
+      const sub = args[0];
+      if (sub === 'remember') {
+        let cwd = shellCwd;
+        const noteParts = [];
+        for (let i = 1; i < args.length; i++) {
+          if (args[i] === '--cwd' && args[i + 1]) cwd = expandHomePath(args[++i], home);
+          else if (args[i].startsWith('--cwd=')) cwd = expandHomePath(args[i].slice(6), home);
+          else if (!args[i].startsWith('-')) noteParts.push(args[i]);
+        }
+        const note = noteParts.join(' ').trim();
+        if (note) {
+          uses.push({
+            kind: 'memory',
+            name: `remember:${note}`,
+            short: clampShort(note, 36),
+            summary: note,
+            action: 'remembered',
+            group: 'saved',
+            filePath: '',
+            cwd,
+            source: 'agent-memory',
+          });
+        }
+      } else if (sub === 'search') {
+        const qParts = [];
+        for (let i = 1; i < args.length; i++) {
+          if ((args[i] === '--cwd' || args[i] === '--limit' || args[i] === '-n') && args[i + 1]) i += 1;
+          else if (args[i].startsWith('--')) continue;
+          else qParts.push(args[i]);
+        }
+        const query = qParts.join(' ').trim();
+        if (query) {
+          uses.push({
+            kind: 'memory',
+            name: `search:${query}`,
+            short: clampShort(query, 36),
+            summary: query,
+            action: 'search',
+            group: 'read',
+            filePath: '',
+            source: 'agent-memory',
+          });
+        }
+      } else if (sub === 'drift' || sub === 'context') {
+        uses.push({
+          kind: 'memory',
+          name: `agent-memory ${sub}`,
+          short: `memory ${sub}`,
+          summary: '',
+          action: sub,
+          group: 'read',
+          filePath: '',
+          source: 'agent-memory',
+        });
+      }
+    } else if (bin === 'agy-compound' && args[0] === 'record') {
+      let cwd = shellCwd;
+      let summary = '';
+      let updated = false;
+      const files = [];
+      for (let i = 1; i < args.length; i++) {
+        const tok = args[i];
+        if (tok === '--updated') updated = true;
+        else if (tok === '--cwd' && args[i + 1]) cwd = expandHomePath(args[++i], home);
+        else if (tok.startsWith('--cwd=')) cwd = expandHomePath(tok.slice(6), home);
+        else if (tok === '--summary' && args[i + 1]) summary = args[++i];
+        else if (tok.startsWith('--summary=')) summary = tok.slice(10);
+        else if (tok === '--cid' && args[i + 1]) i += 1;
+        else if (tok === '--files') {
+          while (i + 1 < args.length && !args[i + 1].startsWith('--')) files.push(args[++i]);
+        }
+      }
+      for (const f of filterLearningFiles(files)) {
+        uses.push({
+          kind: 'learnings',
+          name: f,
+          short: basename(f).replace(/\.(md|txt|json)$/i, '') || f,
+          summary: clampShort(summary, 140),
+          action: updated ? 'updated' : 'captured',
+          group: 'saved',
+          filePath: f.startsWith('/') ? f : '',
+          cwd,
+          source: 'agy-compound',
+        });
+      }
+    }
+  }
+  return uses;
+}
+
+function annotateMemoryUse(cls, toolName) {
+  if (!cls || (cls.kind !== 'memory' && cls.kind !== 'learnings')) return { ...cls, source: toolName };
+  const action = /^(write_file|write_to_file)$/.test(toolName)
+    ? 'captured'
+    : /^(edit_file|replace_file_content|multi_replace_file_content)$/.test(toolName)
+      ? 'updated'
+      : 'read';
+  return {
+    ...cls,
+    action,
+    group: action === 'read' ? 'read' : 'saved',
+    filePath: cls.name,
+    source: toolName,
+  };
+}
+
 export function extractToolUses(call, home = '') {
   const name = String(call?.name ?? '');
   const args = call?.args && typeof call.args === 'object' ? call.args : {};
@@ -234,7 +423,7 @@ export function extractToolUses(call, home = '') {
   if (cat === 'files') {
     const multi = unquote(args.Paths ?? args.paths);
     if (Array.isArray(multi) && multi.length) {
-      return multi.map((p) => unquote(p)).map(classifyPath).filter(Boolean).map((u) => ({ ...u, source: name }));
+      return multi.map((p) => unquote(p)).map(classifyPath).filter(Boolean).map((u) => annotateMemoryUse(u, name));
     }
     const p = pathArg(call);
     const query = String(unquote(args.Query ?? args.Pattern ?? args.query ?? args.pattern ?? '') || '').trim();
@@ -244,7 +433,7 @@ export function extractToolUses(call, home = '') {
         return [{ kind: 'files', name: p, short: `${basename(p) || p} (${query.slice(0, 20)})`, source: name }];
       }
       const cls = classifyPath(p);
-      if (cls) return [{ ...cls, source: name }];
+      if (cls) return [annotateMemoryUse(cls, name)];
     }
     if (query) {
       return [{ kind: 'other', name: query, short: query.slice(0, 36), source: name }];
@@ -264,7 +453,10 @@ export function extractToolUses(call, home = '') {
       }];
       for (const bp of bashPaths(cmd, home)) {
         const cls = classifyPath(bp);
-        if (cls) uses.push({ ...cls, source: 'bash' });
+        if (cls) uses.push(annotateMemoryUse(cls, 'bash'));
+      }
+      for (const mu of parseMemoryShellCommand(cmd, home)) {
+        if (mu.source === 'agent-memory') uses.push(mu);
       }
       return uses;
     }
@@ -338,13 +530,23 @@ export function collectUsed(turnRows, subagentSources = [], home = '') {
           const count = (prev?.count ?? 0) + 1;
           // Re-insert so the most recent item sits last, then we reverse for newest-first.
           if (prev) b.byKey.delete(mapKey);
-          b.byKey.set(mapKey, {
+          const upgradedSaved = prev?.group === 'saved' || u.group === 'saved';
+          const nextItem = {
             name: u.name,
             short: u.short || u.name,
             count,
-            source: u.source || prev?.source || '',
+            source: (u.group === 'saved' ? u.source : prev?.group === 'saved' ? prev.source : u.source) || prev?.source || '',
             reader,
-          });
+          };
+          if (u.action || prev?.action) {
+            nextItem.action = u.group === 'saved' ? u.action : (prev?.action || u.action);
+          }
+          if (upgradedSaved) nextItem.group = 'saved';
+          else if (u.group) nextItem.group = u.group;
+          if (u.filePath || prev?.filePath) nextItem.filePath = u.filePath || prev.filePath;
+          if (u.summary || prev?.summary) nextItem.summary = u.summary || prev.summary;
+          if (u.cwd || prev?.cwd) nextItem.cwd = u.cwd || prev.cwd;
+          b.byKey.set(mapKey, nextItem);
         }
       }
     }

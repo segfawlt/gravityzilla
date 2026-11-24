@@ -4,112 +4,136 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Overview</title>
-  <style>:focus-visible { outline: 2px solid var(--accent, #1a73e8); } /*APP_CSS*/</style>
+  <style>:focus-visible { outline: 2px solid var(--accent, #0b57d0); } /*APP_CSS*/</style>
 </head>
 <body>
   <main id="root" class="shell" aria-live="polite">
-    <!-- Top Status Header -->
-    <header class="topbar" id="header">
-      <div class="status-row" id="status-row">
-        <div class="status-left">
-          <span class="status-dot" id="status-dot" aria-hidden="true"></span>
-          <h1 class="status-text" id="status-text">Idle</h1>
-        </div>
-        <span class="step-summary-pill" id="step-summary-pill" hidden></span>
-      </div>
-
-      <!-- Planning next turn banner (when stale planning state is active) -->
-      <div class="planning-banner" id="planning-banner" hidden>
-        <span class="planning-glyph" aria-hidden="true">◐</span>
-        <span class="planning-text">Planning next turn…</span>
-      </div>
-    </header>
-
-    <!-- Scrollable Editorial Stream (dims during stale planning state) -->
+    <!-- Scrollable Editorial Stream -->
     <div class="content" id="content">
-      <!-- Ask Section -->
-      <section id="sec-ask" class="sec row-sec" hidden>
-        <h2 class="row-label">Ask</h2>
-        <div class="row-body">
-          <p id="ask" class="ask-text clamp" tabindex="0" role="button" aria-expanded="false"></p>
-          <button type="button" class="btn-text-action" id="ask-toggle-btn" aria-label="Toggle full ask" hidden>Show more</button>
-        </div>
-      </section>
+      <!-- Prompt-only Session & Topic Group (does not dim between turns) -->
+      <div class="about-group" id="about-group" hidden>
+        <section id="sec-session" class="about-sec" hidden>
+          <div class="about-head">
+            <h2 class="about-label">Session</h2>
+            <span class="about-slot" id="session-slot" hidden></span>
+          </div>
+          <p class="about-body" id="session-summary" hidden></p>
+        </section>
 
-      <!-- Take Section -->
-      <section id="sec-take" class="sec row-sec" hidden>
-        <h2 class="row-label">Take</h2>
-        <div class="row-body take-flow">
-          <span class="take-chip" id="take-chip">
-            <span class="take-glyph" id="take-glyph"></span>
-            <span class="take-label" id="take-label"></span>
-          </span>
-          <span id="take-why" class="take-why"></span>
-        </div>
-      </section>
+        <hr class="full-rule" id="rule-session" hidden>
 
-      <!-- Plan Section -->
-      <section id="sec-plan" class="sec block-sec" hidden>
-        <div class="sec-header">
-          <h2>Plan</h2>
-          <span class="plan-summary" id="plan-summary"></span>
-        </div>
-        <div class="plan-bar-track" role="progressbar" id="plan-bar" aria-label="Plan progress" aria-valuemin="0" aria-valuemax="100">
-          <div class="plan-bar-fill" id="plan-fill"></div>
-        </div>
-        <ol id="steps" class="step-list"></ol>
-      </section>
+        <section id="sec-topic" class="about-sec" hidden>
+          <div class="about-head">
+            <h2 class="about-label">Topic</h2>
+            <div class="about-actions">
+              <span class="about-slot" id="topic-slot" hidden></span>
+              <button type="button" class="link-btn" id="topics-all-btn" hidden>show all</button>
+            </div>
+          </div>
+          <p class="about-body" id="topic-latest" hidden></p>
+        </section>
 
-      <!-- Verdict Section -->
-      <section id="sec-verdict" class="sec row-sec" hidden>
-        <h2 class="row-label">Result</h2>
-        <div class="row-body verdict-flow">
-          <span class="verdict-icon" id="verdict-icon" aria-hidden="true"></span>
-          <p id="verdict" class="verdict-text"></p>
-        </div>
-      </section>
+        <hr class="full-rule" id="rule-topic" hidden>
+      </div>
 
-      <!-- Used Section -->
-      <section id="sec-used" class="sec block-sec" hidden>
-        <div class="sec-header">
-          <h2>Used</h2>
+      <!-- Current (or stale-dimmed previous) Turn Report -->
+      <div class="turn-group" id="turn-group">
+        <div class="planning-banner" id="planning-banner" hidden>
+          <span class="planning-glyph" aria-hidden="true">◐</span>
+          <span class="planning-text">Planning…</span>
         </div>
-        <div id="used-list" class="used-grid"></div>
-      </section>
 
-      <!-- Empty / Status Note -->
-      <p id="empty-note" class="empty-note" hidden></p>
+        <section id="sec-ask" class="row-sec" hidden>
+          <h2 class="row-label">Ask</h2>
+          <div class="row-body">
+            <p id="ask" class="ask-text"></p>
+          </div>
+        </section>
+
+        <hr class="part-rule" id="rule-take" hidden>
+
+        <section id="sec-take" class="row-sec" hidden>
+          <h2 class="row-label">Take</h2>
+          <div class="row-body take-flow">
+            <span class="take-inline" id="take-inline"><span class="take-glyph" id="take-glyph" aria-hidden="true"></span> <strong class="take-label" id="take-label"></strong></span><span id="take-why" class="take-why"></span>
+          </div>
+        </section>
+
+        <hr class="part-rule" id="rule-plan" hidden>
+
+        <section id="sec-plan" class="row-sec" hidden>
+          <h2 class="row-label">Plan</h2>
+          <div class="row-body">
+            <ol id="steps" class="step-list"></ol>
+          </div>
+        </section>
+
+        <hr class="part-rule" id="rule-outcome" hidden>
+
+        <section id="sec-outcome" class="row-sec" hidden>
+          <h2 class="row-label">Result</h2>
+          <div class="row-body outcome-body">
+            <div class="outcome-head">
+              <span class="outcome-inline" id="outcome-inline"><span class="outcome-glyph" id="outcome-glyph" aria-hidden="true"></span> <strong class="outcome-label" id="outcome-label"></strong></span><span id="outcome-summary" class="outcome-summary"></span><span class="outcome-slot" id="outcome-slot" hidden></span>
+            </div>
+            <ul id="outcome-items" class="outcome-items" hidden></ul>
+            <div id="outcome-evidence" class="outcome-evidence" hidden></div>
+          </div>
+        </section>
+
+        <hr class="part-rule" id="rule-used" hidden>
+
+        <section id="sec-used" class="row-sec" hidden>
+          <h2 class="row-label">Used</h2>
+          <div class="row-body">
+            <div id="used-list" class="used-grid"></div>
+          </div>
+        </section>
+      </div>
+
+      <p id="empty-note" class="empty-note" hidden>
+        <span class="empty-title">Nothing yet</span>
+        <span class="empty-sub">Turn plan, status, and used context.</span>
+      </p>
     </div>
 
-    <!-- Pinned Bottom Telemetry Footer (Context + Watchdog) -->
-    <footer class="telemetry-footer" id="telemetry-bar">
+    <!-- Unified Bottom HUD Footer (status + telemetry) -->
+    <footer class="hud-footer" id="telemetry-bar">
       <div class="gauge-track" id="context-bar" role="progressbar" aria-label="Context usage" aria-valuemin="0" aria-valuemax="100">
         <div class="gauge-fill" id="context-fill"></div>
       </div>
-      <div class="telemetry-grid">
-        <div class="telemetry-chip context-chip" id="context-chip" tabindex="0" role="group" aria-label="Context size">
-          <span class="chip-label">Context</span>
-          <span class="chip-value" id="context-val">—</span>
-          <div class="tooltip" id="context-tooltip">Context usage telemetry</div>
+      <div class="status-row" id="status-row" data-state="idle">
+        <div class="status-left">
+          <span class="status-glyph" id="status-glyph" aria-hidden="true">○</span>
+          <span class="status-text" id="status-text">idle</span>
+          <span class="step-summary-pill" id="step-summary-pill" hidden></span>
         </div>
-        <div class="telemetry-chip watchdog-chip" id="watchdog-chip" tabindex="0" role="group" aria-label="Watchdog timer">
-          <span class="chip-label">Watchdog <span class="watchdog-alert-badge" id="watchdog-alert-badge" hidden>!</span></span>
-          <span class="chip-value" id="watchdog-val">—</span>
-          <span class="watchdog-meta" id="watchdog-meta" hidden>Idle</span>
-          <div class="tooltip" id="watchdog-tooltip">Watchdog telemetry</div>
-        </div>
+        <button type="button" class="hud-chip" id="context-chip" aria-haspopup="dialog">
+          <span class="chip-label">ctx</span>
+          <span class="chip-value" id="context-val"></span>
+        </button>
+      </div>
+      <div class="hud-meta-row">
+        <button type="button" class="hud-chip" id="watchdog-chip" aria-haspopup="dialog">
+          <span class="chip-value" id="watchdog-val"></span>
+          <span class="watchdog-alert-badge" id="watchdog-alert-badge" hidden>!</span>
+        </button>
       </div>
     </footer>
 
-    <!-- Interactive Drill-Down Sheet / Modal -->
+    <!-- Interactive Drill-Down Sheet (topics / used / telemetry) -->
     <div class="drawer-backdrop" id="drawer-backdrop" hidden></div>
     <aside class="details-drawer" id="details-drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title" tabindex="-1" hidden>
       <div class="drawer-header">
         <div class="drawer-title-group">
+          <button type="button" class="drawer-back-btn" id="drawer-back-btn" aria-label="Back to list" hidden>←</button>
           <h3 id="drawer-title" class="drawer-title">Details</h3>
-          <span class="drawer-count-badge" id="drawer-count">0 items</span>
+          <span class="drawer-count" id="drawer-count">0 items</span>
         </div>
-        <button type="button" class="drawer-close-btn" id="drawer-close-btn" aria-label="Close details">×</button>
+        <div class="drawer-actions">
+          <button type="button" class="link-btn drawer-open-tab-btn" id="drawer-open-tab-btn" hidden>Open tab ↗</button>
+          <button type="button" class="drawer-close-btn" id="drawer-close-btn" aria-label="Close details">×</button>
+        </div>
       </div>
       <div class="drawer-body" id="drawer-body"></div>
     </aside>

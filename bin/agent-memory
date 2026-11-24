@@ -44,7 +44,7 @@ AGY_HISTORY_PATH = HOME / ".gemini" / "antigravity-cli" / "history.jsonl"
 CLI_LOG_PATH = HOME / ".gemini" / "antigravity-cli" / "cli.log"
 AGY_SKILLS_JSON = HOME / ".gemini" / "config" / "skills.json"
 PI_SESSIONS_DIR = HOME / ".pi" / "agent" / "sessions"
-COMPOUND_BIN = Path("/home/domixi/.local/bin/agy-compound")
+COMPOUND_BIN = Path(shutil.which("agy-compound") or (HOME / ".local" / "bin" / "agy-compound"))
 
 INTERNAL_MARKER = "[AGY_INTERNAL_WORKER]"
 UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
@@ -724,16 +724,27 @@ def extract_pi_transcript_digest(spath: Path, max_chars: int = 28000) -> tuple[s
     return cwd, joined
 
 
-def run_stage1(thread_id: str, digest: str, model: str, head_sha: str | None = None) -> dict[str, Any] | None:
+def run_stage1(
+    thread_id: str,
+    digest: str,
+    model: str,
+    head_sha: str | None = None,
+    has_learnings_dir: bool = False,
+) -> dict[str, Any] | None:
     sha_rule = (
         f"\n- Whenever stating how specific repository files or invariants currently work, cite the repo-relative path in backticks and append `(verified: {head_sha})`."
         if head_sha
         else ""
     )
+    layer_rule = (
+        "\n- Layer boundary: This repository tracks narrow file-level bug postmortems in `docs/learnings/README.md`. Focus raw_memory on high-level architecture, module contracts, credentials/environment setup, verification commands, and user workflow preferences rather than duplicating narrow single-bug postmortems."
+        if has_learnings_dir
+        else ""
+    )
     prompt = f"""You are a Stage-1 repository memory extractor.
 Return strict JSON matching the schema.
 Distill ONLY reusable, durable engineering knowledge from this completed session:
-- Concrete architecture facts, invariants, resolved bug root-causes, durable pitfalls, verified commands, or user workflow decisions.{sha_rule}
+- Concrete architecture facts, invariants, resolved bug root-causes, durable pitfalls, verified commands, or user workflow decisions.{sha_rule}{layer_rule}
 - NEVER include transient chatter, greetings, or speculative guesses that were disproved.
 - If the session contains NO durable reusable repository signal (e.g. trivial Q&A or aborted chat), return empty strings for rollout_summary and raw_memory and null for rollout_slug.
 
@@ -769,17 +780,23 @@ def run_stage2(ws_dir: Path, model: str, repo_dir: Path | None = None) -> bool:
 
     resolved_repo = repo_dir or resolve_repo_for_slug(ws_dir.name)
     head_sha = get_git_head_sha(resolved_repo) if resolved_repo else None
+    has_learnings_dir = bool(resolved_repo and (resolved_repo / "docs" / "learnings" / "README.md").is_file())
     sha_instruction = (
         f"Whenever recording or newly re-verifying a technical fact about code structure, files, or invariants, cite the repo-relative file path in backticks and stamp `(verified: {head_sha})` (preserve an older `(verified: <sha>)` from PRIOR MEMORY.md if that claim was not re-verified in recent rollouts)."
         if head_sha
         else "Preserve any existing `(verified: <sha>)` stamps on prior claims."
+    )
+    learnings_dedup = (
+        " Keep `MEMORY.md` concise (target <= 120 lines) as an architectural and operational handbook (topology, module contracts, credentials/env, verification/deploy commands, and user workflow rules). Because this repository maintains `docs/learnings/README.md`, prune narrow single-bug postmortems that are already covered by `docs/learnings/`."
+        if has_learnings_dir
+        else ""
     )
 
     prompt = f"""You are a Stage-2 repository memory consolidator.
 Consolidate the prior MEMORY.md with new Stage-1 raw memories and rollout summaries.
 Rules:
 1. `memory_summary`: A single dense paragraph (180-320 words max) summarizing canonical repo architecture, operating rules, shipped capabilities, and top active pitfalls. Injected at SessionStart.
-2. `memory_md`: Clean, deduplicated, well-structured Markdown handbook (`MEMORY.md`). Preserve high-value prior sections (architecture, user operating rules, durable implementation pitfalls, workflow hygiene). Prune outdated/superseded claims when newer rollouts resolved them. Treat current repo state as authoritative. {sha_instruction}
+2. `memory_md`: Clean, deduplicated, well-structured Markdown handbook (`MEMORY.md`). Preserve high-value prior sections (architecture, user operating rules, durable implementation pitfalls, workflow hygiene). Prune outdated/superseded claims when newer rollouts resolved them. Treat current repo state as authoritative. {sha_instruction}{learnings_dedup}
 3. `skills`: Preserve valuable existing domain `SKILL.md` playbooks (with valid YAML frontmatter `name` and `description`) and add a new skill ONLY when a distinct, multi-step domain workflow is clearly established.
 
 === PRIOR MEMORY.md ===
@@ -934,7 +951,8 @@ def cmd_sync(args: argparse.Namespace) -> int:
                 continue
 
             stage1_sha = get_git_head_sha(repo_for_slug) if repo_for_slug else None
-            res = run_stage1(tid, digest, model=model, head_sha=stage1_sha)
+            has_learnings_dir = bool(repo_for_slug and (repo_for_slug / "docs" / "learnings" / "README.md").is_file())
+            res = run_stage1(tid, digest, model=model, head_sha=stage1_sha, has_learnings_dir=has_learnings_dir)
             if res is None:
                 log_event(f"[STAGE1-ERR] tid={tid} slug={slug} model={model}")
                 continue
@@ -1117,6 +1135,40 @@ def build_session_start_payload(repo_root: Path, ws_dir: Path, guidance: str) ->
     }
 
 
+BRAIN_ROOT = Path.home() / ".gemini" / "antigravity" / "brain"
+SUBAGENT_ACTIVE_WINDOW_S = 30
+
+
+def looks_like_subagent_session(conn: sqlite3.Connection | None, cid: str, repo_root: Path) -> bool:
+    """Heuristic: SessionStart payload has no subagent flag and the transcript does not exist yet.
+
+    A sibling conversation in the same workspace that wrote its transcript within the last
+    SUBAGENT_ACTIVE_WINDOW_S seconds is, in practice, the parent that just spawned this child.
+    Injecting a SYSTEM_MESSAGE at step 0 of a subagent displaces the harness's
+    `[antigravity-subagent-route:...]` prompt and the backend rejects the launch with HTTP 409.
+    """
+    if conn is None:
+        return False
+    try:
+        now = dt.datetime.now(dt.timezone.utc).timestamp()
+        rows = conn.execute(
+            "SELECT conversation_id FROM session_workspaces WHERE workspace_path = ? AND updated_at > ?",
+            (str(repo_root), now - 6 * 3600),
+        ).fetchall()
+    except Exception:
+        return False
+    for (other,) in rows:
+        if not other or other == cid:
+            continue
+        t = BRAIN_ROOT / other / ".system_generated" / "logs" / "transcript_full.jsonl"
+        try:
+            if now - t.stat().st_mtime <= SUBAGENT_ACTIVE_WINDOW_S:
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def cmd_session_start_hook(_args: argparse.Namespace) -> int:
     if os.environ.get("AGY_HOOK_INTERNAL") == "1":
         print("{}")
@@ -1143,6 +1195,7 @@ def cmd_session_start_hook(_args: argparse.Namespace) -> int:
     conn: sqlite3.Connection | None = None
     try:
         conn = open_db()
+        is_child = looks_like_subagent_session(conn, cid, repo_root)
         if cid:
             conn.execute(
                 "INSERT OR REPLACE INTO session_workspaces VALUES (?, ?, ?, ?)",
@@ -1151,10 +1204,18 @@ def cmd_session_start_hook(_args: argparse.Namespace) -> int:
             conn.commit()
     except Exception:
         conn = None
+        is_child = False
     if ws_dir.is_dir():
         save_workspace_meta(ws_dir, repo_root)
 
     spawn_detached_sync()
+
+    if is_child:
+        log_event(f"[INJECT-SKIP] cid={cid[:8] if cid else 'none'} slug={slug} reason=subagent_session")
+        if conn is not None:
+            conn.close()
+        print("{}")
+        return 0
 
     if not (ws_dir / "memory_summary.md").is_file() and not (ws_dir / "MEMORY.md").is_file():
         log_event(f"[INJECT-SKIP] cid={cid[:8] if cid else 'none'} slug={slug} reason=no_memory_files")

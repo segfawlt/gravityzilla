@@ -35,6 +35,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import sqlite3
@@ -162,6 +163,7 @@ WS_RE = re.compile(r"\s+")
 
 DEFAULT_STATE: dict[str, Any] = {
     "enabled": True,
+    "git_guard": True,
     "auto_kill_late_hangs": True,
     "model_warn_s": 90,
     "tool_warn_s": 60,
@@ -169,6 +171,7 @@ DEFAULT_STATE: dict[str, Any] = {
     "stop_idle_bounce_s": 12,
     "bg_hang_s": 90,
     "loops_blocked": 0,
+    "git_guards_blocked": 0,
     "thrash_pivots": 0,
     "hangs_bounced": 0,
     "late_hangs_killed": 0,
@@ -258,8 +261,12 @@ def default_session(cid: str) -> dict[str, Any]:
         "last_user_input": "",
         "model_started_mono_ns": 0,
         "model_started_epoch": 0.0,
+        "turn_started_epoch": 0.0,
+        "turn_step_count": 0,
+        "total_steps": 0,
         "turn_tool_count": 0,
         "warned_step_45": False,
+        "margin_step2_nudged": False,
         "mutation_seq": 0,
         "recent_calls": [],
         "file_hashes": {},
@@ -304,6 +311,16 @@ def load_session(cid: str) -> dict[str, Any]:
 def save_session(cid: str, sess: dict[str, Any]) -> None:
     sess["updated_at"] = time.time()
     atomic_write_json(session_path(cid), sess)
+
+
+def _clear_sync_stall_alert(sess: dict[str, Any]) -> None:
+    alert = sess.get("last_alert")
+    if (
+        isinstance(alert, dict)
+        and alert.get("kind") == "stall"
+        and not str(alert.get("detail") or "").startswith("task-")
+    ):
+        sess["last_alert"] = None
 
 
 def _rotate_if_oversized(path: Path, max_bytes: int) -> None:
@@ -627,6 +644,184 @@ def is_readonly_command(cmd: str) -> bool:
     return not is_mutating_shell_command(cmd)
 
 
+ENV_SECRET_FILE_RE = re.compile(r"^\.env(?:\..+)?$")
+ENV_TEMPLATE_FILE_RE = re.compile(r"^\.env\.(?:example|sample|template)$")
+SHORT_FORCE_FLAG_RE = re.compile(r"^-[a-zA-Z]*f[a-zA-Z]*$")
+SHORT_ALL_FLAG_RE = re.compile(r"^-[a-zA-Z]*a[a-zA-Z]*$")
+
+
+def _split_unquoted_command_segments(cmd: str) -> list[tuple[str, str]]:
+    """Return [(raw_seg, masked_seg)] split on unquoted shell separators."""
+    cleaned = re.sub(r"<<[-~]?\s*['\"]?(\w+)['\"]?.*?(?:\n\1\b|$)", " <<HEREDOC ", cmd, flags=re.S)
+    cleaned = re.sub(r"\s-(?:c|e)\s+(?:'[^']*'|\"(?:\\.|[^\"])*\")", " -c __INLINE__ ", cleaned, flags=re.S)
+    masked = QUOTED_STR_RE.sub(
+        lambda m: (m.group(0)[0] + (" " * (len(m.group(0)) - 2)) + m.group(0)[-1]) if len(m.group(0)) >= 2 else m.group(0),
+        cleaned,
+    )
+    segs: list[tuple[str, str]] = []
+    start = 0
+    for m in re.finditer(r"&&|\|\||[;\n|]", masked):
+        raw_part = cleaned[start : m.start()].strip()
+        masked_part = masked[start : m.start()].strip()
+        if raw_part:
+            segs.append((raw_part, masked_part))
+        start = m.end()
+    raw_tail = cleaned[start:].strip()
+    masked_tail = masked[start:].strip()
+    if raw_tail:
+        segs.append((raw_tail, masked_tail))
+    return segs
+
+
+def _tokenize_segment(raw_seg: str, masked_seg: str) -> tuple[list[str], set[str]]:
+    """Strip wrappers/env assignments from a segment and return (tokens, env_assignments)."""
+    try:
+        tokens = shlex.split(raw_seg)
+    except ValueError:
+        tokens = masked_seg.split()
+    env_assigns: set[str] = set()
+    idx = 0
+    while idx < len(tokens):
+        tok = tokens[idx]
+        if "=" in tok and not tok.startswith("-") and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tok):
+            env_assigns.add(tok)
+            idx += 1
+            continue
+        base = Path(tok).name
+        if base == "rtk":
+            idx += 1
+            if idx < len(tokens) and tokens[idx] == "bypass":
+                idx += 1
+            continue
+        if base in {"sudo", "nohup", "time", "nice", "command", "env", "stdbuf", "setsid"}:
+            idx += 1
+            while idx < len(tokens) and tokens[idx].startswith("-"):
+                idx += 1
+            continue
+        if base == "timeout":
+            idx += 1
+            while idx < len(tokens) and tokens[idx].startswith("-"):
+                idx += 1
+            if idx < len(tokens) and re.match(r"^\d+[smhd]?$", tokens[idx]):
+                idx += 1
+            continue
+        break
+    return tokens[idx:], env_assigns
+
+
+def _run_git_readonly(git_dir: str, *args: str) -> tuple[bool, str]:
+    try:
+        proc = subprocess.run(
+            ["git", "--no-optional-locks", "-C", git_dir, *args],
+            capture_output=True,
+            text=True,
+            timeout=1.5,
+        )
+        return proc.returncode == 0, proc.stdout
+    except Exception:
+        return False, ""
+
+
+def check_git_safety_guard(cmd: str, cwd: str, state: dict[str, Any]) -> str:
+    """Return a block reason string if `cmd` violates a safety guard, else empty string."""
+    if not state.get("git_guard", True) or not (cmd or "").strip():
+        return ""
+    cur_dir = cwd or os.getcwd()
+    for raw_seg, masked_seg in _split_unquoted_command_segments(cmd):
+        tokens, env_assigns = _tokenize_segment(raw_seg, masked_seg)
+        if not tokens:
+            continue
+        verb = Path(tokens[0]).name
+        if verb == "cd" and len(tokens) >= 2 and not tokens[1].startswith("-"):
+            cand = Path(tokens[1]).expanduser()
+            cur_dir = str((cand if cand.is_absolute() else (Path(cur_dir) / cand)).resolve())
+            continue
+        if verb != "git":
+            continue
+
+        git_dir = cur_dir
+        i = 1
+        while i < len(tokens):
+            tok = tokens[i]
+            if tok == "-C" and i + 1 < len(tokens):
+                cand = Path(tokens[i + 1]).expanduser()
+                git_dir = str((cand if cand.is_absolute() else (Path(git_dir) / cand)).resolve())
+                i += 2
+                continue
+            if tok in {"-c", "--git-dir", "--work-tree"}:
+                i += 2
+                continue
+            if tok.startswith("-"):
+                i += 1
+                continue
+            break
+        if i >= len(tokens):
+            continue
+        sub = tokens[i]
+        rest = tokens[i + 1 :]
+
+        # Rule 1: Block committing staged secret .env* files
+        if sub == "commit" and not any(a in {"-h", "--help"} for a in rest):
+            ok_staged, staged_out = _run_git_readonly(git_dir, "diff", "--cached", "--name-only")
+            candidates: list[str] = staged_out.splitlines() if ok_staged else []
+            if any(a in {"-a", "--all"} or SHORT_ALL_FLAG_RE.match(a) for a in rest):
+                ok_mod, mod_out = _run_git_readonly(git_dir, "diff", "--name-only")
+                if ok_mod:
+                    candidates.extend(mod_out.splitlines())
+            bad_envs: list[str] = []
+            for rel_path in candidates:
+                p_str = rel_path.strip()
+                if not p_str:
+                    continue
+                bname = Path(p_str).name
+                if ENV_SECRET_FILE_RE.match(bname) and not ENV_TEMPLATE_FILE_RE.match(bname):
+                    if p_str not in bad_envs:
+                        bad_envs.append(p_str)
+            if bad_envs:
+                listed = ", ".join(bad_envs[:5])
+                restore_args = " ".join(shlex.quote(p) for p in bad_envs[:5])
+                return (
+                    f"[Watchdog Git Guard] Blocked `git commit`: secret environment file staged ({listed}). "
+                    f"Unstage it with `git restore --staged {restore_args}` before committing."
+                )
+
+        # Rule 2: Block raw `git push --force` / `-f` / `+refspec`
+        if sub == "push" and "AGY_GIT_GUARD_ALLOW_FORCE=1" not in env_assigns:
+            if any(
+                a == "--force" or SHORT_FORCE_FLAG_RE.match(a) or (a.startswith("+") and len(a) > 1)
+                for a in rest
+            ):
+                return (
+                    "[Watchdog Git Guard] Blocked raw `git push --force`. Never force-push without explicit user "
+                    "confirmation; if rewriting a feature branch is requested, use `git push --force-with-lease` "
+                    "(or prefix with `AGY_GIT_GUARD_ALLOW_FORCE=1` if explicitly approved)."
+                )
+
+        # Rule 3: Block `git reset --hard` / `git clean -f` when uncommitted work would be lost
+        is_hard_reset = sub == "reset" and "--hard" in rest
+        is_force_clean = sub == "clean" and any(a == "--force" or SHORT_FORCE_FLAG_RE.match(a) for a in rest)
+        if (is_hard_reset or is_force_clean) and "AGY_GIT_GUARD_ALLOW_RESET=1" not in env_assigns:
+            ok_st, st_out = _run_git_readonly(git_dir, "status", "--porcelain")
+            if ok_st and st_out:
+                dirty: list[str] = []
+                for ln in st_out.splitlines():
+                    if not ln.strip():
+                        continue
+                    is_untracked = ln.startswith("?? ")
+                    if (is_hard_reset and not is_untracked) or (is_force_clean and is_untracked):
+                        dirty.append(ln[3:].strip())
+                if dirty:
+                    preview = ", ".join(dirty[:5])
+                    if len(dirty) > 5:
+                        preview += f" (+{len(dirty) - 5} more)"
+                    return (
+                        f"[Watchdog Git Guard] Blocked `git {sub}` that would permanently discard uncommitted work "
+                        f"({preview}). Restore specific files (`git checkout -- <file>`) or, if the user explicitly "
+                        "approved discarding all work, prefix with `AGY_GIT_GUARD_ALLOW_RESET=1`."
+                    )
+    return ""
+
+
 def extract_cwd(payload: dict[str, Any]) -> str:
     cwd = str(payload.get("cwd") or "").strip()
     if cwd:
@@ -812,6 +1007,52 @@ def resolve_transcript_path(cid: str, payload: dict[str, Any] | None = None) -> 
         if cand.is_file():
             return cand
     return None
+
+
+def _parse_iso_epoch(raw: Any) -> float:
+    s = str(raw or "").strip()
+    if not s:
+        return 0.0
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    with contextlib.suppress(Exception):
+        d = dt.datetime.fromisoformat(s)
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=dt.timezone.utc)
+        return d.timestamp()
+    return 0.0
+
+
+def inspect_transcript_turn(cid: str, payload: dict[str, Any] | None = None) -> tuple[int, int, float]:
+    """Return (turn_planner_steps, total_planner_steps, latest_user_prompt_epoch) from transcript.jsonl."""
+    tpath = resolve_transcript_path(cid, payload)
+    if tpath is None or not tpath.is_file():
+        return 0, 0, 0.0
+    turn_planner_steps = 0
+    total_planner_steps = 0
+    latest_prompt_epoch = 0.0
+    with contextlib.suppress(Exception):
+        with tpath.open("r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                etype = str(entry.get("type") or "")
+                if etype == "USER_INPUT":
+                    turn_planner_steps = 0
+                    ts = _parse_iso_epoch(entry.get("created_at"))
+                    if ts > 0.0:
+                        latest_prompt_epoch = ts
+                elif etype == "PLANNER_RESPONSE":
+                    turn_planner_steps += 1
+                    total_planner_steps += 1
+    return turn_planner_steps, total_planner_steps, latest_prompt_epoch
 
 
 def _trunc_str(text: str, limit: int) -> str:
@@ -1136,6 +1377,156 @@ def _read_hook_payload() -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def _is_subagent_turn(cid: str, sess: dict[str, Any], payload: dict[str, Any], user_in: str) -> bool:
+    """Return True when the hook fired inside a subagent or internal worker session."""
+    if sess.get("parent_cid") or sess.get("role"):
+        return True
+    if payload.get("parentConversationId") or payload.get("isSubagent"):
+        return True
+    if user_in.lstrip().startswith("[AGY_INTERNAL_WORKER]"):
+        return True
+    brain_root = CLI_DATA_DIR / "brain"
+    if brain_root.is_dir():
+        with contextlib.suppress(OSError):
+            if any(brain_root.glob(f"*/.system_generated/subagents/{cid}.json")):
+                return True
+    return False
+
+
+def _is_margin_enabled() -> bool:
+    """Return True when the Margin plugin is enabled in Antigravity config."""
+    forced = os.environ.get("AGY_WATCHDOG_MARGIN_ENABLED")
+    if forced is not None:
+        return forced == "1"
+    cfg_path = Path.home() / ".gemini" / "config" / "config.json"
+    if cfg_path.is_file():
+        with contextlib.suppress(Exception):
+            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+            plugins = cfg.get("plugins")
+            if isinstance(plugins, dict) and "margin" in plugins:
+                entry = plugins.get("margin")
+                if isinstance(entry, dict) and "enabled" in entry:
+                    return bool(entry["enabled"])
+    return any(
+        (Path.home() / ".gemini" / prod / "mcp" / "margin_margin").is_dir()
+        for prod in ("antigravity", "antigravity-cli", "antigravity-ide")
+    )
+
+
+def _resolve_brain_dir(cid: str, payload: dict[str, Any] | None = None) -> Path | None:
+    """Resolve `<brain>` directory for `cid` across transcript path, CLI_DATA_DIR, and home products."""
+    tp = resolve_transcript_path(cid, payload)
+    if tp and tp.parent.name == "logs" and tp.parent.parent.name == ".system_generated":
+        return tp.parent.parent.parent
+    cli_brain = CLI_DATA_DIR / "brain" / cid
+    if cli_brain.is_dir():
+        return cli_brain
+    gemini_dir = Path.home() / ".gemini"
+    for prod in ("antigravity-cli", "antigravity", "antigravity-ide"):
+        cand = gemini_dir / prod / "brain" / cid
+        if cand.is_dir():
+            return cand
+    return cli_brain if cid else None
+
+
+def _margin_topics_worker_path() -> Path | None:
+    for cand in (
+        Path.home() / ".gemini" / "config" / "plugins" / "margin" / "lib" / "topics-worker.mjs",
+        Path(__file__).resolve().parent.parent / "config" / "plugins" / "margin" / "lib" / "topics-worker.mjs",
+    ):
+        if cand.is_file():
+            return cand
+    return None
+
+
+def _spawn_margin_topics(brain: Path | None) -> None:
+    """Spawn detached `topics-worker.mjs` at 0 ms without waiting for model completion."""
+    if not brain or os.environ.get("AGY_WATCHDOG_NO_TOPICS_SPAWN") == "1":
+        return
+    if not (brain / ".system_generated" / "logs" / "transcript.jsonl").is_file():
+        return
+    worker = _margin_topics_worker_path()
+    node_bin = shutil.which("node")
+    if not worker or not node_bin:
+        return
+    env = os.environ.copy()
+    env["AGY_HOOK_INTERNAL"] = "1"
+    with contextlib.suppress(Exception):
+        subprocess.Popen(
+            [node_bin, str(worker), "--brain", str(brain)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            env=env,
+        )
+
+
+def _margin_outcome_worker_path() -> Path | None:
+    for cand in (
+        Path.home() / ".gemini" / "config" / "plugins" / "margin" / "lib" / "outcome-worker.mjs",
+        Path(__file__).resolve().parent.parent / "config" / "plugins" / "margin" / "lib" / "outcome-worker.mjs",
+    ):
+        if cand.is_file():
+            return cand
+    return None
+
+
+def _spawn_margin_outcome(brain: Path | None) -> None:
+    """Spawn detached `outcome-worker.mjs --spawn` at 0 ms without blocking Stop."""
+    if not brain or os.environ.get("AGY_WATCHDOG_NO_OUTCOME_SPAWN") == "1":
+        return
+    if not (brain / ".system_generated" / "logs" / "transcript.jsonl").is_file():
+        return
+    worker = _margin_outcome_worker_path()
+    node_bin = shutil.which("node")
+    if not worker or not node_bin:
+        return
+    env = os.environ.copy()
+    env["AGY_HOOK_INTERNAL"] = "1"
+    with contextlib.suppress(Exception):
+        subprocess.Popen(
+            [node_bin, str(worker), "--brain", str(brain), "--spawn"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            env=env,
+        )
+
+
+def _intent_updated_since(brain: Path | None, since_epoch: float) -> bool:
+    """Return True when `intent.json` was written at or after `since_epoch`."""
+    if not brain or since_epoch <= 0.0:
+        return False
+    ip = brain / ".system_generated" / "margin" / "intent.json"
+    if not ip.is_file():
+        return False
+    try:
+        data = json.loads(ip.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    if not isinstance(data, dict):
+        return False
+    upd = _parse_iso_epoch(data.get("updatedAt"))
+    if upd > 0.0:
+        return upd >= since_epoch - 2.0
+    with contextlib.suppress(OSError):
+        return ip.stat().st_mtime >= since_epoch - 2.0
+    return False
+
+
+def _prev_turn_missed_margin(
+    brain: Path | None,
+    prev_turn_started: float,
+    prev_had_user_in: bool,
+) -> bool:
+    """Detect whether an immediately preceding turn never reported to `margin_intent`."""
+    if not prev_had_user_in or prev_turn_started <= 0.0:
+        return False
+    return not _intent_updated_since(brain, prev_turn_started)
+
+
 def cmd_pre_invocation_hook(_args: argparse.Namespace) -> int:
     if os.environ.get("AGY_HOOK_INTERNAL") == "1":
         print("{}")
@@ -1166,19 +1557,57 @@ def cmd_pre_invocation_hook(_args: argparse.Namespace) -> int:
             _sync_session_meta(sess, payload)
             proj = str(sess.get("project") or "")
 
-            if user_in and user_in != sess.get("last_user_input"):
+            t_turn_steps, t_total_steps, t_prompt_epoch = inspect_transcript_turn(cid, payload)
+            prev_turn_started = float(sess.get("turn_started_epoch") or 0.0)
+            prev_had_user_in = bool(sess.get("last_user_input"))
+            is_new_user_turn = bool(user_in and user_in != sess.get("last_user_input"))
+            if is_new_user_turn:
                 sess["last_user_input"] = user_in
                 sess["turn_tool_count"] = 0
+                sess["turn_step_count"] = max(1, t_turn_steps + 1)
+                sess["total_steps"] = max(int(sess.get("total_steps") or 0) + 1, t_total_steps + 1)
+                sess["turn_started_epoch"] = now
                 sess["warned_step_45"] = False
+                sess["margin_step2_nudged"] = False
                 sess["recent_calls"] = []
                 sess["file_hashes"] = {}
                 sess["stop_bounced_tasks"] = []
-                if (sess.get("last_alert") or {}).get("kind") != "stall":
-                    sess["last_alert"] = None
+                sess["last_alert"] = None
                 sync_transcript_errors(sess, cid, payload, advance_only=True)
             else:
+                sess["turn_step_count"] = max(int(sess.get("turn_step_count") or 0) + 1, t_turn_steps + 1)
+                sess["total_steps"] = max(int(sess.get("total_steps") or 0) + 1, t_total_steps + 1)
+                if float(sess.get("turn_started_epoch") or 0.0) <= 0.0:
+                    sess["turn_started_epoch"] = t_prompt_epoch if t_prompt_epoch > 0.0 else now
+                _clear_sync_stall_alert(sess)
                 sync_transcript_errors(sess, cid, payload, advance_only=False)
 
+            is_sub = _is_subagent_turn(cid, sess, payload, user_in)
+            margin_on = not is_sub and _is_margin_enabled()
+            margin_brain = _resolve_brain_dir(cid, payload) if margin_on else None
+            if is_new_user_turn and margin_on:
+                _spawn_margin_topics(margin_brain)
+            if margin_on and os.environ.get("AGY_WATCHDOG_NO_MARGIN_NUDGE") != "1":
+                if is_new_user_turn:
+                    if _prev_turn_missed_margin(margin_brain, prev_turn_started, prev_had_user_in):
+                        inject_msgs.append(
+                            f"Margin missed last turn: call `call_mcp_tool` (`margin_margin` / `margin_intent`) with `conversation_id: \"{cid}\"`, `wants` (terse wants <=60ch), `take` (pre-work stance, never answer), `steps` (short steps <=40ch), and `now: 1` FIRST (including Plan Mode)."
+                        )
+                    else:
+                        inject_msgs.append(
+                            f"Margin Overview (Step 1): call `call_mcp_tool` (`margin_margin` / `margin_intent`) with `conversation_id: \"{cid}\"`, `wants` (terse wants <=60ch), `take` (pre-work stance, never answer), `steps` (short steps <=40ch), and `now: 1` FIRST before other tools (Plan Mode ok; schema in rules)."
+                        )
+                elif (
+                    int(sess.get("turn_step_count") or 0) == 2
+                    and not sess.get("margin_step2_nudged")
+                    and not _intent_updated_since(margin_brain, float(sess.get("turn_started_epoch") or 0.0))
+                ):
+                    sess["margin_step2_nudged"] = True
+                    inject_msgs.append(
+                        f"Margin Overview missing: call `call_mcp_tool` (`margin_margin` / `margin_intent`) with `conversation_id: \"{cid}\"`, `wants` (terse wants <=60ch), `take`, `steps` (short steps <=40ch), `now: 1` now."
+                    )
+
+            sess["inflight_tools"] = {}
             sess["phase"] = "model"
             sess["model_started_mono_ns"] = mono_ns
             sess["model_started_epoch"] = now
@@ -1202,20 +1631,23 @@ def cmd_pre_invocation_hook(_args: argparse.Namespace) -> int:
                 sess["last_alert"] = {"kind": "loop", "detail": f"err×{err_cnt}", "ts": now}
                 thrash_triggered = True
 
-            if int(sess.get("turn_tool_count") or 0) == 45 and not sess.get("warned_step_45"):
+            turn_steps = int(sess.get("turn_step_count") or 0)
+            turn_tools = int(sess.get("turn_tool_count") or 0)
+            if (turn_steps >= 25 or turn_tools >= 45) and not sess.get("warned_step_45"):
                 sess["warned_step_45"] = True
                 inject_msgs.append(
-                    "Turn step check: 45 tool calls executed in this turn. "
+                    f"Turn step check: {turn_steps} model steps ({turn_tools} tool calls) executed in this turn. "
                     "Verify forward progress and avoid unnecessary retry loops."
                 )
 
+            step_for_event = turn_steps
             save_session(cid, sess)
 
         if thrash_triggered:
             update_state_field(lambda st: st.__setitem__("thrash_pivots", int(st.get("thrash_pivots") or 0) + 1))
             log_line(f"[THRASH] cid={cid[:8]} err_count={err_cnt}")
 
-        append_event(cid=cid, event="model_start", project=proj)
+        append_event(cid=cid, event="model_start", step_idx=step_for_event, project=proj)
         ensure_watcher_running()
 
         if inject_msgs:
@@ -1260,6 +1692,28 @@ def cmd_pre_tool_hook(_args: argparse.Namespace) -> int:
         cwd = extract_cwd(payload)
         agy_pid = find_ancestor_agy_pid()
         exempt, args_hash = canonicalize_tool_call(tname, targs)
+
+        if tname == "run_command":
+            guard_cwd = cwd or str(load_session(cid).get("cwd") or "")
+            git_block = check_git_safety_guard(str(targs.get("CommandLine") or ""), guard_cwd, state)
+            if git_block:
+                proj_g = Path(guard_cwd).name if guard_cwd else ""
+                target_g = summarize_tool_target(tname, targs, guard_cwd)
+                update_state_field(lambda st: st.__setitem__("git_guards_blocked", int(st.get("git_guards_blocked") or 0) + 1))
+                append_event(
+                    cid=cid,
+                    event="git_guard_blocked",
+                    step_idx=step_idx,
+                    tool_id=tool_id,
+                    tool=tname,
+                    status="denied",
+                    detail=git_block[:120],
+                    project=proj_g,
+                    target=target_g,
+                )
+                log_line(f"[GIT-GUARD] cid={cid[:8]} step={step_idx} reason={git_block[:120]}")
+                print(json.dumps({"decision": "deny", "reason": git_block}))
+                return 0
 
         model_dur_ms: int | None = None
         blocked_reason = ""
@@ -1390,6 +1844,10 @@ def cmd_post_tool_hook(_args: argparse.Namespace) -> int:
 
             sess["inflight_tools"] = inflight
             sess["turn_tool_count"] = int(sess.get("turn_tool_count") or 0) + 1
+            if int(sess.get("turn_step_count") or 0) <= 0:
+                sess["turn_step_count"] = 1
+            if float(sess.get("turn_started_epoch") or 0.0) <= 0.0:
+                sess["turn_started_epoch"] = time.time()
             sess["last_step"] = {
                 "event": "tool_done",
                 "step_idx": step_idx,
@@ -1509,9 +1967,10 @@ def cmd_stop_hook(_args: argparse.Namespace) -> int:
             if sess.get("phase") == "model" and int(sess.get("model_started_mono_ns") or 0) > 0:
                 model_dur_ms = max(0, (mono_ns - int(sess["model_started_mono_ns"])) // 1_000_000)
 
+            sess["inflight_tools"] = {}
+            _clear_sync_stall_alert(sess)
             if fully_idle is not False:
                 sess["phase"] = "idle"
-                sess["inflight_tools"] = {}
                 save_session(cid, sess)
             else:
                 sess["phase"] = "bg_wait"
@@ -1529,6 +1988,8 @@ def cmd_stop_hook(_args: argparse.Namespace) -> int:
         )
 
         if fully_idle is not False:
+            if not _is_subagent_turn(cid, sess, payload, str(sess.get("last_user_input") or "")) and _is_margin_enabled():
+                _spawn_margin_outcome(_resolve_brain_dir(cid, payload))
             print(json.dumps({"decision": "stop"}))
             return 0
 
@@ -1701,15 +2162,25 @@ def cmd_daemon_loop(_args: argparse.Namespace) -> int:
                 if phase in {"model", "tool", "bg_wait"} or has_running_db or has_generating_db:
                     any_active = True
 
-                # 1. Sync tool / MCP stall check (no task-<idx>.log)
+                # 1. Sync tool / MCP stall check (prune completed, backgrounded, or permission-rejected steps)
+                stale_ids: list[str] = []
                 for tool_id, tinfo in inflight.items():
                     if not isinstance(tinfo, dict):
+                        stale_ids.append(tool_id)
                         continue
                     s_idx = tinfo.get("step_idx")
                     has_task_log = False
                     if isinstance(s_idx, int):
                         tlog = CLI_DATA_DIR / "brain" / cid / ".system_generated" / "tasks" / f"task-{s_idx}.log"
                         has_task_log = tlog.is_file()
+                    if has_task_log or (
+                        _db_ok
+                        and isinstance(s_idx, int)
+                        and s_idx not in running_idxs
+                        and (now - float(tinfo.get("started_epoch") or now)) >= 3.0
+                    ):
+                        stale_ids.append(tool_id)
+                        continue
                     if (has_running_db or phase == "tool") and not has_task_log:
                         elapsed = now - float(tinfo.get("started_epoch") or now)
                         if elapsed >= float(state.get("tool_warn_s", 60)):
@@ -1737,6 +2208,17 @@ def cmd_daemon_loop(_args: argparse.Namespace) -> int:
                                     detail=f"{int(elapsed)}s",
                                 )
                                 log_line(f"[TOOL-STALL] cid={cid[:8]} tool={tname} {int(elapsed)}s")
+
+                if stale_ids:
+                    with file_lock(session_lock_path(cid)):
+                        sess = load_session(cid)
+                        cur_inf = dict(sess.get("inflight_tools") or {})
+                        for sid in stale_ids:
+                            cur_inf.pop(sid, None)
+                        sess["inflight_tools"] = cur_inf
+                        if not cur_inf:
+                            _clear_sync_stall_alert(sess)
+                        save_session(cid, sess)
 
                 # 2. Model generation stall check
                 model_started_epoch = float(sess.get("model_started_epoch") or 0.0)
@@ -1910,8 +2392,14 @@ def cmd_status(_args: argparse.Namespace) -> int:
                 s = load_session(sp.stem)
                 alert = s.get("last_alert")
                 alert_s = f" alert={alert['kind']}:{alert['detail']}" if isinstance(alert, dict) else ""
+                el_s = ""
+                ts_turn = float(s.get("turn_started_epoch") or 0.0)
+                if ts_turn > 0.0:
+                    el_s = f" turn_elapsed={int(max(0.0, time.time() - ts_turn))}s"
                 print(
-                    f"  {sp.stem[:8]} phase={s.get('phase')} turn_tools={s.get('turn_tool_count')} "
+                    f"  {sp.stem[:8]} phase={s.get('phase')} "
+                    f"steps={int(s.get('turn_step_count') or 0)}/{int(s.get('total_steps') or 0)} "
+                    f"turn_tools={s.get('turn_tool_count')}{el_s} "
                     f"inflight={len(s.get('inflight_tools') or {})}{alert_s}"
                 )
     return 0
@@ -2085,7 +2573,10 @@ def collect_session_snapshots(include_closed: bool = False, cid_prefix: str = ""
                 "cwd": cwd_val,
                 "project": proj_val,
                 "model": str(sess.get("model") or ""),
+                "turn_step_count": int(sess.get("turn_step_count") or 0),
+                "total_steps": int(sess.get("total_steps") or 0),
                 "turn_tool_count": int(sess.get("turn_tool_count") or 0),
+                "turn_started_epoch": float(sess.get("turn_started_epoch") or 0.0),
                 "prompt_preview": clean_prompt_preview(str(sess.get("last_user_input") or "")),
                 "inflight": inflight_list,
                 "bg_tasks": bg_tasks,
@@ -2203,10 +2694,13 @@ def render_ps_human(
         el_txt = _fmt_elapsed(float(s["elapsed_s"] or 0.0))
         el_part = f" {el_txt}" if el_txt else ""
         closed_tag = f" {c['dim']}closed{c['reset']}" if not s["live"] and st_txt != "closed" else ""
+        turn_ts = float(s.get("turn_started_epoch") or 0.0)
+        turn_el = f" turn:{_fmt_elapsed(max(0.0, time.time() - turn_ts))}" if turn_ts > 0.0 else ""
         lines.append(
             f"{indent}{st_col}{glyph}{c['reset']} {c['bold']}{s['cid'][:8]}{c['reset']} "
             f"{label}  {st_col}{st_txt}{el_part}{c['reset']}  "
-            f"{c['dim']}tools:{s['turn_tool_count']}{c['reset']}{closed_tag}"
+            f"{c['dim']}steps:{s.get('turn_step_count', 0)}/{s.get('total_steps', 0)} "
+            f"tools:{s['turn_tool_count']}{turn_el}{c['reset']}{closed_tag}"
         )
 
         if s["prompt_preview"] and s["kind"] == "main":
@@ -2630,6 +3124,88 @@ def cmd_reset(_args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_doctor(_args: argparse.Namespace) -> int:
+    ensure_dirs()
+    st = load_state()
+    alive = _is_watcher_alive()
+    problems = 0
+
+    print(f"agy-watch doctor ({utc_iso_now()}):")
+    print(f"  home: {WATCHDOG_HOME} | cli_data: {CLI_DATA_DIR}")
+    print(
+        f"  state: enabled={st.get('enabled', True)} auto_kill={st.get('auto_kill_late_hangs', True)} "
+        f"watcher={'RUNNING' if alive else 'idle (stopped)'}"
+    )
+
+    hooks_file = Path.home() / ".gemini" / "config" / "plugins" / "watchdog" / "hooks.json"
+    required_events = ("PreInvocation", "PreToolUse", "PostToolUse", "Stop")
+    hooks_ok = False
+    missing_ev: list[str] = []
+    if hooks_file.is_file():
+        def _entry_has_watch_cmd(entry: Any) -> bool:
+            if not isinstance(entry, dict):
+                return False
+            if "agy-watch" in str(entry.get("command") or ""):
+                return True
+            sub_hooks = entry.get("hooks")
+            return isinstance(sub_hooks, list) and any(
+                isinstance(h, dict) and "agy-watch" in str(h.get("command") or "") for h in sub_hooks
+            )
+
+        with contextlib.suppress(Exception):
+            hj = json.loads(hooks_file.read_text(encoding="utf-8"))
+            wd = hj.get("watchdog") if isinstance(hj, dict) else None
+            if isinstance(wd, dict) and wd.get("enabled", True):
+                for ev in required_events:
+                    entries = wd.get(ev) or []
+                    if not any(_entry_has_watch_cmd(e) for e in entries):
+                        missing_ev.append(ev)
+                hooks_ok = not missing_ev
+    if hooks_ok:
+        print(f"  hooks ({hooks_file}): OK ({', '.join(required_events)})")
+    else:
+        problems += 1
+        print(f"  hooks ({hooks_file}): WARN missing={missing_ev or ['plugin/file']}")
+
+    for label, bin_p in (
+        ("agy-watch", Path(__file__).resolve()),
+        (
+            "agy-statusline",
+            Path(
+                os.environ.get("AGY_STATUSLINE_BIN")
+                or shutil.which("agy-statusline")
+                or str(Path.home() / ".local" / "bin" / "agy-statusline")
+            ),
+        ),
+    ):
+        ok_bin = bin_p.is_file() and os.access(bin_p, os.X_OK)
+        print(f"  binary {label} ({bin_p}): {'OK' if ok_bin else 'MISSING/NOT EXECUTABLE'}")
+        if not ok_bin:
+            problems += 1
+
+    sess_files = list(SESSIONS_DIR.glob("*.json")) if SESSIONS_DIR.is_dir() else []
+    with_steps = 0
+    with_timer = 0
+    for sp in sess_files:
+        s = load_session(sp.stem)
+        if int(s.get("turn_step_count") or 0) > 0:
+            with_steps += 1
+        if float(s.get("turn_started_epoch") or 0.0) > 0.0:
+            with_timer += 1
+    print(f"  sessions: {len(sess_files)} stored (turn_step_count={with_steps}, turn_started_epoch={with_timer})")
+
+    ev_lines = EVENTS_FILE.read_text(encoding="utf-8", errors="replace").splitlines() if EVENTS_FILE.is_file() else []
+    last_ev_ts = ""
+    if ev_lines:
+        with contextlib.suppress(Exception):
+            last_ev_ts = str(json.loads(ev_lines[-1]).get("ts") or "")
+    print(f"  events ({EVENTS_FILE}): {len(ev_lines)} lines | latest={last_ev_ts or 'none'}")
+
+    log_lines = LOG_FILE.read_text(encoding="utf-8", errors="replace").splitlines() if LOG_FILE.is_file() else []
+    print(f"  log ({LOG_FILE}): {len(log_lines)} lines")
+    return 0 if problems == 0 else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="agy-watch", description="Zero-token execution watchdog for Antigravity CLI.")
     sub = p.add_subparsers(dest="cmd")
@@ -2641,6 +3217,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("daemon-loop")
 
     sub.add_parser("status")
+    sub.add_parser("doctor")
 
     ps = sub.add_parser("ps", aliases=["sessions"])
     ps.add_argument("-a", "--all", action="store_true", help="Include closed/recent sessions")
@@ -2696,6 +3273,8 @@ def main() -> int:
             return cmd_daemon_loop(args)
         if cmd == "status":
             return cmd_status(args)
+        if cmd == "doctor":
+            return cmd_doctor(args)
         if cmd in {"ps", "sessions"}:
             return cmd_ps(args)
         if cmd in {"stream", "tail"}:

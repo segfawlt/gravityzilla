@@ -1,6 +1,6 @@
 ---
 name: hallmark
-description: "Design skill for websites and new pages that look designed, not generated. Use when the user asks to build or design something new, or names Hallmark. Never use it on an existing design unless the user names Hallmark, as in `/hallmark redesign <path>`. For fixing or de-slopping an existing UI use avoid-ai-design instead."
+description: "Explicit-only design skill (/hallmark) for websites and new pages with dealt themes, Together AI comps, and sloplint gates. Trigger ONLY when the user explicitly invokes /hallmark or names Hallmark (e.g., `/hallmark <prompt>`, `/hallmark redesign <path>`, `/hallmark audit <path>`, or A/B design bake-offs). For default page and app-screen design use taste-skill; for auditing or surgically de-slopping existing UI use avoid-ai-design."
 argument-hint: "<prompt> | redesign <path> | audit <path>"
 version: 2.0.0
 metadata:

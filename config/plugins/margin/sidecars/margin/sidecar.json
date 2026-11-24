@@ -1,6 +1,6 @@
 {
   "command": "node",
-  "args": ["--watch", "main.mjs"],
+  "args": ["--watch", "--watch-path=../../app", "--watch-path=../../lib", "--watch-path=../../mcp", "main.mjs"],
   "restart_policy": "always",
   "display_name": "Overview",
   "description": "Right-side Overview pane for the current conversation: live status, the ask, the agent's take, plan progress, verdict, and what it used.",

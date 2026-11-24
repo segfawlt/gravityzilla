@@ -2,9 +2,21 @@
 import { createHash } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, dirname, join } from 'node:path';
-import { appDataDirs, brainDirOf, ID_RE, intentPath, transcriptPath } from './paths.mjs';
+import { basename, dirname, join, resolve } from 'node:path';
+import { appDataDirs, brainDirOf, ID_RE, intentPath, outcomePath, topicsPath, transcriptPath } from './paths.mjs';
 import { enrichTake, readIntent } from './intent.mjs';
+import { collectSessionSavedMemories, memoryStoreDirs, readMarkdownExcerpt } from './memory.mjs';
+import {
+  buildHeuristicOutcome,
+  extractTurnExecution,
+  mergeOutcome,
+  OUTCOME_DEFAULT_LABELS,
+  OUTCOME_MARKS,
+  readOutcomeState,
+} from './outcome.mjs';
+import { spawnOutcomeWorker } from './outcome-worker.mjs';
+import { isTopicsRunning, readTopicsState } from './topics.mjs';
+import { spawnTopicsWorker } from './topics-worker.mjs';
 import {
   collectUsed,
   computeContext,
@@ -50,7 +62,7 @@ function contextDirsFromBrain(brain) {
   const wdEnv = !isHermetic || home === homedir() ? process.env.AGY_WATCHDOG_HOME : '';
   const watchdogDir = wdEnv || join(home, '.agents', 'watchdog');
   const configDir = join(home, '.gemini', 'config');
-  return { conv, home, dirs, watchdogDir, configDir };
+  return { conv, home, isHermetic, dirs, watchdogDir, configDir };
 }
 
 function cleanBriefSummary(raw, workerName = '') {
@@ -471,13 +483,22 @@ export function buildWatchdog(conv, facts, overviewStatus, ctxDirs, now = Date.n
   };
 }
 
-export function buildOverview(brain, now = Date.now()) {
+export function buildOverview(brain, now = Date.now(), { triggerTopics = false, triggerOutcome = triggerTopics } = {}) {
   const ctxDirs = contextDirsFromBrain(brain);
   const tp = transcriptPath(brain);
   const rows = readRows(tp);
   const headText = readHeadText(tp);
   const facts = summarize(rows, now);
+  if (triggerTopics) spawnTopicsWorker(brain);
   const stored = readIntent(intentPath(brain));
+  const topicsState = readTopicsState(topicsPath(brain));
+  const topicsRunning = isTopicsRunning(topicsState, now);
+  const about = {
+    summary: topicsState?.summary || '',
+    topics: Array.isArray(topicsState?.topics) ? topicsState.topics : [],
+    running: topicsRunning,
+    failed: Boolean(topicsState?.failed && !topicsRunning),
+  };
 
   const { spawns, coordinatorModel } = discoverAgents(brain, rows, facts, ctxDirs, now);
 
@@ -489,10 +510,9 @@ export function buildOverview(brain, now = Date.now()) {
   const waitingAgents = activeSpawns.length;
 
   const fresh = stored && stored.userStep === facts.userStep ? stored : null;
-  const hasClosingVerdict = Boolean(fresh?.verdict);
 
   let status = facts.status;
-  if (waitingAgents > 0 && (!hasClosingVerdict || anyActivelyRunning)) {
+  if (waitingAgents > 0) {
     const lastTurnPlanner = [...facts.turnRows].reverse().find((r) => r.type === 'PLANNER_RESPONSE') ?? null;
     const lastLaunchedAgents = Boolean(
       lastTurnPlanner && toolCalls(lastTurnPlanner).some((c) => c?.name === 'invoke_subagent' || c?.name === 'swarm' || c?.name === 'swarm_wait'),
@@ -502,10 +522,32 @@ export function buildOverview(brain, now = Date.now()) {
     }
   }
 
-  // Hang subagents/swarm workers under steps before auto-completing on clean turn completion (`isAnswered` rule)
+  let outcome = null;
+  let storedOutcome = null;
+  if (status === 'done') {
+    const exec = extractTurnExecution(facts.turnRows, { brain });
+    if (triggerOutcome && exec.finalStep >= 0 && exec.finalReply.trim()) {
+      spawnOutcomeWorker(brain, now);
+    }
+    storedOutcome = readOutcomeState(outcomePath(brain));
+    const heuristic = buildHeuristicOutcome(exec, { take: fresh?.take ? enrichTake(fresh.take) : null });
+    outcome = mergeOutcome({
+      heuristic,
+      stored: storedOutcome,
+      userStep: facts.userStep,
+      finalStep: exec.finalStep,
+      exec,
+      now,
+    });
+  } else {
+    storedOutcome = readOutcomeState(outcomePath(brain));
+  }
+
+  // Hang subagents/swarm workers under steps before auto-completing only when turn didn't pause for input/blockers
   const rawSteps = fresh?.steps ?? [];
   const hungSteps = hang(rawSteps, spawns);
-  const steps = status === 'done' && hungSteps.length
+  const shouldAutoComplete = status === 'done' && outcome?.kind !== 'needs_input' && outcome?.kind !== 'blocked';
+  const steps = shouldAutoComplete && hungSteps.length
     ? hungSteps.map((s) => ({ ...s, status: 'completed' }))
     : hungSteps;
 
@@ -518,17 +560,35 @@ export function buildOverview(brain, now = Date.now()) {
     !fresh &&
     stored &&
     stored.userStep !== facts.userStep &&
-    (stored.wants || stored.take || stored.steps?.length || stored.verdict)
+    (stored.wants || stored.take || stored.steps?.length)
   ) {
+    const prevOutcome = storedOutcome && storedOutcome.userStep === stored.userStep && storedOutcome.kind
+      ? {
+        kind: storedOutcome.kind,
+        mark: OUTCOME_MARKS[storedOutcome.kind] || '✓',
+        label: storedOutcome.label || OUTCOME_DEFAULT_LABELS[storedOutcome.kind] || storedOutcome.kind,
+        summary: storedOutcome.summary || '',
+        items: Array.isArray(storedOutcome.items) ? storedOutcome.items : [],
+        evidence: '',
+        verifyState: 'none',
+        source: 'worker',
+        running: false,
+        failed: false,
+        archiveSafe: storedOutcome.kind === 'clear',
+      }
+      : null;
+    const prevCleanComplete = Boolean(
+      facts.prevTurnDone && prevOutcome?.kind !== 'needs_input' && prevOutcome?.kind !== 'blocked',
+    );
     const prevRawSteps = Array.isArray(stored.steps) ? stored.steps : [];
     const prevSteps = prevRawSteps.map((s, idx) => ({
       index: idx + 1,
       text: s.text,
-      status: facts.prevTurnDone || stored.verdict ? 'completed' : s.status,
+      status: prevCleanComplete ? 'completed' : s.status,
       agents: Array.isArray(s.agents)
         ? s.agents.map((spec) => ({
           ...plannedAgentFromSpec(spec),
-          status: facts.prevTurnDone || stored.verdict ? 'completed' : 'planned',
+          status: prevCleanComplete ? 'completed' : 'planned',
         }))
         : [],
     }));
@@ -536,7 +596,7 @@ export function buildOverview(brain, now = Date.now()) {
       wants: stored.wants || '',
       take: stored.take ? enrichTake(stored.take) : null,
       steps: prevSteps,
-      verdict: stored.verdict || '',
+      outcome: prevOutcome,
     };
   }
 
@@ -556,7 +616,88 @@ export function buildOverview(brain, now = Date.now()) {
   }));
   const { used, usedDetails } = collectUsed(facts.turnRows, subSources, ctxDirs.home);
 
+  // Merge session-wide captured learnings, remember notes, and extracted rollouts into `memory` and `learnings`.
+  const memStores = memoryStoreDirs(ctxDirs);
+  const { items: savedMemItems, learningItems: savedLearningItems } = collectSessionSavedMemories({
+    conv: ctxDirs.conv,
+    allRows: rows,
+    currentUserStep: facts.userStep,
+    home: ctxDirs.home,
+    memoriesDir: memStores.memoriesDir,
+    compoundDir: memStores.compoundDir,
+  });
+
+  const mergeSavedCategory = (detail, savedItems, { filterLearningReadme = false } = {}) => {
+    const baseDetail = detail ?? { main: 0, agents: 0, items: [] };
+    const inTurnMain = baseDetail.items.filter((it) => it.reader === 'main');
+    const agents = baseDetail.items.filter((it) => it.reader !== 'main');
+
+    const savedByKey = new Map();
+    const savedKeyOf = (it) => (
+      it.action === 'remembered'
+        ? `rem:${String(it.summary || it.name).trim().toLowerCase()}`
+        : `path:${it.filePath && it.filePath.startsWith('/') ? resolve(it.filePath) : it.name}`
+    );
+    for (const s of savedItems) {
+      savedByKey.set(savedKeyOf(s), { ...s });
+    }
+    const hasNonReadmeLearning = filterLearningReadme && [...savedByKey.values()].some(
+      (it) => it.filePath && it.filePath.includes('/docs/learnings/') && basename(it.filePath).toUpperCase() !== 'README.MD',
+    );
+    for (const it of inTurnMain) {
+      if (it.group !== 'saved') continue;
+      const normPath = it.filePath && it.filePath.startsWith('/') ? resolve(it.filePath) : (it.filePath || it.name);
+      if (hasNonReadmeLearning && /(?:^|\/)docs\/learnings\/README\.md$/i.test(normPath)) continue;
+      const k = it.action === 'remembered'
+        ? `rem:${String(it.summary || it.name).trim().toLowerCase()}`
+        : `path:${normPath}`;
+      const prev = savedByKey.get(k);
+      if (prev) {
+        prev.earlier = false;
+        prev.count = Math.max(prev.count || 1, it.count || 1);
+        if (!prev.summary && it.summary) prev.summary = it.summary;
+      } else {
+        savedByKey.set(k, {
+          ...it,
+          filePath: normPath.startsWith('/') ? normPath : '',
+          summary: it.summary || (normPath.startsWith('/') ? readMarkdownExcerpt(normPath) : ''),
+          earlier: false,
+        });
+      }
+    }
+    const mergedSaved = [...savedByKey.values()].sort((a, b) => Number(Boolean(a.earlier)) - Number(Boolean(b.earlier)));
+    const readItems = inTurnMain
+      .filter((it) => it.group !== 'saved')
+      .map((it) => (
+        it.filePath && !it.summary
+          ? { ...it, summary: readMarkdownExcerpt(it.filePath) }
+          : it
+      ));
+    const mainCount = mergedSaved.reduce((sum, it) => sum + (it.earlier ? 1 : (it.count || 1)), 0)
+      + readItems.reduce((sum, it) => sum + (it.count || 1), 0);
+
+    return {
+      total: mainCount + (baseDetail.agents || 0),
+      detail: {
+        main: mainCount,
+        agents: baseDetail.agents || 0,
+        savedCount: mergedSaved.length,
+        readCount: readItems.length,
+        items: [...mergedSaved, ...readItems, ...agents],
+      },
+    };
+  };
+
+  const mergedMemory = mergeSavedCategory(usedDetails.memory, savedMemItems, { filterLearningReadme: false });
+  usedDetails.memory = mergedMemory.detail;
+  used.memory = mergedMemory.total;
+
+  const mergedLearnings = mergeSavedCategory(usedDetails.learnings, savedLearningItems, { filterLearningReadme: true });
+  usedDetails.learnings = mergedLearnings.detail;
+  used.learnings = mergedLearnings.total;
+
   return {
+    about,
     status,
     waitingAgents,
     ask: facts.ask,
@@ -565,7 +706,7 @@ export function buildOverview(brain, now = Date.now()) {
     steps,
     stepProgress,
     done: stepProgress.done,
-    verdict: fresh?.verdict || '',
+    outcome,
     reported: Boolean(fresh),
     previous,
     context,
@@ -580,12 +721,12 @@ export function buildOverview(brain, now = Date.now()) {
 }
 
 /** Resolve conversation overview with ETag support for sidecar HTTP polling. */
-export function resolveOverview({ conversationId = '', etag = '' } = {}, dirs = appDataDirs()) {
+export function resolveOverview({ conversationId = '', etag = '', triggerTopics = true } = {}, dirs = appDataDirs()) {
   const raw = String(conversationId ?? '');
   const conv = ID_RE.test(raw) && brainDirOf(raw, dirs) ? raw : newestConversation(dirs);
   const brain = brainDirOf(conv, dirs);
   if (!brain) return { conversationId: conv || null, overview: null };
-  const overview = buildOverview(brain);
+  const overview = buildOverview(brain, Date.now(), { triggerTopics });
   const stable = {
     ...overview,
     watchdog: overview.watchdog ? { ...overview.watchdog, elapsedMs: 0 } : null,

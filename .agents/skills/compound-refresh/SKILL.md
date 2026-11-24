@@ -128,11 +128,12 @@ For every `.agents/rules/*.md` file with `trigger: glob`:
 - Confirm linked learnings still exist and the guardrail still matches current code.
 - Flag rules longer than ~25 lines; move detail back into the linked learning.
 
-### 8. Check AGENTS integration
+### 8. Check discoverability integration
 
-Verify that `AGENTS.md` (or `CLAUDE.md`) points agents to `docs/learnings/README.md` before relevant
-non-trivial work and names the `compound` trigger. If either is absent, report the gap rather than
-editing persistent project instructions implicitly.
+Verify that either global instructions (`GEMINI.md`) or the repository's `AGENTS.md` (or
+`CLAUDE.md`) points agents to `docs/learnings/README.md` before relevant non-trivial work and names
+the `compound` trigger. If neither covers both, report the gap rather than editing persistent
+instructions implicitly.
 
 ## Completion
 
@@ -142,4 +143,4 @@ Report:
 - Files changed and destructive decisions deferred.
 - Broken links, missing index entries, metadata errors, and dead rule globs repaired.
 - Pending terms and promotion candidates.
-- Whether `AGENTS.md` discovery and trigger integration are sufficient.
+- Whether global (`GEMINI.md`) or per-repo (`AGENTS.md`) discovery and trigger integration are sufficient.

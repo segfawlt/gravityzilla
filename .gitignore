@@ -3,3 +3,11 @@ __pycache__/
 *.pyo
 *.log
 .DS_Store
+*.key
+*.pem
+*.p12
+*.jks
+.env
+.env.*
+.playwright-mcp/
+config-extra/agy-stats/keys/

@@ -16,6 +16,7 @@ Use this workflow to iterate on UI/UX designs in a live browser port **without m
 1. **Zero repo mutations:** Create the prototype inside `<artifactDir>/scratch/<slug>/` (never inside the git working tree while still in planning/design mode).
 2. **Instant setup (no `npm install` bloat):**
    - **Inside a Vite / frontend workspace:**
+     - Read the repo's root `DESIGN.md` (if present) alongside `index.css` and `tailwind.config.*` so the prototype obeys the repo's container grammar and reuses its shared primitives.
      - Symlink the workspace's existing `node_modules` (e.g., `ln -s <repo>/apps/web/node_modules ./node_modules`).
      - Copy or import the project's **real** CSS tokens (`index.css`), `tailwind.config.*`, theme attributes (`data-theme`), and surrounding app chrome (rail, sidebar, wrapper widths) so the demo reflects real viewport space and real components—catching shell constraints like `max-w-*` wrappers immediately.
      - In `vite.config.ts`, restrict filesystem serving (`server: { host: '0.0.0.0', port, strictPort: true, fs: { strict: true, allow: [scratchDir, repoWebDir] } }`) so binding `0.0.0.0` is safe on LAN/Wi-Fi.
@@ -62,6 +63,12 @@ Never mock only a single "maximalist" power-user/incident record. Include at lea
 
 Before presenting the port URL to the user (and after every major visual revision):
 1. Render the live port at desktop resolution (e.g., `1512×980`) and verify `0` `pageerror`s / console errors:
-   - Prefer a short local Playwright script (`node -e` via workspace `playwright` package) so `pageerror`s and multi-state clicks are captured without needing the global `playwright` MCP plugin enabled; fall back to `/usr/sbin/chromium --headless --screenshot=<path> --window-size=1512,980 <url>` (or Playwright MCP if active).
+   - Prefer a short local Playwright script (`node -e` via workspace `playwright` package) so `pageerror`s and multi-state clicks are captured without needing the global `playwright` MCP plugin enabled; fall back to `chromium` (or `chromium-browser` / `google-chrome`) `--headless --screenshot=<path> --window-size=1512,980 <url>` (or Playwright MCP if active).
 2. Capture and inspect (`read_file`) screenshots of **both** the **heavy/flagged** fixture and the **clean/edge** fixture.
 3. Check the actual pixels as a critical designer: verify section headlines read clearly at a glance, check for wasted viewport width, and fix any flat text walls, duplicated badges, or empty `0`-value grids **before** asking the user to review.
+
+---
+
+## Step 5: Production Handoff
+
+When implementing an approved prototype into production, if the new design introduces or retires shared UI primitives, changes tokens or motion, or shifts container/layout grammar rules, update the repository's root `DESIGN.md` (rules, not page inventory) in the same change.
