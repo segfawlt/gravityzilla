@@ -1,21 +1,38 @@
 // Shared ephemeral `agy` worker prompt runner with cross-product SQLite cleanup.
 import { execFileSync } from 'node:child_process';
 import { existsSync, readdirSync, readFileSync, rmSync, unlinkSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 export const INTERNAL_MARKER = '[AGY_INTERNAL_WORKER]';
 export const AGY_PRODUCTS = ['antigravity-cli', 'antigravity', 'antigravity-ide'];
 export const UUID_STEM_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export const DEFAULT_MODEL = 'gemini-3.8-flash-low';
+const IS_WIN = process.platform === 'win32';
+
+function sqliteReadOnlyUri(dbPath) {
+  return `file:${dbPath.replace(/\\/g, '/')}?mode=ro`;
+}
 
 export function findBinary(candidates, fallbackName) {
   for (const cand of candidates) {
     if (cand && existsSync(cand)) return cand;
   }
   try {
-    const found = execFileSync('which', [fallbackName], { encoding: 'utf8', timeout: 2000 }).trim();
-    if (found) return found.split('\n')[0].trim();
+    const cmd = IS_WIN ? 'where' : 'which';
+    const found = execFileSync(cmd, [fallbackName], {
+      encoding: 'utf8',
+      timeout: 2000,
+      windowsHide: true,
+    }).trim();
+    if (found) {
+      const lines = found.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+      if (IS_WIN) {
+        const exe = lines.find((l) => l.toLowerCase().endsWith('.exe'));
+        if (exe) return exe;
+      }
+      if (lines[0]) return lines[0];
+    }
   } catch {
     // ignore missing binary
   }
@@ -24,14 +41,19 @@ export function findBinary(candidates, fallbackName) {
 
 export function findAgyBinary() {
   const home = homedir();
-  return findBinary(
-    [process.env.AGY_BIN, join(home, '.local', 'bin', 'agy'), '/usr/local/bin/agy'],
-    'agy',
-  );
+  const candidates = IS_WIN
+    ? [
+        process.env.AGY_BIN,
+        join(home, '.local', 'bin', 'agy.exe'),
+        join(home, '.local', 'bin', 'agy.cmd'),
+        join(home, '.local', 'bin', 'agy'),
+      ]
+    : [process.env.AGY_BIN, join(home, '.local', 'bin', 'agy'), '/usr/local/bin/agy'];
+  return findBinary(candidates, 'agy');
 }
 
 export function findSqliteBinary() {
-  return findBinary(['/usr/bin/sqlite3', '/usr/sbin/sqlite3'], 'sqlite3');
+  return findBinary(IS_WIN ? [] : ['/usr/bin/sqlite3', '/usr/sbin/sqlite3'], 'sqlite3');
 }
 
 function geminiRoot() {
@@ -100,8 +122,8 @@ export function discoverNewWorkerCids(existing, ephemeralCid, sqliteBin) {
             try {
               const hex = execFileSync(
                 sqliteBin,
-                [`file:${join(cdir, name)}?mode=ro`, 'SELECT hex(step_payload) FROM steps WHERE idx = 0 LIMIT 1;'],
-                { encoding: 'utf8', timeout: 1000 },
+                [sqliteReadOnlyUri(join(cdir, name)), 'SELECT hex(step_payload) FROM steps WHERE idx = 0 LIMIT 1;'],
+                { encoding: 'utf8', timeout: 1000, windowsHide: true },
               ).trim();
               if (hex && Buffer.from(hex, 'hex').toString('utf8').includes(INTERNAL_MARKER)) {
                 found.add(stem);
@@ -120,10 +142,10 @@ export function discoverNewWorkerCids(existing, ephemeralCid, sqliteBin) {
           const out = execFileSync(
             sqliteBin,
             [
-              `file:${sumDb}?mode=ro`,
+              sqliteReadOnlyUri(sumDb),
               `SELECT conversation_id FROM conversation_summaries WHERE preview LIKE '%${INTERNAL_MARKER}%';`,
             ],
-            { encoding: 'utf8', timeout: 1000 },
+            { encoding: 'utf8', timeout: 1000, windowsHide: true },
           );
           for (const line of out.split('\n')) {
             const cstr = line.trim();
@@ -173,7 +195,7 @@ export function purgeEphemeralConversations(cids, sqliteBin) {
         `DELETE FROM conversation_parents WHERE conversation_id IN (${quoted});`,
       ].join('\n');
       try {
-        execFileSync(sqliteBin, [sumDb], { input: sql, timeout: 4000 });
+        execFileSync(sqliteBin, [sumDb], { input: sql, timeout: 4000, windowsHide: true });
       } catch {
         // FTS or parent tables may not exist in older schemas; best-effort per statement
         for (const tbl of ['conversation_summaries', 'conversations_fts', 'conversation_parents']) {
@@ -181,7 +203,7 @@ export function purgeEphemeralConversations(cids, sqliteBin) {
             execFileSync(
               sqliteBin,
               [sumDb, `PRAGMA busy_timeout=3000; DELETE FROM ${tbl} WHERE conversation_id IN (${quoted});`],
-              { timeout: 2000 },
+              { timeout: 2000, windowsHide: true },
             );
           } catch {
             // ignore
@@ -209,7 +231,8 @@ export function runEphemeralAgyPrompt({
 
   const sqliteBin = findSqliteBinary();
   const existing = snapshotAgyState();
-  const tmpLog = `/tmp/${logPrefix}-${process.pid}-${Date.now()}.log`;
+  const tmpDir = tmpdir();
+  const tmpLog = join(tmpDir, `${logPrefix}-${process.pid}-${Date.now()}.log`);
   const printArg = guard ? `${INTERNAL_MARKER}\n${guard}\n\n${prompt}` : `${INTERNAL_MARKER}\n${prompt}`;
 
   let ephemeralCid = '';
@@ -233,9 +256,10 @@ export function runEphemeralAgyPrompt({
         `--print=${printArg}`,
       ],
       {
-        cwd: '/tmp',
+        cwd: tmpDir,
         encoding: 'utf8',
         timeout: (timeoutSec + 10) * 1000,
+        windowsHide: true,
         env: { ...process.env, AGY_HOOK_INTERNAL: '1', WSL_INTEROP: '1' },
       },
     );

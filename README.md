@@ -68,9 +68,31 @@ cd ~/gravityzilla
 # ./install.sh --uninstall
 ```
 
+## Windows Support (Portable Subset)
+
+Use [`install.ps1`](./install.ps1) in PowerShell (works on Windows PowerShell 5.1 and PowerShell 7+, no Admin required):
+
+```powershell
+# Copy portable subset (rewrites Windows Python hook commands cleanly)
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+
+# Or use NTFS directory junctions for skills and non-rewritten plugins
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -Junction
+
+# Audit installed files/junctions for drift, or uninstall
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -Status
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -Uninstall
+```
+
+| Category | Included on Windows | Skipped (Linux-only / Patching) |
+| --- | --- | --- |
+| **Rules & Config** | `config/GEMINI.md`, `config.json`, `mcp_config.json`, `settings.windows.json.template` | `agy-statusline` |
+| **Plugins** | `gemini-api`, `playwright`, `margin` (open Overview tab manually), `stats`, `diagnostics` | `watchdog`, `memory` (`agent-memory`, `agy-compound`), `rtk` |
+| **Skills & Patching** | 16 portable skills under `.agents/skills/` | `ship` (`git-wt-sync` bash), `desktop-patch` (`app.asar` patcher) |
+
 ## Requirements
 
-- **OS / Arch:** Linux (`x86_64` for bundled `bin/rtk`; other Linux architectures skip `rtk` and can install it via `cargo` or upstream releases)
+- **OS / Arch:** Linux (`x86_64` for bundled `bin/rtk`; other Linux architectures skip `rtk` and can install it via `cargo` or upstream releases), or Windows 10/11 (portable subset via `install.ps1`)
 - **Python:** >= 3.11 (earlier Python 3 degrades TOML diagnostics in `agy-diagnostics`)
 - **Node.js:** >= 22.13 (for Margin `node:sqlite` rollout queries, `agy-desktop-patch`, and `taste-skill` CDP; Margin degrades `memory.db` reads gracefully on older Node)
 - **Core CLI tools:** `git`, `curl`, `agy` CLI in `~/.local/bin` or `$PATH`

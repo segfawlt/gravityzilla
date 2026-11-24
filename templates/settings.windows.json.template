@@ -1,0 +1,9 @@
+{
+  "agentMode": "auto",
+  "notifications": true,
+  "permissions": {
+    "allow": []
+  },
+  "trustedWorkspaces": [],
+  "verbosity": "high"
+}

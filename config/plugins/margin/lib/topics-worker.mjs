@@ -2,7 +2,7 @@
 // Detached background worker generating SESSION + TOPIC strictly from user prompts.
 import { spawn } from 'node:child_process';
 import { existsSync, realpathSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { basename, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DEFAULT_MODEL, runEphemeralAgyPrompt } from './agy-worker.mjs';
 import { ID_RE, topicsPath, transcriptPath } from './paths.mjs';
@@ -52,6 +52,7 @@ export function spawnTopicsWorker(brain) {
     const child = spawn(process.execPath, [selfPath, '--worker', '--brain', brain], {
       detached: true,
       stdio: 'ignore',
+      windowsHide: true,
       env: { ...process.env, AGY_HOOK_INTERNAL: '1' },
     });
     child.unref();
@@ -157,7 +158,7 @@ function main() {
     process.exit(1);
   }
   const absBrain = resolve(brain);
-  if (!ID_RE.test(absBrain.split('/').pop() || '')) {
+  if (!ID_RE.test(basename(absBrain))) {
     // Allow custom test brain paths if transcript exists, just resolve cleanly.
   }
   if (spawnMode) {
