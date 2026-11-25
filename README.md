@@ -2,13 +2,23 @@
 
 Antigravity setup with comfortable in mind. Supports both Antigravity Desktop and CLI. 
 
+> **Alpha:** Expect rough edges — this is personal tooling, not a polished release. Tested on Linux; Windows is unsupported.
+
 ## Install
+
+Best way to install is to let your AI agent handle it:
+
+```text
+Clone https://github.com/segfawlt/gravityzilla.git to ~/gravityzilla, inspect available components with ./install.sh --list --json, install what fits this machine, and verify with ./install.sh --status --json.
+```
+
+Or run interactively yourself:
 
 ```bash
 git clone https://github.com/segfawlt/gravityzilla.git ~/gravityzilla && ~/gravityzilla/install.sh
 ```
 
-Opens an interactive component checklist on a terminal; runs non-interactively in pipes, CI, or with `--yes` / `--only` / `--skip`. See [docs/INSTALL.md](./docs/INSTALL.md) for flags, AI-agent / manual setup, target paths, RTK detection, Desktop patches, and Windows.
+See [docs/INSTALL.md](./docs/INSTALL.md) for flags, target paths, RTK detection, Desktop patches, and manual steps.
 
 ---
 
@@ -16,11 +26,11 @@ Opens an interactive component checklist on a terminal; runs non-interactively i
 
 <img src="docs/assets/margin-overview.jpg" alt="Margin Overview Sidebar" align="right" width="320" />
 
-- **Session & Topic:** Background prompt-only summary and topic history (`show all`).
-- **Ask & Take:** Instant `Ask` plus pre-work `Take` (`✓ clear`, `! check first`, `✗ data loss`, `? needs repro`).
+- **Session & Topic:** Background summary of your current task and collapsible topic history (`show all`).
+- **Ask & Take:** `Ask` echoes your request; `Take` shows the agent's pre-work stance (`✓ clear`, `! check first`, `✗ data loss`, `? needs repro`).
 - **Plan & Subagents:** Live `update_steps` checklist with nested subagent and swarm trees.
-- **Result & Used:** Turn outcome triage (`✓ clear`, `? needs input`, `! caveats`, `✗ blocked`) and touched-context drawer.
-- **Live HUD Footer:** 1s context gauge (`ctx`), step count, and Watchdog timer.
+- **Result & Used:** Turn outcome triage (`✓ clear`, `? needs input`, `! caveats`, `✗ blocked`) and a `Used` drawer for touched files.
+- **Live HUD Footer:** 1-second context gauge (`ctx`), step count, and Watchdog timer.
 
 <br clear="all" />
 
