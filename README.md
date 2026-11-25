@@ -1,6 +1,6 @@
 # gravityzilla
 
-Antigravity setup with taste — Margin sidebar, Desktop patches, custom status line, zero-token guardrails, memory, learnings, and skills.
+Antigravity setup with comfortable in mind. Supports both Antigravity Desktop and CLI. 
 
 ## Install
 
