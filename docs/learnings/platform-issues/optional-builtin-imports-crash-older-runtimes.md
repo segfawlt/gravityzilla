@@ -11,7 +11,7 @@ date: 2026-11-25
 
 ## Problem
 
-Plugins and hooks imported optional newer standard-library modules (`node:sqlite` in [memory.mjs](file:///home/domixi/Projects/gravityzilla/config/plugins/margin/lib/memory.mjs) and `tomllib` in [agy-diagnostics](file:///home/domixi/Projects/gravityzilla/bin/agy-diagnostics)) unconditionally at module load time.
+Plugins and hooks imported optional newer standard-library modules (`node:sqlite` in [memory.mjs](../../../config/plugins/margin/lib/memory.mjs) and `tomllib` in [agy-diagnostics](../../../bin/agy-diagnostics)) unconditionally at module load time.
 
 ## Symptoms
 
@@ -22,9 +22,9 @@ Plugins and hooks imported optional newer standard-library modules (`node:sqlite
 
 Guard optional newer runtime built-ins at import time and degrade only the affected sub-feature:
 
-- In [memory.mjs](file:///home/domixi/Projects/gravityzilla/config/plugins/margin/lib/memory.mjs), load `DatabaseSync` via top-level `await import('node:sqlite')` wrapped in `try/catch`, and return an empty rollout list in `readExtractedMemories` when `DatabaseSync` is `null`.
-- In [agy-diagnostics](file:///home/domixi/Projects/gravityzilla/bin/agy-diagnostics), wrap `import tomllib` in `try/except ImportError`, return `None` in `check_toml`, and report `"unavailable (requires Python >= 3.11)"` in `detect_host_engines`.
-- Emit explicit version warnings for Python `< 3.11` and Node `< 22.13` in [install.sh](file:///home/domixi/Projects/gravityzilla/install.sh) and document the requirements in [README.md](file:///home/domixi/Projects/gravityzilla/README.md).
+- In [memory.mjs](../../../config/plugins/margin/lib/memory.mjs), load `DatabaseSync` via top-level `await import('node:sqlite')` wrapped in `try/catch`, and return an empty rollout list in `readExtractedMemories` when `DatabaseSync` is `null`.
+- In [agy-diagnostics](../../../bin/agy-diagnostics), wrap `import tomllib` in `try/except ImportError`, return `None` in `check_toml`, and report `"unavailable (requires Python >= 3.11)"` in `detect_host_engines`.
+- Emit explicit version warnings for Python `< 3.11` and Node `< 22.13` in [install.sh](../../../install.sh) and document the requirements in [README.md](../../../README.md).
 
 ## Why This Works
 

@@ -253,14 +253,14 @@ Never promote automatically.
 
 ## Completion Output
 
-After writing/updating learnings (or determining none qualify), record or skip via `~/.local/bin/agy-compound` so the audit trail stays complete:
+After writing/updating learnings (or determining none qualify), if `~/.local/bin/agy-compound` is installed, record or skip so the audit trail stays complete:
 
 ```bash
 # After writing/updating 1..N learning files:
-~/.local/bin/agy-compound record --files docs/learnings/<cat>/<slug1>.md ... --summary "<concise note>"
+test -x ~/.local/bin/agy-compound && ~/.local/bin/agy-compound record --files docs/learnings/<cat>/<slug1>.md ... --summary "<concise note>"
 
 # Or if all fixes were strictly routine/trivial:
-~/.local/bin/agy-compound skip "<item>: <reason>"
+test -x ~/.local/bin/agy-compound && ~/.local/bin/agy-compound skip "<item>: <reason>"
 ```
 
 CLI debugging subcommands (`~/.local/bin/agy-compound`):

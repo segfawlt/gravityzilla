@@ -29,15 +29,15 @@ Execute this runbook autonomously from start to finish whenever the user runs `/
 
 ---
 
-## Step 1: Run Zero-Mutation Audit (`git wt-sync`)
+## Step 1: Run Zero-Mutation Audit (`git-wt-sync`)
 
 Run the diagnostic script from anywhere in the repository:
 
 ```bash
-git wt-sync
+~/.agents/skills/ship/scripts/git-wt-sync
 ```
 
-*(Or invoke [scripts/git-wt-sync](./scripts/git-wt-sync) directly).*
+*(Also available as `git wt-sync` when `~/.local/bin` is on `PATH`.)*
 
 The script is **100% read-only** in audit mode (zero temporary objects written to `.git/objects`). Interpret its badges systematically:
 
@@ -111,7 +111,7 @@ Git `merge` refuses to run when incoming branches touch dirty or untracked files
 
 ## Step 4: Ordered Merge, Semantic Overlaps, & Conflict Resolution
 
-Re-run `git wt-sync` for a fresh merge plan, then merge from the **primary worktree** on `main`:
+Re-run `~/.agents/skills/ship/scripts/git-wt-sync` for a fresh merge plan, then merge from the **primary worktree** on `main`:
 
 1. **Skip `✅ Already merged` and `✅ Squash/patch-equivalent` branches** (pruned in Step 5).
 2. **Merge clean independent branches first**:
@@ -127,7 +127,7 @@ Re-run `git wt-sync` for a fresh merge plan, then merge from the **primary workt
    - **Lockfile-only (`⚠️ LOCKFILE-ONLY CONFLICT`)**: never hand-edit lockfiles. Keep dependency additions from both manifests, run `git -C "<wt_path>" checkout --ours <lockfile>`, regenerate via package manager (`pnpm install` / `npm install` / `cargo generate-lockfile` / `uv lock` / `go mod tidy`), then `git -C "<wt_path>" add <lockfile> <manifest> && git -C "<wt_path>" rebase --continue`.
    - **Additive / signature adaptations**: inspect `git -C "<wt_path>" log -p main..HEAD`, adapt calls/imports/schemas to `main`'s updated contracts, verify tests in `<wt_path>`, and continue rebase.
    - **Contradictory product intent**: do not guess — ask the user concisely which behavior wins (or provide a rebase handoff prompt if another session owns `<wt_path>`).
-   - Once rebased, re-run `git wt-sync` and `git merge --no-ff "<branch>" -m "Merge branch '<branch>'"` on `main`.
+   - Once rebased, re-run `~/.agents/skills/ship/scripts/git-wt-sync` and `git merge --no-ff "<branch>" -m "Merge branch '<branch>'"` on `main`.
 
 ---
 
@@ -140,7 +140,7 @@ Re-run `git wt-sync` for a fresh merge plan, then merge from the **primary workt
 2. **Review orphan local branches**: if `git wt-sync` reported `📌 Unmerged local branches (no active worktree)` not belonging to the finished cohort, confirm with the user before merging or deleting them.
 3. **Prune merged secondary worktrees & local branches**:
    ```bash
-   git wt-sync --prune-merged
+   ~/.agents/skills/ship/scripts/git-wt-sync --prune-merged
    ```
 4. **Sanity check `main`**: run `git status --short` and `git diff --check` to confirm `main` is clean and conflict-marker-free.
 

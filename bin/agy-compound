@@ -23,6 +23,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 from collections import Counter
 from pathlib import Path
@@ -1480,6 +1481,18 @@ def _build_extract_prompt(repo_root: Path, turns_summary: list[dict[str, Any]]) 
     )
 
 
+def _find_agy_binary() -> str:
+    for candidate in [
+        os.environ.get("AGY_BIN"),
+        shutil.which("agy"),
+        str(HOME / ".local" / "bin" / "agy"),
+        str(HOME / ".gemini" / "antigravity-cli" / "bin" / "agy"),
+    ]:
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return ""
+
+
 def cmd_extract(args: argparse.Namespace) -> int:
     cwd = str(Path(args.cwd or os.getcwd()).resolve())
     repo_root = resolve_repo_root(cwd)
@@ -1502,9 +1515,9 @@ def cmd_extract(args: argparse.Namespace) -> int:
             print(f"agy-compound extract: no substantive repo mutations in {cid[:8]}.")
         return 0
 
-    agy_bin = shutil.which("agy")
+    agy_bin = _find_agy_binary()
     if not agy_bin:
-        print("agy-compound extract: `agy` CLI not found on PATH.")
+        print("agy-compound extract: `agy` CLI not found on PATH or ~/.local/bin/agy.")
         return 1
 
     st = load_state()
@@ -1512,7 +1525,7 @@ def cmd_extract(args: argparse.Namespace) -> int:
     prompt = _build_extract_prompt(repo_root, substantive_turns[-2:])
     existing_brains, existing_convs = _snapshot_agy_state()
     ephemeral_cid = ""
-    tmp_log = Path(f"/tmp/agy-compound-worker-{os.getpid()}-{time.time_ns()}.log")
+    tmp_log = Path(tempfile.gettempdir()) / f"agy-compound-worker-{os.getpid()}-{time.time_ns()}.log"
     cmd = [
         agy_bin,
         "--mode",

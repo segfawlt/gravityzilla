@@ -15,7 +15,7 @@ date: 2026-11-19
 
 ## Root Causes (`Observed`)
 
-Disassembling `/home/domixi/.local/bin/agy` (`store.BuildStatusLineData`, `agent_state_component.newContextWindowUsage`, `applyCompactionInfo`, `commitHistoryLoaded`) and comparing against 160 real `conversations/*.db` and `transcript.jsonl` logs revealed:
+Disassembling `~/.local/bin/agy` (`store.BuildStatusLineData`, `agent_state_component.newContextWindowUsage`, `applyCompactionInfo`, `commitHistoryLoaded`) and comparing against 160 real `conversations/*.db` and `transcript.jsonl` logs revealed:
 
 1. **Exact `PLANNER_RESPONSE` token formula (NOT double-counting):**
    - `tokens = input_tokens + cache_read_tokens + cache_write_tokens + output_tokens`

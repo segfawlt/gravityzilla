@@ -36,10 +36,10 @@ Derived surfaces (`--hover`, `--accent-soft`, `--bad-soft`) use `color-mix(in sr
 
 Keep the simple top conversation & turn structure unchanged:
 - **About block (`#about-group`, never dimmed between turns):** `Session` (plus `updating…` / `update failed` slot), full-width `.full-rule`, `Topic` (`show all` action opening Topics drawer), full-width `.full-rule`.
-- **Turn block (`#turn-group`, dims via `.is-stale` while planning without report):** unified `54px 1fr` two-column `.row-sec` grid with `62px`-indented `.part-rule` hairlines for:
+- **Turn block (`#turn-group`, dims via `.is-stale` while planning without report; individual prior `Ask` / `Take` rows dim via `.row-sec.is-stale-field` at `opacity: 0.56` when fresh `Ask` or live `working` steps appear before `Take` lands):** unified `54px 1fr` two-column `.row-sec` grid with `62px`-indented `.part-rule` hairlines for:
   - `Ask` (always expanded, renders `wants` only with no line clamp or toggle)
   - `Take` (inline `<mark> <label>` + optional `: <why>`, no pill border)
-  - `Plan` (`✓` / `●` / `○` steps)
+  - `Plan` (`✓` / `●` / `○` / `✗` / `–` steps from native `update_steps` with `intent.json` fallback)
   - `Result` (end-of-turn `Outcome` triage: inline `<mark> <label>` + optional `: <summary>` and `checking…` slot, 0–3 muted bullet items, and quiet verification evidence line; no pill chrome)
   - `Used` (interactive ledger rows)
 

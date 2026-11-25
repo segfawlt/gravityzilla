@@ -27,6 +27,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -547,7 +548,7 @@ def call_llm_json(prompt_text: str, schema: dict[str, Any], model: str, timeout:
     env["WSL_INTEROP"] = "1"
     existing_brains, existing_convs = _snapshot_agy_state()
     ephemeral_cid = ""
-    tmp_log = Path(f"/tmp/agy-memory-worker-{os.getpid()}-{time.time_ns()}.log")
+    tmp_log = Path(tempfile.gettempdir()) / f"agy-memory-worker-{os.getpid()}-{time.time_ns()}.log"
     worker_guard = (
         "Do NOT call any filesystem, search, or shell tools (run_command, read_file, etc.). "
         "Distill strictly from the text provided below and return the JSON response immediately."
@@ -1135,7 +1136,7 @@ def build_session_start_payload(repo_root: Path, ws_dir: Path, guidance: str) ->
     }
 
 
-BRAIN_ROOT = Path.home() / ".gemini" / "antigravity" / "brain"
+BRAIN_ROOTS = tuple(HOME / ".gemini" / prod / "brain" for prod in AGY_PRODUCTS)
 SUBAGENT_ACTIVE_WINDOW_S = 30
 
 
@@ -1160,12 +1161,13 @@ def looks_like_subagent_session(conn: sqlite3.Connection | None, cid: str, repo_
     for (other,) in rows:
         if not other or other == cid:
             continue
-        t = BRAIN_ROOT / other / ".system_generated" / "logs" / "transcript_full.jsonl"
-        try:
-            if now - t.stat().st_mtime <= SUBAGENT_ACTIVE_WINDOW_S:
-                return True
-        except OSError:
-            continue
+        for broot in BRAIN_ROOTS:
+            t = broot / other / ".system_generated" / "logs" / "transcript_full.jsonl"
+            try:
+                if now - t.stat().st_mtime <= SUBAGENT_ACTIVE_WINDOW_S:
+                    return True
+            except OSError:
+                continue
     return False
 
 

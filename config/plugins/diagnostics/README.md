@@ -25,9 +25,9 @@ OMP-style immediate post-edit syntax & parse feedback for Antigravity (`agy`), b
 ## Usage
 
 ```bash
-agy diagnostics status
-agy diagnostics check src/
-agy diagnostics logs -n 30
-agy diagnostics checker yaml off
-agy diagnostics off
+~/.local/bin/agy-diagnostics status
+~/.local/bin/agy-diagnostics check src/
+~/.local/bin/agy-diagnostics logs -n 30
+~/.local/bin/agy-diagnostics checker yaml off
+~/.local/bin/agy-diagnostics off
 ```

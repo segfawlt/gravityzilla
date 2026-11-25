@@ -10,8 +10,8 @@ import {
   applyTopicsReply,
   buildTopicsPrompt,
   isTopicsRunning,
-  readAllUserPrompts,
   readTopicsState,
+  readUserPromptsWithSteps,
   writeTopicsState,
 } from './topics.mjs';
 
@@ -24,22 +24,31 @@ export function spawnTopicsWorker(brain) {
   const tp = transcriptPath(brain);
   if (!existsSync(tp)) return false;
 
-  const prompts = readAllUserPrompts(tp);
+  const { prompts, lastUserStep } = readUserPromptsWithSteps(tp);
   if (!prompts.length) return false;
 
   const tFile = topicsPath(brain);
   const prev = readTopicsState(tFile);
-  if (prev && prev.at >= prompts.length) return false;
-  if (isTopicsRunning(prev) && (prev.targetAt ?? 0) >= prompts.length) return false;
+  if (prev && prev.at >= prompts.length && (lastUserStep < 0 || prev.askUserStep >= lastUserStep)) return false;
+  if (
+    isTopicsRunning(prev) &&
+    (prev.targetAt ?? 0) >= prompts.length &&
+    (lastUserStep < 0 || (prev.targetUserStep ?? -1) >= lastUserStep)
+  ) {
+    return false;
+  }
 
   try {
     writeTopicsState(tFile, {
       at: prev?.at ?? 0,
       summary: prev?.summary ?? '',
       topics: prev?.topics ?? [],
+      ask: prev?.ask ?? '',
+      askUserStep: prev?.askUserStep ?? -1,
       running: true,
       failed: false,
       targetAt: prompts.length,
+      targetUserStep: lastUserStep,
       startedAtMs: Date.now(),
       updatedAt: new Date().toISOString(),
     });
@@ -63,9 +72,12 @@ export function spawnTopicsWorker(brain) {
         at: prev?.at ?? 0,
         summary: prev?.summary ?? '',
         topics: prev?.topics ?? [],
+        ask: prev?.ask ?? '',
+        askUserStep: prev?.askUserStep ?? -1,
         running: false,
         failed: true,
         targetAt: 0,
+        targetUserStep: -1,
         startedAtMs: 0,
         updatedAt: new Date().toISOString(),
       });
@@ -83,16 +95,21 @@ export function runTopicsWorker(brain, { preMarked = false } = {}) {
   const tFile = topicsPath(brain);
   if (!existsSync(tp)) return { ok: false, skipped: true };
 
-  const prompts = readAllUserPrompts(tp);
+  const { prompts, lastUserStep } = readUserPromptsWithSteps(tp);
   const prev = readTopicsState(tFile);
   if (!prompts.length) return { ok: false, skipped: true };
-  if (prev && prev.at >= prompts.length) {
+  if (prev && prev.at >= prompts.length && (lastUserStep < 0 || prev.askUserStep >= lastUserStep)) {
     if (prev.running) {
-      writeTopicsState(tFile, { ...prev, running: false, startedAtMs: 0, targetAt: 0 });
+      writeTopicsState(tFile, { ...prev, running: false, startedAtMs: 0, targetAt: 0, targetUserStep: -1 });
     }
     return { ok: true, skipped: true };
   }
-  if (!preMarked && isTopicsRunning(prev) && (prev.targetAt ?? 0) >= prompts.length) {
+  if (
+    !preMarked &&
+    isTopicsRunning(prev) &&
+    (prev.targetAt ?? 0) >= prompts.length &&
+    (lastUserStep < 0 || (prev.targetUserStep ?? -1) >= lastUserStep)
+  ) {
     return { ok: true, skipped: true };
   }
 
@@ -104,9 +121,12 @@ export function runTopicsWorker(brain, { preMarked = false } = {}) {
       at: prev?.at ?? 0,
       summary: prev?.summary ?? '',
       topics: prev?.topics ?? [],
+      ask: prev?.ask ?? '',
+      askUserStep: prev?.askUserStep ?? -1,
       running: true,
       failed: false,
       targetAt: prompts.length,
+      targetUserStep: lastUserStep,
       startedAtMs: Date.now(),
       updatedAt: new Date().toISOString(),
     });
@@ -114,7 +134,7 @@ export function runTopicsWorker(brain, { preMarked = false } = {}) {
 
   const res = runEphemeralAgyPrompt({
     prompt: built.prompt,
-    guard: 'Do NOT call any tools, read files, or run commands. Reply only with the requested session "> " line and "- " topic lines.',
+    guard: 'Do NOT call any tools, read files, or run commands. Reply only with the requested "> " session line, "= " newest-ask line, and "- " topic lines.',
     model: process.env.AGY_MARGIN_TOPICS_MODEL || DEFAULT_MODEL,
     logPrefix: 'agy-margin-topics',
     timeoutSec: 45,
@@ -125,19 +145,23 @@ export function runTopicsWorker(brain, { preMarked = false } = {}) {
       at: prev?.at ?? 0,
       summary: prev?.summary ?? '',
       topics: prev?.topics ?? [],
+      ask: prev?.ask ?? '',
+      askUserStep: prev?.askUserStep ?? -1,
       running: false,
       failed: true,
       targetAt: 0,
+      targetUserStep: -1,
       startedAtMs: 0,
       updatedAt: new Date().toISOString(),
     });
     return { ok: false, error: 'agy_not_found' };
   }
 
-  const applied = applyTopicsReply(prev, res.rawText, prompts.length, built.mode);
+  const applied = applyTopicsReply(prev, res.rawText, prompts.length, built.mode, undefined, lastUserStep);
   writeTopicsState(tFile, {
     ...applied.state,
     targetAt: 0,
+    targetUserStep: -1,
     startedAtMs: 0,
   });
   return { ok: applied.ok };

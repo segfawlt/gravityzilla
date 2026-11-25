@@ -16,7 +16,7 @@ date: 2026-11-19
 
 ## Symptoms
 
-- `find ~/Projects/gravityzilla/docs -maxdepth 3 2>/dev/null` triggered `<compound-check>` Stop bounces on read-only turns.
+- `find <repo>/docs -maxdepth 3 2>/dev/null` triggered `<compound-check>` Stop bounces on read-only turns.
 - `sed -i 's/a/b/' config/GEMINI.md` returned `False` in `is_mutating_command()`.
 - `git diff` rejected `--no-optional-locks` as an unknown subcommand flag, whereas `git status --no-optional-locks` silently accepted it.
 

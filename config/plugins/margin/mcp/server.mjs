@@ -30,16 +30,15 @@ export function appHtml({ sidecar = false } = {}) {
     .replace('/*APP_JS*/', () => read('app.js'));
 }
 
-const DESCRIPTION = `Pinned Overview panel beside chat. Silent bookkeeping: never mention this tool or panel in replies; write wants, take, and steps in user's language.
-Clean-caveman style: write wants, take.why, and steps as ultra-terse telegraphic plain words — drop articles (a/an/the), copulas (is/are), and filler while keeping negations exact and words readable (never mangled caveman like "me fix"). Avoid code symbols, internal filenames, camelCase names, hashes, acronyms, and backticks unless asked.
+const DESCRIPTION = `Pinned Overview panel beside chat. Silent bookkeeping: never mention this tool or panel in replies; write wants and take in user's language.
+Clean-caveman style: write wants and take.why as ultra-terse telegraphic plain words — drop articles (a/an/the), copulas (is/are), and filler while keeping negations exact and words readable (never mangled caveman like "me fix"). Avoid code symbols, internal filenames, camelCase names, hashes, acronyms, and backticks unless asked.
 Rules:
-1. Call FIRST every turn answering a user prompt (including Plan Mode), before any other tool call, with conversation_id (from .../brain/<conversation_id>/), wants (3-8w telegraphic core goal, <=60ch, no file lists/symbols/sub-details unless asked), take, and steps (when 2+ real steps).
+1. Call FIRST on every new user message (including Plan Mode and short/queued follow-ups), before or alongside your first read/search batch (never skip a follow-up or wait until after scouting), with conversation_id (from .../brain/<conversation_id>/), wants (3-8w telegraphic core goal, <=60ch, everyday words, no file lists/symbols/sub-details unless asked), and take.
 2. take = reaction BEFORE work; never the answer. On work asks: stance on doing as asked. On questions with no work: certainty + source to check or premise doubted; never expected answer, even when in context — name source only (Bad: "plausible: wording invites mini-answer". Good: "check rule: read take rule").
    - stance: fine = do as asked; concern = real risk or better way; against = ask user first (irreversible, skips safeguard/review/CI/backup/confirm, or breaks rule — pick against over concern whenever true); unsure = cannot judge yet.
    - label: required, 1-2 words, <=14 chars (max 16). Question asks (no work): verb + target ("check labels", "read session", "count names"). Examples — fine: "clear", "small fix"; concern: "risky", "overkill", "check first"; against: "breaks rule", "data loss"; unsure: "needs repro", "unclear goal". Bad: "naming q", "design q", "answer", "question". No mood words.
    - why: optional 2-5w telegraphic fragment, <=40ch (good: "needs app patch", "check margin + memory code"; bad: "requires dist/preload.js hook in app.asar"; omit on fine when label suffices). With unsure, name source to check (file, command, session), never a finding.
-3. Add steps (2-8 items, 2-5w verb+noun <=40ch, everyday words, no raw paths/symbols) when turn has 2+ real steps, with now: 1 active. List exact role/description in step.agents when spawning subagents/swarm workers and keep across redrafts.
-4. Start of each next step: ping {conversation_id, now: n} (1-based index), ONLY then. Re-send wants/take/steps only when reading or steps change. Never call alone to mark last step done: your answer closes it.`;
+3. Margin reads Plan steps automatically from Antigravity's native update_steps tool — do not duplicate steps or send per-step pings (optional steps/now remain only as fallback for non-update_steps harnesses). Always send a fresh take on every new user message; within the same turn, only re-call if wants or take changes, and never call alone at turn end.`;
 
 const TOOL = {
   name: 'margin_intent',

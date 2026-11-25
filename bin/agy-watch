@@ -1394,10 +1394,13 @@ def _is_subagent_turn(cid: str, sess: dict[str, Any], payload: dict[str, Any], u
 
 
 def _is_margin_enabled() -> bool:
-    """Return True when the Margin plugin is enabled in Antigravity config."""
+    """Return True when the Margin plugin is installed and enabled in Antigravity config."""
     forced = os.environ.get("AGY_WATCHDOG_MARGIN_ENABLED")
     if forced is not None:
         return forced == "1"
+    plugin_dir = Path.home() / ".gemini" / "config" / "plugins" / "margin"
+    if not plugin_dir.exists():
+        return False
     cfg_path = Path.home() / ".gemini" / "config" / "config.json"
     if cfg_path.is_file():
         with contextlib.suppress(Exception):
@@ -1407,10 +1410,7 @@ def _is_margin_enabled() -> bool:
                 entry = plugins.get("margin")
                 if isinstance(entry, dict) and "enabled" in entry:
                     return bool(entry["enabled"])
-    return any(
-        (Path.home() / ".gemini" / prod / "mcp" / "margin_margin").is_dir()
-        for prod in ("antigravity", "antigravity-cli", "antigravity-ide")
-    )
+    return True
 
 
 def _resolve_brain_dir(cid: str, payload: dict[str, Any] | None = None) -> Path | None:
@@ -1495,36 +1495,107 @@ def _spawn_margin_outcome(brain: Path | None) -> None:
         )
 
 
-def _intent_updated_since(brain: Path | None, since_epoch: float) -> bool:
-    """Return True when `intent.json` was written at or after `since_epoch`."""
-    if not brain or since_epoch <= 0.0:
-        return False
+def _transcript_explicit_user_steps(
+    brain: Path | None,
+    cid: str = "",
+    payload: dict[str, Any] | None = None,
+) -> tuple[int | None, int | None]:
+    """Return `(last_user_step, prev_user_step)` across `USER_EXPLICIT` rows in transcript.jsonl."""
+    tpath: Path | None = None
+    if brain:
+        for fname in ("transcript.jsonl", "transcript_full.jsonl"):
+            cand = brain / ".system_generated" / "logs" / fname
+            if cand.is_file():
+                tpath = cand
+                break
+    if tpath is None and cid:
+        tpath = resolve_transcript_path(cid, payload)
+    if tpath is None or not tpath.is_file():
+        return None, None
+    last_step: int | None = None
+    prev_step: int | None = None
+    with contextlib.suppress(Exception):
+        with tpath.open("r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if "USER_INPUT" not in line:
+                    continue
+                s = line.strip()
+                if not s:
+                    continue
+                try:
+                    entry = json.loads(s)
+                except Exception:
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                if entry.get("type") != "USER_INPUT" or entry.get("source") != "USER_EXPLICIT":
+                    continue
+                step_idx = entry.get("step_index")
+                if isinstance(step_idx, int) and not isinstance(step_idx, bool):
+                    prev_step = last_step
+                    last_step = step_idx
+    return last_step, prev_step
+
+
+def _read_margin_intent(brain: Path | None) -> tuple[dict[str, Any] | None, Path | None]:
+    if not brain:
+        return None, None
     ip = brain / ".system_generated" / "margin" / "intent.json"
     if not ip.is_file():
-        return False
+        return None, ip
     try:
         data = json.loads(ip.read_text(encoding="utf-8"))
     except Exception:
+        return None, ip
+    return (data if isinstance(data, dict) else None), ip
+
+
+def _has_valid_take(data: dict[str, Any]) -> bool:
+    take = data.get("take")
+    if not isinstance(take, dict):
         return False
-    if not isinstance(data, dict):
+    if take.get("stance") not in {"fine", "concern", "against", "unsure"}:
+        return False
+    return bool(str(take.get("label") or "").strip())
+
+
+def _intent_has_fresh_take(brain: Path | None, user_step: int | None, since_epoch: float) -> bool:
+    """Return True when `intent.json` carries a valid `take` for the current turn."""
+    data, ip = _read_margin_intent(brain)
+    if not data or not _has_valid_take(data):
+        return False
+    intent_step = data.get("userStep")
+    if user_step is not None and isinstance(intent_step, int) and not isinstance(intent_step, bool):
+        return intent_step == user_step
+    if since_epoch <= 0.0:
         return False
     upd = _parse_iso_epoch(data.get("updatedAt"))
     if upd > 0.0:
         return upd >= since_epoch - 2.0
-    with contextlib.suppress(OSError):
-        return ip.stat().st_mtime >= since_epoch - 2.0
+    if ip is not None:
+        with contextlib.suppress(OSError):
+            return ip.stat().st_mtime >= since_epoch - 2.0
     return False
 
 
 def _prev_turn_missed_margin(
     brain: Path | None,
+    prev_user_step: int | None,
     prev_turn_started: float,
     prev_had_user_in: bool,
 ) -> bool:
-    """Detect whether an immediately preceding turn never reported to `margin_intent`."""
+    """Detect whether an immediately preceding turn never reported a valid `take` to `margin_intent`."""
+    if prev_user_step is not None:
+        data, _ = _read_margin_intent(brain)
+        if not data or not _has_valid_take(data):
+            return True
+        intent_step = data.get("userStep")
+        if isinstance(intent_step, int) and not isinstance(intent_step, bool):
+            return intent_step < prev_user_step
+        return True
     if not prev_had_user_in or prev_turn_started <= 0.0:
         return False
-    return not _intent_updated_since(brain, prev_turn_started)
+    return not _intent_has_fresh_take(brain, None, prev_turn_started)
 
 
 def cmd_pre_invocation_hook(_args: argparse.Namespace) -> int:
@@ -1558,17 +1629,33 @@ def cmd_pre_invocation_hook(_args: argparse.Namespace) -> int:
             proj = str(sess.get("project") or "")
 
             t_turn_steps, t_total_steps, t_prompt_epoch = inspect_transcript_turn(cid, payload)
+            is_sub = _is_subagent_turn(cid, sess, payload, user_in)
+            margin_on = not is_sub and _is_margin_enabled()
+            margin_brain = _resolve_brain_dir(cid, payload) if margin_on else None
+            cur_user_step, prev_tx_user_step = (
+                _transcript_explicit_user_steps(margin_brain, cid, payload) if margin_on else (None, None)
+            )
+
             prev_turn_started = float(sess.get("turn_started_epoch") or 0.0)
             prev_had_user_in = bool(sess.get("last_user_input"))
-            is_new_user_turn = bool(user_in and user_in != sess.get("last_user_input"))
+            raw_prev_step = sess.get("last_user_step")
+            prev_recorded_step = (
+                raw_prev_step if isinstance(raw_prev_step, int) and not isinstance(raw_prev_step, bool) else None
+            )
+            step_changed = cur_user_step is not None and cur_user_step != prev_recorded_step
+            is_new_user_turn = bool((user_in and user_in != sess.get("last_user_input")) or step_changed)
             if is_new_user_turn:
-                sess["last_user_input"] = user_in
+                if user_in:
+                    sess["last_user_input"] = user_in
+                if cur_user_step is not None:
+                    sess["last_user_step"] = cur_user_step
                 sess["turn_tool_count"] = 0
                 sess["turn_step_count"] = max(1, t_turn_steps + 1)
                 sess["total_steps"] = max(int(sess.get("total_steps") or 0) + 1, t_total_steps + 1)
                 sess["turn_started_epoch"] = now
                 sess["warned_step_45"] = False
                 sess["margin_step2_nudged"] = False
+                sess["margin_missing_nudges"] = 0
                 sess["recent_calls"] = []
                 sess["file_hashes"] = {}
                 sess["stop_bounced_tasks"] = []
@@ -1582,29 +1669,33 @@ def cmd_pre_invocation_hook(_args: argparse.Namespace) -> int:
                 _clear_sync_stall_alert(sess)
                 sync_transcript_errors(sess, cid, payload, advance_only=False)
 
-            is_sub = _is_subagent_turn(cid, sess, payload, user_in)
-            margin_on = not is_sub and _is_margin_enabled()
-            margin_brain = _resolve_brain_dir(cid, payload) if margin_on else None
             if is_new_user_turn and margin_on:
                 _spawn_margin_topics(margin_brain)
             if margin_on and os.environ.get("AGY_WATCHDOG_NO_MARGIN_NUDGE") != "1":
                 if is_new_user_turn:
-                    if _prev_turn_missed_margin(margin_brain, prev_turn_started, prev_had_user_in):
-                        inject_msgs.append(
-                            f"Margin missed last turn: call `call_mcp_tool` (`margin_margin` / `margin_intent`) with `conversation_id: \"{cid}\"`, `wants` (terse wants <=60ch), `take` (pre-work stance, never answer), `steps` (short steps <=40ch), and `now: 1` FIRST (including Plan Mode)."
-                        )
-                    else:
-                        inject_msgs.append(
-                            f"Margin Overview (Step 1): call `call_mcp_tool` (`margin_margin` / `margin_intent`) with `conversation_id: \"{cid}\"`, `wants` (terse wants <=60ch), `take` (pre-work stance, never answer), `steps` (short steps <=40ch), and `now: 1` FIRST before other tools (Plan Mode ok; schema in rules)."
-                        )
+                    already_fresh = cur_user_step is not None and _intent_has_fresh_take(
+                        margin_brain, cur_user_step, 0.0
+                    )
+                    if not already_fresh:
+                        eff_prev_step = prev_tx_user_step if prev_tx_user_step is not None else prev_recorded_step
+                        if _prev_turn_missed_margin(margin_brain, eff_prev_step, prev_turn_started, prev_had_user_in):
+                            inject_msgs.append(
+                                f"Margin missed last turn: call `call_mcp_tool` (`margin_margin` / `margin_intent`) with `conversation_id: \"{cid}\"`, `wants` (terse wants <=60ch), and `take` (pre-work stance, never answer) FIRST (including Plan Mode)."
+                            )
+                        else:
+                            inject_msgs.append(
+                                f"Margin Overview (Step 1): call `call_mcp_tool` (`margin_margin` / `margin_intent`) with `conversation_id: \"{cid}\"`, `wants` (terse wants <=60ch), and `take` (pre-work stance, never answer) FIRST before other tools (Plan Mode ok; schema in rules)."
+                            )
                 elif (
-                    int(sess.get("turn_step_count") or 0) == 2
-                    and not sess.get("margin_step2_nudged")
-                    and not _intent_updated_since(margin_brain, float(sess.get("turn_started_epoch") or 0.0))
+                    not _intent_has_fresh_take(
+                        margin_brain, cur_user_step, float(sess.get("turn_started_epoch") or 0.0)
+                    )
+                    and int(sess.get("margin_missing_nudges") or 0) < 2
                 ):
+                    sess["margin_missing_nudges"] = int(sess.get("margin_missing_nudges") or 0) + 1
                     sess["margin_step2_nudged"] = True
                     inject_msgs.append(
-                        f"Margin Overview missing: call `call_mcp_tool` (`margin_margin` / `margin_intent`) with `conversation_id: \"{cid}\"`, `wants` (terse wants <=60ch), `take`, `steps` (short steps <=40ch), `now: 1` now."
+                        f"Margin Overview missing: call `call_mcp_tool` (`margin_margin` / `margin_intent`) with `conversation_id: \"{cid}\"`, `wants` (terse wants <=60ch), and `take` now."
                     )
 
             sess["inflight_tools"] = {}

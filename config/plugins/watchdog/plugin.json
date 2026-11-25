@@ -5,8 +5,8 @@
   "description": "Deterministic step timestamping, zero-token retry/error loop circuit-breaker, and silent stdin/hang recovery.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
-    "agy-watch status",
-    "agy-watch logs",
-    "agy-watch events"
+    "~/.local/bin/agy-watch status",
+    "~/.local/bin/agy-watch logs",
+    "~/.local/bin/agy-watch events"
   ]
 }

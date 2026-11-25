@@ -1,9 +1,12 @@
 // Read-only session memory extraction/capture reader (memory.db, audit.jsonl, transcript) and safe doc viewer.
 import { closeSync, existsSync, openSync, readdirSync, readFileSync, readSync, realpathSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, dirname, join, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { classifyPath, parseMemoryShellCommand, pathArg, toolCalls, unquote } from './transcript.mjs';
 export { parseMemoryShellCommand };
+
+const isAbsPath = (p) => typeof p === 'string' && (isAbsolute(p) || /^[A-Za-z]:[\\/]/.test(p));
+const toPosix = (p) => String(p ?? '').replace(/\\/g, '/');
 
 let DatabaseSync = null;
 try {
@@ -280,12 +283,12 @@ export function readCompoundCaptures(conv, compoundDir, currentUserStep = -1) {
     const action = r.outcome === 'UPDATED' ? 'updated' : 'captured';
     const files = filterLearningFiles(r.files);
     for (const rawFile of files) {
-      const absPath = rawFile.startsWith('/') ? resolve(rawFile) : (r.cwd ? resolve(String(r.cwd), rawFile) : rawFile);
-      const hasFile = absPath.startsWith('/') && existsSync(absPath);
+      const absPath = isAbsPath(rawFile) ? resolve(rawFile) : (r.cwd ? resolve(String(r.cwd), rawFile) : rawFile);
+      const hasFile = isAbsPath(absPath) && existsSync(absPath);
       const excerpt = hasFile ? readMarkdownExcerpt(absPath) : '';
       items.push({
         name: absPath,
-        filePath: absPath.startsWith('/') ? absPath : '',
+        filePath: isAbsPath(absPath) ? absPath : '',
         short: basename(rawFile).replace(/\.(md|txt|json)$/i, '') || rawFile,
         summary: excerpt || clamp(r.summary || '', 140),
         action,
@@ -303,10 +306,10 @@ export function readCompoundCaptures(conv, compoundDir, currentUserStep = -1) {
 function dedupeSavedEntries(entriesByPriority) {
   const byKey = new Map();
   const findSuffixMatch = (relPath) => {
-    if (!relPath || relPath.startsWith('/')) return '';
-    const suffix = `/${relPath.replace(/^\.\//, '')}`;
+    if (!relPath || isAbsPath(relPath)) return '';
+    const suffix = `/${toPosix(relPath).replace(/^\.\//, '')}`;
     for (const k of byKey.keys()) {
-      if (k.startsWith('path:') && k.endsWith(suffix)) return k;
+      if (k.startsWith('path:') && toPosix(k).endsWith(suffix)) return k;
     }
     return '';
   };
@@ -383,12 +386,12 @@ export function collectSessionSavedMemories({
         const p = pathArg(c);
         const cls = classifyPath(p);
         if (cls?.kind === 'memory' || cls?.kind === 'learnings') {
-          const abs = p.startsWith('/') ? resolve(p) : p;
+          const abs = isAbsPath(p) ? resolve(p) : p;
           const entry = {
             name: abs,
-            filePath: abs.startsWith('/') ? abs : '',
+            filePath: isAbsPath(abs) ? abs : '',
             short: cls.short,
-            summary: abs.startsWith('/') ? readMarkdownExcerpt(abs) : '',
+            summary: isAbsPath(abs) ? readMarkdownExcerpt(abs) : '',
             action: CREATE_TOOLS.has(tname) ? 'captured' : 'updated',
             group: 'saved',
             source: tname,
@@ -407,7 +410,7 @@ export function collectSessionSavedMemories({
           if (u.kind === 'memory' && u.action === 'remembered') {
             let memFile = '';
             if (u.cwd && memoriesDir) {
-              const normCwd = u.cwd.startsWith('/') ? resolve(u.cwd) : u.cwd;
+              const normCwd = isAbsPath(u.cwd) ? resolve(u.cwd) : u.cwd;
               const cand = join(memoriesDir, cwdToSlug(normCwd), 'MEMORY.md');
               if (existsSync(cand)) memFile = resolve(cand);
             }
@@ -429,9 +432,9 @@ export function collectSessionSavedMemories({
             const abs = u.filePath ? resolve(u.filePath) : (cwd ? resolve(cwd, u.name) : u.name);
             txRecords.push({
               name: abs,
-              filePath: abs.startsWith('/') && existsSync(abs) ? abs : '',
+              filePath: isAbsPath(abs) && existsSync(abs) ? abs : '',
               short: u.short,
-              summary: (abs.startsWith('/') ? readMarkdownExcerpt(abs) : '') || u.summary,
+              summary: (isAbsPath(abs) ? readMarkdownExcerpt(abs) : '') || u.summary,
               action: u.action,
               group: 'saved',
               source: 'agy-compound',
@@ -477,9 +480,10 @@ function escapeRe(s) {
 /** Strict read-only allowlist check for memory & learnings markdown/text files. */
 export function isAllowedMemoryPath(rawPath, { home = homedir(), memoriesDir = '' } = {}) {
   if (typeof rawPath !== 'string' || !rawPath.trim() || rawPath.includes('\0')) return null;
-  if (!rawPath.startsWith('/')) return null;
-  if (BLOCKED_PATH_RE.test(rawPath) || BLOCKED_FILE_RE.test(basename(rawPath))) return null;
-  if (!/\.(?:md|txt)$/i.test(rawPath)) return null;
+  if (!isAbsPath(rawPath)) return null;
+  const posixRaw = toPosix(rawPath);
+  if (BLOCKED_PATH_RE.test(posixRaw) || BLOCKED_FILE_RE.test(basename(posixRaw))) return null;
+  if (!/\.(?:md|txt)$/i.test(posixRaw)) return null;
 
   let realFile;
   try {
@@ -490,8 +494,9 @@ export function isAllowedMemoryPath(rawPath, { home = homedir(), memoriesDir = '
     return null;
   }
 
-  if (BLOCKED_PATH_RE.test(realFile) || BLOCKED_FILE_RE.test(basename(realFile))) return null;
-  if (!/\.(?:md|txt)$/i.test(realFile)) return null;
+  const posixReal = toPosix(realFile);
+  if (BLOCKED_PATH_RE.test(posixReal) || BLOCKED_FILE_RE.test(basename(posixReal))) return null;
+  if (!/\.(?:md|txt)$/i.test(posixReal)) return null;
 
   const effMem = memoriesDir || join(home, '.agents', 'memories');
   let realMem = '';
@@ -499,10 +504,16 @@ export function isAllowedMemoryPath(rawPath, { home = homedir(), memoriesDir = '
   let realHome = '';
   try { realHome = realpathSync(home); } catch { realHome = resolve(home); }
 
-  if (realFile.startsWith(`${realMem}/`)) return realFile;
-  if (new RegExp(`^${escapeRe(realHome)}/\\.claude/projects/[^/]+/memory/`).test(realFile)) return realFile;
-  if (realFile.includes('/docs/learnings/')) return realFile;
-  if (basename(realFile).toUpperCase() === 'MEMORY.MD') return realFile;
+  const posixMem = toPosix(realMem);
+  const posixHome = toPosix(realHome);
+  const cmp = process.platform === 'win32'
+    ? (a, b) => a.toLowerCase().startsWith(b.toLowerCase())
+    : (a, b) => a.startsWith(b);
+
+  if (cmp(posixReal, `${posixMem}/`)) return realFile;
+  if (new RegExp(`^${escapeRe(posixHome)}/\\.claude/projects/[^/]+/memory/`, process.platform === 'win32' ? 'i' : '').test(posixReal)) return realFile;
+  if (posixReal.toLowerCase().includes('/docs/learnings/')) return realFile;
+  if (basename(posixReal).toUpperCase() === 'MEMORY.MD') return realFile;
   return null;
 }
 
@@ -589,7 +600,7 @@ export function renderMemoryViewHtml(rawPath, opts = {}) {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>${escHtml(doc.title)} — ${doc.path.includes('/docs/learnings/') ? 'Learning' : 'Memory'}</title>
+<title>${escHtml(doc.title)} — ${toPosix(doc.path).includes('/docs/learnings/') ? 'Learning' : 'Memory'}</title>
 <style>
   :root { color-scheme: light dark; --bg:#f8f9fa; --surface:#fff; --fg:#1f1f1f; --muted:#5f6368; --line:rgba(0,0,0,.1); --code-bg:rgba(0,0,0,.045); }
   @media (prefers-color-scheme: dark) { :root { --bg:#16181c; --surface:#1e2126; --fg:#e8eaed; --muted:#9aa0a6; --line:rgba(255,255,255,.1); --code-bg:rgba(255,255,255,.06); } }

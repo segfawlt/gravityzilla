@@ -1,6 +1,8 @@
 // Deterministic facts about a conversation, derived from transcript.jsonl.
 import { closeSync, existsSync, openSync, readFileSync, readSync, statSync } from 'node:fs';
-import { basename, join } from 'node:path';
+import { basename, isAbsolute, join } from 'node:path';
+
+const isAbsPath = (p) => typeof p === 'string' && (isAbsolute(p) || /^[A-Za-z]:[\\/]/.test(p));
 
 export const IDLE_MS = 5 * 60 * 1000;
 const TAIL_BYTES = 8 * 1024 * 1024;
@@ -25,7 +27,7 @@ export function unquote(v) {
 
 export function isMarginToolCall(name, args) {
   const n = String(name ?? '');
-  if (/^margin/.test(n) || /margin_(intent|overview)/.test(n) || n === 'swarm_wait' || n === 'read_board' || n === 'post_message') return true;
+  if (/^margin/.test(n) || /margin_(intent|overview)/.test(n) || n === 'swarm_wait' || n === 'read_board' || n === 'post_message' || n === 'update_steps' || n === 'update_focus') return true;
   if (n === 'call_mcp_tool' && args && typeof args === 'object') {
     const srv = String(unquote(args.ServerName ?? '') || '');
     const tl = String(unquote(args.ToolName ?? '') || '');
@@ -104,19 +106,20 @@ export const pathArg = (c) => {
 export function classifyPath(rawPath) {
   const p = String(rawPath ?? '').trim();
   if (!p) return null;
-  if (/(?:^|\/)SKILL\.md$/i.test(p)) {
-    const m = /\/([^/]+)\/SKILL\.md$/i.exec(p);
+  const norm = p.replace(/\\/g, '/');
+  if (/(?:^|\/)SKILL\.md$/i.test(norm)) {
+    const m = /\/([^/]+)\/SKILL\.md$/i.exec(norm);
     return { kind: 'skills', name: p, short: m ? m[1] : 'SKILL.md' };
   }
-  if (/(?:^|\/)docs\/learnings(?:\/|$)/i.test(p)) {
-    const b = basename(p);
+  if (/(?:^|\/)docs\/learnings(?:\/|$)/i.test(norm)) {
+    const b = basename(norm);
     return { kind: 'learnings', name: p, short: b.replace(/\.(md|txt|json)$/i, '') || b };
   }
-  if (/\/\.agents\/memories(?:\/|$)|\/\.claude\/projects\/[^/]+\/memory\/|(?:^|\/)MEMORY\.md$/i.test(p)) {
-    const b = basename(p);
+  if (/\/\.agents\/memories(?:\/|$)|\/\.claude\/projects\/[^/]+\/memory\/|(?:^|\/)MEMORY\.md$/i.test(norm)) {
+    const b = basename(norm);
     return { kind: 'memory', name: p, short: b.replace(/\.(md|txt|json)$/i, '') || b };
   }
-  return { kind: 'files', name: p, short: basename(p) || p };
+  return { kind: 'files', name: p, short: basename(norm) || p };
 }
 
 const BASH_READ_HEAD = /^\s*(?:(?:\w+=\S*|rtk|env)\s+)*(?:\S*\/)?(git\s+grep|grep|rg|find|fd|ag|ack|cat|head|tail|ls)(?:\s+|$)/;
@@ -300,7 +303,7 @@ export function parseMemoryShellCommand(cmd, home = '') {
     const args = rawTokens.slice(idx + 1);
     if (bin === 'cd' && args[0] && !args[0].startsWith('-')) {
       const target = expandHomePath(args[0], home);
-      shellCwd = target.startsWith('/') ? target : (shellCwd ? join(shellCwd, target) : target);
+      shellCwd = isAbsPath(target) ? target : (shellCwd ? join(shellCwd, target) : target);
       continue;
     }
     if (!args.length) continue;
@@ -386,7 +389,7 @@ export function parseMemoryShellCommand(cmd, home = '') {
           summary: clampShort(summary, 140),
           action: updated ? 'updated' : 'captured',
           group: 'saved',
-          filePath: f.startsWith('/') ? f : '',
+          filePath: isAbsPath(f) ? f : '',
           cwd,
           source: 'agy-compound',
         });
@@ -743,9 +746,54 @@ export function summarizeSubagent(rows, subagentState = '', now = Date.now()) {
  *   lastStepAt:string|null, used:Record<string,number>, files:string[], steps:number,
  *   turnSteps:number, turnTools:number, prevTurnDone:boolean, turnRows:object[]}}
  */
+function mapNativeStepStatus(raw) {
+  const s = String(raw ?? '').trim().toLowerCase();
+  if (s === 'done' || s === 'completed') return 'completed';
+  if (s === 'in_progress') return 'in_progress';
+  if (s === 'skipped') return 'skipped';
+  if (s === 'failed') return 'failed';
+  return 'pending';
+}
+
+/** Extract the latest non-empty native `update_steps` list from transcript rows. */
+export function extractNativeSteps(rows) {
+  if (!Array.isArray(rows) || !rows.length) return [];
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const calls = toolCalls(rows[i]);
+    for (let j = calls.length - 1; j >= 0; j--) {
+      const c = calls[j];
+      if (c?.name !== 'update_steps') continue;
+      const raw = unquote(c?.args?.steps);
+      if (!Array.isArray(raw)) continue;
+      const out = [];
+      for (const item of raw) {
+        if (out.length >= 20) break;
+        if (!item || typeof item !== 'object') continue;
+        const text = clampShort(item.title ?? item.text, 100);
+        if (!text) continue;
+        out.push({ text, status: mapNativeStepStatus(item.status), agents: [] });
+      }
+      if (out.length) return out;
+    }
+  }
+  return [];
+}
+
+/** Resolve turn steps preferring native `update_steps` over `intent.json` steps. */
+export function resolveTurnSteps(turnRows, intent = null) {
+  const nativeSteps = extractNativeSteps(turnRows);
+  if (nativeSteps.length) return nativeSteps;
+  return Array.isArray(intent?.steps) ? intent.steps : [];
+}
+
 export function summarize(rows, now = Date.now()) {
   let lastUser = -1;
   rows.forEach((r, i) => { if (r.type === 'USER_INPUT' && r.source === 'USER_EXPLICIT') lastUser = i; });
+  let prevUser = -1;
+  for (let i = 0; i < lastUser; i++) {
+    if (rows[i].type === 'USER_INPUT' && rows[i].source === 'USER_EXPLICIT') prevUser = i;
+  }
+  const prevTurnRows = lastUser > 0 ? rows.slice(prevUser + 1, lastUser) : [];
   const turn = rows.slice(lastUser + 1);
   const used = {};
   const files = [];
@@ -800,6 +848,7 @@ export function summarize(rows, now = Date.now()) {
     turnSteps,
     turnTools,
     prevTurnDone,
+    prevTurnRows,
     turnRows: turn,
   };
 }

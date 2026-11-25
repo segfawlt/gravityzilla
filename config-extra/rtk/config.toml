@@ -37,7 +37,7 @@ enabled = false
 consent_given = false
 
 [hooks]
-exclude_commands = []
+exclude_commands = ["claude", "opencode"]
 transparent_prefixes = []
 suppress_hook_warning = false
 

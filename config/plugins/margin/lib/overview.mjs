@@ -2,7 +2,7 @@
 import { createHash } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, dirname, join, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { appDataDirs, brainDirOf, ID_RE, intentPath, outcomePath, topicsPath, transcriptPath } from './paths.mjs';
 import { enrichTake, readIntent } from './intent.mjs';
 import { collectSessionSavedMemories, memoryStoreDirs, readMarkdownExcerpt } from './memory.mjs';
@@ -21,8 +21,10 @@ import {
   collectUsed,
   computeContext,
   detectModel,
+  extractNativeSteps,
   readHeadText,
   readRows,
+  resolveTurnSteps,
   summarize,
   summarizeSubagent,
   toolCalls,
@@ -510,6 +512,10 @@ export function buildOverview(brain, now = Date.now(), { triggerTopics = false, 
   const waitingAgents = activeSpawns.length;
 
   const fresh = stored && stored.userStep === facts.userStep ? stored : null;
+  const workerAsk =
+    topicsState && topicsState.askUserStep === facts.userStep && topicsState.ask
+      ? topicsState.ask
+      : '';
 
   let status = facts.status;
   if (waitingAgents > 0) {
@@ -544,25 +550,24 @@ export function buildOverview(brain, now = Date.now(), { triggerTopics = false, 
   }
 
   // Hang subagents/swarm workers under steps before auto-completing only when turn didn't pause for input/blockers
-  const rawSteps = fresh?.steps ?? [];
+  const rawSteps = resolveTurnSteps(facts.turnRows, fresh);
   const hungSteps = hang(rawSteps, spawns);
   const shouldAutoComplete = status === 'done' && outcome?.kind !== 'needs_input' && outcome?.kind !== 'blocked';
   const steps = shouldAutoComplete && hungSteps.length
-    ? hungSteps.map((s) => ({ ...s, status: 'completed' }))
+    ? hungSteps.map((s) => (s.status === 'skipped' || s.status === 'failed' ? s : { ...s, status: 'completed' }))
     : hungSteps;
 
   const stepProgress = computeStepProgress(steps);
 
-  // Previous turn intent dim fallback while `status === 'planning'` and current turn hasn't reported yet
+  // Previous turn intent dim fallback while active and current turn hasn't landed a fresh Take yet
+  const prevNativeSteps = extractNativeSteps(facts.prevTurnRows);
+  const hasPrevIntent = Boolean(
+    stored && stored.userStep !== facts.userStep && (stored.wants || stored.take || stored.steps?.length),
+  );
+  const isTurnActive = status === 'planning' || status === 'working' || status === 'waiting_agents';
   let previous = null;
-  if (
-    status === 'planning' &&
-    !fresh &&
-    stored &&
-    stored.userStep !== facts.userStep &&
-    (stored.wants || stored.take || stored.steps?.length)
-  ) {
-    const prevOutcome = storedOutcome && storedOutcome.userStep === stored.userStep && storedOutcome.kind
+  if (isTurnActive && !fresh?.take && (hasPrevIntent || prevNativeSteps.length > 0)) {
+    const prevOutcome = storedOutcome && stored && storedOutcome.userStep === stored.userStep && storedOutcome.kind
       ? {
         kind: storedOutcome.kind,
         mark: OUTCOME_MARKS[storedOutcome.kind] || '✓',
@@ -580,11 +585,13 @@ export function buildOverview(brain, now = Date.now(), { triggerTopics = false, 
     const prevCleanComplete = Boolean(
       facts.prevTurnDone && prevOutcome?.kind !== 'needs_input' && prevOutcome?.kind !== 'blocked',
     );
-    const prevRawSteps = Array.isArray(stored.steps) ? stored.steps : [];
+    const prevRawSteps = prevNativeSteps.length
+      ? prevNativeSteps
+      : (Array.isArray(stored?.steps) ? stored.steps : []);
     const prevSteps = prevRawSteps.map((s, idx) => ({
       index: idx + 1,
       text: s.text,
-      status: prevCleanComplete ? 'completed' : s.status,
+      status: prevCleanComplete && s.status !== 'skipped' && s.status !== 'failed' ? 'completed' : s.status,
       agents: Array.isArray(s.agents)
         ? s.agents.map((spec) => ({
           ...plannedAgentFromSpec(spec),
@@ -593,8 +600,8 @@ export function buildOverview(brain, now = Date.now(), { triggerTopics = false, 
         : [],
     }));
     previous = {
-      wants: stored.wants || '',
-      take: stored.take ? enrichTake(stored.take) : null,
+      wants: stored?.wants || '',
+      take: stored?.take ? enrichTake(stored.take) : null,
       steps: prevSteps,
       outcome: prevOutcome,
     };
@@ -627,6 +634,9 @@ export function buildOverview(brain, now = Date.now(), { triggerTopics = false, 
     compoundDir: memStores.compoundDir,
   });
 
+  const isAbsPath = (p) => typeof p === 'string' && (isAbsolute(p) || /^[A-Za-z]:[\\/]/.test(p));
+  const toPosix = (p) => String(p ?? '').replace(/\\/g, '/');
+
   const mergeSavedCategory = (detail, savedItems, { filterLearningReadme = false } = {}) => {
     const baseDetail = detail ?? { main: 0, agents: 0, items: [] };
     const inTurnMain = baseDetail.items.filter((it) => it.reader === 'main');
@@ -636,18 +646,18 @@ export function buildOverview(brain, now = Date.now(), { triggerTopics = false, 
     const savedKeyOf = (it) => (
       it.action === 'remembered'
         ? `rem:${String(it.summary || it.name).trim().toLowerCase()}`
-        : `path:${it.filePath && it.filePath.startsWith('/') ? resolve(it.filePath) : it.name}`
+        : `path:${it.filePath && isAbsPath(it.filePath) ? resolve(it.filePath) : it.name}`
     );
     for (const s of savedItems) {
       savedByKey.set(savedKeyOf(s), { ...s });
     }
     const hasNonReadmeLearning = filterLearningReadme && [...savedByKey.values()].some(
-      (it) => it.filePath && it.filePath.includes('/docs/learnings/') && basename(it.filePath).toUpperCase() !== 'README.MD',
+      (it) => it.filePath && toPosix(it.filePath).includes('/docs/learnings/') && basename(toPosix(it.filePath)).toUpperCase() !== 'README.MD',
     );
     for (const it of inTurnMain) {
       if (it.group !== 'saved') continue;
-      const normPath = it.filePath && it.filePath.startsWith('/') ? resolve(it.filePath) : (it.filePath || it.name);
-      if (hasNonReadmeLearning && /(?:^|\/)docs\/learnings\/README\.md$/i.test(normPath)) continue;
+      const normPath = it.filePath && isAbsPath(it.filePath) ? resolve(it.filePath) : (it.filePath || it.name);
+      if (hasNonReadmeLearning && /(?:^|\/)docs\/learnings\/README\.md$/i.test(toPosix(normPath))) continue;
       const k = it.action === 'remembered'
         ? `rem:${String(it.summary || it.name).trim().toLowerCase()}`
         : `path:${normPath}`;
@@ -659,8 +669,8 @@ export function buildOverview(brain, now = Date.now(), { triggerTopics = false, 
       } else {
         savedByKey.set(k, {
           ...it,
-          filePath: normPath.startsWith('/') ? normPath : '',
-          summary: it.summary || (normPath.startsWith('/') ? readMarkdownExcerpt(normPath) : ''),
+          filePath: isAbsPath(normPath) ? normPath : '',
+          summary: it.summary || (isAbsPath(normPath) ? readMarkdownExcerpt(normPath) : ''),
           earlier: false,
         });
       }
@@ -701,13 +711,14 @@ export function buildOverview(brain, now = Date.now(), { triggerTopics = false, 
     status,
     waitingAgents,
     ask: facts.ask,
-    wants: fresh?.wants || '',
+    wants: fresh?.wants || workerAsk || '',
+    wantsSource: fresh?.wants ? 'agent' : (workerAsk ? 'worker' : ''),
     take: fresh?.take ? enrichTake(fresh.take) : null,
     steps,
     stepProgress,
     done: stepProgress.done,
     outcome,
-    reported: Boolean(fresh),
+    reported: Boolean(fresh?.take || fresh?.wants || rawSteps.length > 0),
     previous,
     context,
     watchdog,

@@ -10,18 +10,18 @@ Deterministic step timestamping, retry/error loop circuit-breaking, and silent `
 - **`Stop` (`<=20s` only on `fullyIdle: false`):** Polls active backgrounded `run_command` task logs + `/proc/<pid>/stat` CPU ticks (`4s` on interactive `stdin` prompt match, `12s` on 0-CPU/0-output) and bounces control back (`{"decision": "continue"}`) so the agent inspects `manage_task` automatically. Fast-exits immediately for active builds, `Timer:` schedules, and `IsDaemon` commands.
 - **`daemon-loop`:** Singleton self-exiting watcher (stops after 15s of full idle) monitoring `presence/<cid>.lock`, SQLite `CORTEX_STEP_STATUS_WAITING` (`9`), sync tool/model stalls (`notify-send` + `agy-statusline` badge), and surgical child-shell `SIGTERM` recovery on unambiguous late hangs.
 
-## CLI Usage
+## CLI Usage (`~/.local/bin/agy-watch`)
 
 ```bash
-agy-watch status                   # Show enabled state, thresholds, counters, active sessions
-agy-watch ps                       # Active session & subagent snapshot (-a/--all, -w/--watch, --json)
-agy-watch stream                   # Live chronological event & background task tail (--no-follow, --json)
-agy-watch on                       # Enable watchdog hooks & watcher
-agy-watch off                      # Disable watchdog (fail-open pass-through)
-agy-watch autokill on|off          # Toggle surgical child-shell kill on late bg hangs
-agy-watch logs -n 30               # Tail ~/.agents/watchdog/watchdog.log
-agy-watch events -n 30             # Tail raw ~/.agents/watchdog/events.jsonl
-agy-watch reset                    # Reset counters and session files
+~/.local/bin/agy-watch status                   # Show enabled state, thresholds, counters, active sessions
+~/.local/bin/agy-watch ps                       # Active session & subagent snapshot (-a/--all, -w/--watch, --json)
+~/.local/bin/agy-watch stream                   # Live chronological event & background task tail (--no-follow, --json)
+~/.local/bin/agy-watch on                       # Enable watchdog hooks & watcher
+~/.local/bin/agy-watch off                      # Disable watchdog (fail-open pass-through)
+~/.local/bin/agy-watch autokill on|off          # Toggle surgical child-shell kill on late bg hangs
+~/.local/bin/agy-watch logs -n 30               # Tail ~/.agents/watchdog/watchdog.log
+~/.local/bin/agy-watch events -n 30             # Tail raw ~/.agents/watchdog/events.jsonl
+~/.local/bin/agy-watch reset                    # Reset counters and session files
 ```
 
 ### Split-Screen / Sidebar Usage

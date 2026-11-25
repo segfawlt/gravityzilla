@@ -213,6 +213,11 @@ button:focus-visible, [role="button"]:focus-visible, [tabindex="0"]:focus-visibl
   opacity: 0.56;
 }
 
+.row-sec.is-stale-field {
+  opacity: 0.56;
+  transition: opacity 0.2s ease;
+}
+
 .planning-banner {
   display: flex;
   align-items: center;
@@ -419,6 +424,20 @@ button:focus-visible, [role="button"]:focus-visible, [tabindex="0"]:focus-visibl
 .step-row[data-status="in_progress"] .step-text {
   color: var(--fg);
   font-weight: 500;
+}
+
+.step-row[data-status="failed"] .step-glyph,
+.step-row[data-status="failed"] .step-text {
+  color: var(--bad);
+}
+
+.step-row[data-status="skipped"] .step-glyph {
+  color: var(--fg-faint);
+}
+
+.step-row[data-status="skipped"] .step-text {
+  color: var(--fg-faint);
+  text-decoration: line-through;
 }
 
 /* Subagent tree: hairline guide rail aligned under the parent step glyph */

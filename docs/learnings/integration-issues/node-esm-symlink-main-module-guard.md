@@ -19,8 +19,8 @@ if (import.meta.url === `file://${process.argv[1]}`) {
 }
 ```
 
-In Antigravity, user plugin directories are often symlinked (for example `~/.gemini/config/plugins -> ~/Projects/gravityzilla/config/plugins`). When the Antigravity Language Server spawns a plugin MCP server defined in `mcp_config.json`, it invokes `node ${PLUGIN_ROOT}/mcp/server.mjs` using the uncanonicalized symlink path:
-`node /home/domixi/.gemini/config/plugins/margin/mcp/server.mjs`.
+In Antigravity, user plugin directories are often symlinked (for example `~/.gemini/config/plugins -> <repo>/config/plugins`). When the Antigravity Language Server spawns a plugin MCP server defined in `mcp_config.json`, it invokes `node ${PLUGIN_ROOT}/mcp/server.mjs` using the uncanonicalized symlink path:
+`node $HOME/.gemini/config/plugins/margin/mcp/server.mjs`.
 
 ## Symptoms
 
@@ -34,8 +34,8 @@ In Antigravity, user plugin directories are often symlinked (for example `~/.gem
 ## Root Cause
 
 Node.js ES module loader always canonicalizes module specifiers:
-- `import.meta.url` evaluates to the fully resolved realpath: `file:///home/domixi/Projects/gravityzilla/config/plugins/margin/mcp/server.mjs`.
-- `process.argv[1]` retains the exact string passed on the command line: `/home/domixi/.gemini/config/plugins/margin/mcp/server.mjs`.
+- `import.meta.url` evaluates to the fully resolved realpath: `file://<repo>/config/plugins/margin/mcp/server.mjs`.
+- `process.argv[1]` retains the exact string passed on the command line: `$HOME/.gemini/config/plugins/margin/mcp/server.mjs`.
 - `import.meta.url === file://${process.argv[1]}` evaluates to `false`.
 
 The file believes it was imported as a module by another script rather than executed as the main script, so it skips attaching stdin listeners and exits cleanly.

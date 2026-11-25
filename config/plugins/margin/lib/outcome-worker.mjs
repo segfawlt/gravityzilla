@@ -15,7 +15,7 @@ import {
   writeOutcomeState,
 } from './outcome.mjs';
 import { intentPath, outcomePath, transcriptPath } from './paths.mjs';
-import { readRows, summarize } from './transcript.mjs';
+import { readRows, resolveTurnSteps, summarize } from './transcript.mjs';
 
 /**
  * Spawn a detached worker to refine `outcome.json` for a completed turn.
@@ -135,7 +135,7 @@ export function runOutcomeWorker(brain, { preMarked = false } = {}) {
   const prompt = buildOutcomePrompt({
     ask: facts.ask,
     wants: freshIntent?.wants || '',
-    steps: freshIntent?.steps || [],
+    steps: resolveTurnSteps(facts.turnRows, freshIntent),
     exec,
   });
 

@@ -1071,32 +1071,62 @@
     renderStatus(ov);
     renderTelemetry(ov);
 
-    const isStalePlanning = ov.status === 'planning' && !ov.reported && Boolean(ov.previous);
-    const target = isStalePlanning ? ov.previous : ov;
+    const isTurnActive = ov.status === 'working' || ov.status === 'planning' || ov.status === 'waiting_agents';
+    const isFullStalePlanning =
+      ov.status === 'planning' &&
+      !ov.wants &&
+      !ov.take &&
+      !(ov.steps && ov.steps.length) &&
+      Boolean(ov.previous);
 
-    const askVal = target.wants || '';
-    const take = target.take;
-    const steps = target.steps || [];
-    const outcome = target.outcome || null;
+    let askVal = '';
+    let askStale = false;
+    let take = null;
+    let takeStale = false;
+    let steps = ov.steps || [];
+    let outcome = ov.outcome || null;
+
+    if (isFullStalePlanning) {
+      askVal = ov.previous.wants || '';
+      take = ov.previous.take || null;
+      steps = ov.previous.steps || [];
+      outcome = ov.previous.outcome || null;
+    } else {
+      if (ov.wants) {
+        askVal = ov.wants;
+      } else if (isTurnActive && !ov.take && ov.previous && ov.previous.wants) {
+        askVal = ov.previous.wants;
+        askStale = true;
+      }
+      if (ov.take) {
+        take = ov.take;
+      } else if (isTurnActive && ov.previous && ov.previous.take) {
+        take = ov.previous.take;
+        takeStale = true;
+      }
+    }
+
     const cats = getUsedCategories(ov);
     const catKeys = Object.keys(cats);
     const hasReportBlock = Boolean(askVal || take || steps.length > 0 || outcome || catKeys.length > 0);
-    const isTurnActive = ov.status === 'working' || ov.status === 'planning' || ov.status === 'waiting_agents';
 
     const hasAbout = renderAbout(ov, hasReportBlock);
 
-    $('turn-group').classList.toggle('is-stale', isStalePlanning);
-    show('planning-banner', isStalePlanning);
+    $('turn-group').classList.toggle('is-stale', isFullStalePlanning);
+    show('planning-banner', ov.status === 'planning' && !ov.reported && (Boolean(ov.previous) || Boolean(askVal)));
 
     // 1. Ask
     show('sec-ask', Boolean(askVal));
+    $('sec-ask').classList.toggle('is-stale-field', askStale);
     const askEl = $('ask');
     if (askEl.textContent !== askVal) askEl.textContent = askVal;
-    askEl.title = target.wants && target.ask && target.wants !== target.ask ? `You asked: ${target.ask}` : '';
+    const rawAsk = !isFullStalePlanning && !askStale ? (ov.ask || '') : '';
+    askEl.title = askVal && rawAsk && askVal !== rawAsk ? `You asked: ${rawAsk}` : '';
 
     // 2. Take (inline claudzilla format)
     show('rule-take', Boolean(take && askVal));
     show('sec-take', Boolean(take));
+    $('sec-take').classList.toggle('is-stale-field', takeStale);
     if (take) {
       const stance = take.stance || 'unsure';
       const inline = $('take-inline');
@@ -1121,6 +1151,8 @@
         const glyphSpan = el('span', 'step-glyph');
         if (s.status === 'completed') glyphSpan.textContent = CHECK;
         else if (s.status === 'in_progress') glyphSpan.textContent = CIRCLE_DOT;
+        else if (s.status === 'failed') glyphSpan.textContent = CROSS;
+        else if (s.status === 'skipped') glyphSpan.textContent = '–';
         else glyphSpan.textContent = CIRCLE_OPEN;
 
         const contentDiv = el('div', 'step-content');

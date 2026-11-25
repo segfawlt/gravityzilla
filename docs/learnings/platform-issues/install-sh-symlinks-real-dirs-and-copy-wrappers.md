@@ -26,7 +26,7 @@ Deploying `gravityzilla` on a clean or partially configured Linux machine via `i
 
 ## Solution
 
-Refactor [install.sh](file:///home/domixi/Projects/gravityzilla/install.sh) around four invariants:
+Refactor [install.sh](../../../install.sh) around four invariants:
 
 1. **Detect real directories before `ln -sfn`:** In `deploy_skills_link`, if `$dest_dir` is a real directory (`-d` and `! -L`), iterate each child skill and call `deploy_file` per subdirectory instead of calling `ln -sfn`.
 2. **Link per plugin and copy mutable configs:** Ensure `~/.gemini/config/plugins` is a real directory (migrating any legacy whole-dir symlink) and link/copy each plugin individually; copy mutable state files (`config/config.json`, `config-extra/agy-stats/config.json`, `config-extra/rtk/{config,filters}.toml`) explicitly via `deploy_template` so runtime writes never dirty git and `keys/` is never deployed.

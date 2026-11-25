@@ -1247,7 +1247,8 @@ class WatchdogTestCase(unittest.TestCase):
         r1 = run_pre({"conversationId": cid, "lastUserInput": "Fix auth bug"})
         msg1 = ((r1.get("injectSteps") or [{}])[0].get("systemMessage") or {}).get("systemMessage", "")
         self.assertIn("Margin Overview (Step 1)", msg1)
-        self.assertIn("now: 1", msg1)
+        self.assertIn("wants", msg1)
+        self.assertNotIn("now: 1", msg1)
 
         # Turn 2 without writing intent.json in Turn 1: flags missed last turn
         r2 = run_pre({"conversationId": cid, "lastUserInput": "Now check tests"})
@@ -1259,12 +1260,26 @@ class WatchdogTestCase(unittest.TestCase):
         r_sub = run_pre({"conversationId": sub_cid, "parentConversationId": cid, "lastUserInput": "Explore repo"})
         self.assertEqual(r_sub, {})
 
-        # Simulate writing fresh intent.json -> step 2 does NOT spam Margin reminder
+        # Simulate writing wants-only WITHOUT take -> step 2 STILL flags Margin Overview missing
         ip = self.cli_dir / "brain" / cid / ".system_generated" / "margin" / "intent.json"
         ip.parent.mkdir(parents=True, exist_ok=True)
         ip.write_text(json.dumps({"userStep": 2, "wants": "Check tests", "updatedAt": "2099-01-01T00:00:00.000Z"}), encoding="utf-8")
-        r2_step2 = run_pre({"conversationId": cid, "lastUserInput": "Now check tests"})
-        self.assertEqual(r2_step2, {})
+        r2_no_take = run_pre({"conversationId": cid, "lastUserInput": "Now check tests"})
+        msg2_no_take = ((r2_no_take.get("injectSteps") or [{}])[0].get("systemMessage") or {}).get("systemMessage", "")
+        self.assertIn("Margin Overview missing", msg2_no_take)
+
+        # Simulate writing fresh intent.json WITH valid take -> step 3 does NOT spam Margin reminder
+        ip.write_text(
+            json.dumps({
+                "userStep": 2,
+                "wants": "Check tests",
+                "take": {"stance": "fine", "label": "clear"},
+                "updatedAt": "2099-01-01T00:00:00.000Z",
+            }),
+            encoding="utf-8",
+        )
+        r2_step3 = run_pre({"conversationId": cid, "lastUserInput": "Now check tests"})
+        self.assertEqual(r2_step3, {})
 
     def test_13_stop_hook_spawns_margin_outcome_worker(self) -> None:
         cid = "22222222-3333-4444-5555-666666666666"
@@ -1310,6 +1325,84 @@ class WatchdogTestCase(unittest.TestCase):
         self.assertIn("outcome-worker.mjs", spawn_args)
         self.assertIn(f"--brain {brain}", spawn_args)
         self.assertIn("--spawn", spawn_args)
+
+    def test_14_margin_queued_turn_user_step_and_already_reported(self) -> None:
+        cid = "33333333-4444-5555-6666-777777777777"
+        brain = self.cli_dir / "brain" / cid
+        logs = brain / ".system_generated" / "logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        tp = logs / "transcript.jsonl"
+        ip = brain / ".system_generated" / "margin" / "intent.json"
+        ip.parent.mkdir(parents=True, exist_ok=True)
+
+        env_margin = {
+            **self.env,
+            "AGY_WATCHDOG_NO_MARGIN_NUDGE": "0",
+            "AGY_WATCHDOG_MARGIN_ENABLED": "1",
+        }
+
+        def write_tx(rows: list[dict[str, Any]]) -> None:
+            tp.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+
+        def run_pre(payload: dict[str, Any]) -> dict[str, Any]:
+            proc = subprocess.run(
+                [sys.executable, str(WATCH_BIN), "pre-invocation-hook"],
+                input=json.dumps(payload),
+                text=True,
+                capture_output=True,
+                env=env_margin,
+                timeout=10,
+                check=True,
+            )
+            return json.loads(proc.stdout or "{}")
+
+        # Case A: Queued follow-up at userStep=5 where agent already wrote fresh take before delayed PreInvocation fired
+        write_tx([
+            {"step_index": 0, "type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "First task"},
+            {"step_index": 1, "type": "PLANNER_RESPONSE", "status": "DONE"},
+            {"step_index": 5, "type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "Scout around"},
+            {"step_index": 6, "type": "PLANNER_RESPONSE", "status": "DONE"},
+        ])
+        ip.write_text(
+            json.dumps({"userStep": 5, "wants": "Scout around", "take": {"stance": "fine", "label": "clear"}}),
+            encoding="utf-8",
+        )
+        r_a = run_pre({"conversationId": cid, "lastUserInput": "Scout around"})
+        self.assertEqual(r_a, {})
+
+        # Case B: Queued follow-up at userStep=8 where agent jumped into tools (turn_step_count > 2) without updating intent.json
+        write_tx([
+            {"step_index": 0, "type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "First task"},
+            {"step_index": 5, "type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "Scout around"},
+            {"step_index": 8, "type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "go"},
+            {"step_index": 9, "type": "PLANNER_RESPONSE", "status": "DONE"},
+            {"step_index": 10, "type": "PLANNER_RESPONSE", "status": "DONE"},
+        ])
+        # Simulate delayed PreInvocation when lastUserInput already changed or step changed; first turn notice
+        r_b1 = run_pre({"conversationId": cid, "lastUserInput": "go"})
+        msg_b1 = ((r_b1.get("injectSteps") or [{}])[0].get("systemMessage") or {}).get("systemMessage", "")
+        self.assertIn("Margin Overview (Step 1)", msg_b1)
+        # Subsequent PreInvocation in same turn still sees userStep=8 != intent.userStep=5 -> Margin Overview missing (capped at 2)
+        r_b2 = run_pre({"conversationId": cid, "lastUserInput": "go"})
+        msg_b2 = ((r_b2.get("injectSteps") or [{}])[0].get("systemMessage") or {}).get("systemMessage", "")
+        self.assertIn("Margin Overview missing", msg_b2)
+        r_b3 = run_pre({"conversationId": cid, "lastUserInput": "go"})
+        msg_b3 = ((r_b3.get("injectSteps") or [{}])[0].get("systemMessage") or {}).get("systemMessage", "")
+        self.assertIn("Margin Overview missing", msg_b3)
+        r_b4 = run_pre({"conversationId": cid, "lastUserInput": "go"})
+        self.assertEqual(r_b4, {})
+
+        # Case C & D: Identical prompt string "go" at userStep=12 after userStep=8 missed reporting -> detects new turn & missed last turn
+        write_tx([
+            {"step_index": 0, "type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "First task"},
+            {"step_index": 5, "type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "Scout around"},
+            {"step_index": 8, "type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "go"},
+            {"step_index": 11, "type": "PLANNER_RESPONSE", "status": "DONE"},
+            {"step_index": 12, "type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "go"},
+        ])
+        r_cd = run_pre({"conversationId": cid, "lastUserInput": "go"})
+        msg_cd = ((r_cd.get("injectSteps") or [{}])[0].get("systemMessage") or {}).get("systemMessage", "")
+        self.assertIn("Margin missed last turn", msg_cd)
 
 
 if __name__ == "__main__":

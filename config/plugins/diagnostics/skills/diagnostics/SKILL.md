@@ -9,7 +9,7 @@ Manage the sub-50ms post-edit syntax & error diagnostics hook (`~/.local/bin/agy
 
 ## CLI Subcommands
 
-Run `~/.local/bin/agy-diagnostics` (or `agy diagnostics` in interactive shells) via `run_command`:
+Run `~/.local/bin/agy-diagnostics` via `run_command`:
 
 ```bash
 # View status, counters, and detected host checkers

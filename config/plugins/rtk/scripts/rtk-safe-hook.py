@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -911,6 +912,44 @@ def resolve_initial_cwd(payload: dict[str, Any]) -> Path:
     return Path.cwd()
 
 
+def find_rtk_binary() -> str:
+    home = Path.home()
+    candidates = [
+        os.environ.get("RTK_BIN") or "",
+        shutil.which("rtk") or "",
+        str(home / ".cargo" / "bin" / "rtk"),
+        "/opt/homebrew/bin/rtk",
+        "/home/linuxbrew/.linuxbrew/bin/rtk",
+        "/usr/local/bin/rtk",
+        str(home / ".local" / "share" / "mise" / "shims" / "rtk"),
+        str(home / ".asdf" / "shims" / "rtk"),
+        str(home / ".nix-profile" / "bin" / "rtk"),
+        str(home / ".local" / "bin" / "rtk"),
+    ]
+    for cand in candidates:
+        if cand and os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return ""
+
+
+def _command_runs_excluded_cli(cmd: str) -> bool:
+    stripped_cmd, _ = strip_and_collect_heredocs(cmd)
+    for raw_tokens in split_shell_segments(stripped_cmd):
+        argv = unwrap_command_prefix(raw_tokens)
+        if argv and Path(argv[0]).name in {"claude", "opencode"}:
+            return True
+    return False
+
+
+def _strip_rtk_bypass(cmd: str) -> str:
+    return re.sub(r"(^|(?:&&|\|\||;)\s*)(?:[^\s;|&]+/)?rtk\s+bypass\s+", r"\1", cmd)
+
+
+def _qualify_rtk_command(cmd: str, rtk_bin: str) -> str:
+    qbin = shlex.quote(rtk_bin)
+    return re.sub(r"(^|(?:&&|\|\||;)\s*)rtk(?=\s)", lambda m: f"{m.group(1)}{qbin}", cmd)
+
+
 def main() -> int:
     raw = sys.stdin.read()
     if os.environ.get("AGY_HOOK_INTERNAL") == "1":
@@ -931,9 +970,22 @@ def main() -> int:
         print(json.dumps({"decision": decision, "reason": reason}))
         return 0
 
-    rtk_bin = str(Path.home() / ".local" / "bin" / "rtk")
-    if not os.path.isfile(rtk_bin):
-        rtk_bin = shutil.which("rtk") or ""
+    rtk_on_path = bool(shutil.which("rtk"))
+    if not rtk_on_path:
+        stripped = _strip_rtk_bypass(cmd)
+        if stripped != cmd:
+            print(json.dumps({
+                "decision": "allow",
+                "reason": "Stripped rtk bypass prefix.",
+                "overwrite": {"CommandLine": stripped},
+            }))
+            return 0
+
+    if _command_runs_excluded_cli(cmd):
+        print(json.dumps({"decision": "allow"}))
+        return 0
+
+    rtk_bin = find_rtk_binary()
     if not rtk_bin:
         print(json.dumps({"decision": "allow"}))
         return 0
@@ -948,6 +1000,15 @@ def main() -> int:
         )
         out = proc.stdout.strip()
         if proc.returncode == 0 and out:
+            if not rtk_on_path:
+                try:
+                    parsed = json.loads(out)
+                    ow = parsed.get("overwrite")
+                    if isinstance(ow, dict) and isinstance(ow.get("CommandLine"), str):
+                        ow["CommandLine"] = _qualify_rtk_command(ow["CommandLine"], rtk_bin)
+                        out = json.dumps(parsed)
+                except Exception:
+                    pass
             print(out)
             return 0
     except Exception:

@@ -28,15 +28,17 @@ import {
   applyTopicsReply,
   buildTopicsPrompt,
   extractUserPrompts,
+  extractUserPromptsWithSteps,
   isTopicsRunning,
   keptTopics,
   MERGE_TO,
   OVERVIEW_CAP,
+  parseAsk,
   parseSummary,
   parseTopics,
   writeTopicsState,
 } from '../lib/topics.mjs';
-import { bashPaths, computeContext, stripUserText, summarize } from '../lib/transcript.mjs';
+import { bashPaths, computeContext, extractNativeSteps, resolveTurnSteps, stripUserText, summarize } from '../lib/transcript.mjs';
 import { appHtml, handleCall, newestConversation } from '../mcp/server.mjs';
 import { checkpoint, CONV, generic, makeBrain, planner, user } from './fixtures.mjs';
 
@@ -1195,6 +1197,8 @@ test('UI bundle includes tight copy and memory viewer hooks', () => {
     'learnings',
     'Learnings',
     'Captured',
+    'data-status="failed"',
+    'data-status="skipped"',
     'toggleAuxPane',
     '/api/memory-view',
     '/api/memory-doc',
@@ -1203,4 +1207,289 @@ test('UI bundle includes tight copy and memory viewer hooks', () => {
   ]) {
     assert.ok(doc.includes(token), `expected UI bundle to include ${token}`);
   }
+});
+
+test('native update_steps: extraction, override/fallback, failed/skipped preservation, subagent hanging, previous turn, and bookkeeping exclusion', () => {
+  // 1. Direct extraction picks latest non-empty update_steps, maps done -> completed, preserves failed/skipped, ignores malformed
+  const extracted = extractNativeSteps([
+    planner(1, [
+      ['update_steps', { steps: JSON.stringify([{ title: 'First draft', status: 'in_progress' }]) }],
+      ['update_steps', { steps: '{bad json' }],
+      ['update_steps', {
+        steps: JSON.stringify([
+          { title: 'Step one', status: 'done' },
+          { title: 'Step two', status: 'skipped' },
+          { title: 'Step three', status: 'failed' },
+          { title: 'Step four', status: 'in_progress' },
+          { title: 'Step five', status: 'pending' },
+        ]),
+      }],
+    ], T0),
+  ]);
+  assert.deepEqual(extracted.map((s) => [s.text, s.status]), [
+    ['Step one', 'completed'],
+    ['Step two', 'skipped'],
+    ['Step three', 'failed'],
+    ['Step four', 'in_progress'],
+    ['Step five', 'pending'],
+  ]);
+
+  // 2. Fallback to intent steps when update_steps is absent, override when present
+  const fallbackSteps = [{ text: 'Intent step', status: 'in_progress', agents: [] }];
+  assert.deepEqual(resolveTurnSteps([user(0, 'go', T0), planner(1, [['read_file', { Path: '"/a.js"' }]], T0)], { steps: fallbackSteps }), fallbackSteps);
+  assert.equal(resolveTurnSteps([planner(1, [['update_steps', { steps: JSON.stringify([{ title: 'Native step', status: 'in_progress' }]) }]], T0)], { steps: fallbackSteps })[0].text, 'Native step');
+
+  // 3. buildOverview: native steps without intent.json -> reported=true; update_steps/update_focus excluded from used.other and turnTools; subagent hangs under active native step
+  const home = mkdtempSync(join(tmpdir(), 'margin-native-steps-'));
+  const subConv = 'abab1111-2222-4333-8444-555555555555';
+  makeBrain(home, [
+    { step_index: 0, source: 'SYSTEM', type: 'SYSTEM_MESSAGE', status: 'DONE', created_at: T0, content: 'brief' },
+    planner(1, [['read_file', { Path: '"/repo/check.ts"' }]], T0),
+  ], subConv);
+
+  const { brain, dirs } = makeBrain(home, [
+    user(0, 'fix bug', T0),
+    planner(1, [
+      ['update_focus', { focus: '"Inspecting bug"' }],
+      ['update_steps', {
+        steps: JSON.stringify([
+          { title: 'Inspect codebase', status: 'done' },
+          { title: 'Run scout', status: 'in_progress' },
+          { title: 'Optional check', status: 'skipped' },
+        ]),
+      }],
+      ['invoke_subagent', { Role: '"Bug Scout"', TypeName: '"research"', Prompt: '"Check check.ts"' }],
+    ], T0),
+    generic(2, T0, 'DONE', `Created the following subagent:\n{\n  "conversationId": "${subConv}"\n}`),
+  ]);
+
+  const noIntentOv = buildOverview(brain, at(T0) + 2000);
+  assert.equal(noIntentOv.reported, true);
+  assert.deepEqual(noIntentOv.steps.map((s) => [s.text, s.status]), [
+    ['Inspect codebase', 'completed'],
+    ['Run scout', 'in_progress'],
+    ['Optional check', 'skipped'],
+  ]);
+  assert.equal(noIntentOv.steps[1].agents.length, 1);
+  assert.equal(noIntentOv.steps[1].agents[0].name, 'Bug Scout');
+  assert.equal(noIntentOv.used.other, 0);
+  assert.equal(noIntentOv.watchdog.turnTools, 1); // only invoke_subagent; update_steps & update_focus excluded
+
+  // 4. Clean done preserves explicit failed & skipped while auto-completing pending/in_progress; overrides stale intent.json steps
+  handleCall({
+    conversation_id: CONV,
+    wants: 'fix bug',
+    take: { stance: 'fine', label: 'clear' },
+    steps: [{ text: 'Stale intent step', status: 'pending' }],
+    now: 1,
+  }, dirs);
+  makeBrain(home, [
+    user(0, 'fix bug', T0),
+    planner(1, [
+      ['update_steps', {
+        steps: JSON.stringify([
+          { title: 'Inspect codebase', status: 'done' },
+          { title: 'Skipped step', status: 'skipped' },
+          { title: 'Failed step', status: 'failed' },
+          { title: 'Final step', status: 'in_progress' },
+        ]),
+      }],
+    ], T0),
+    generic(2, T0),
+    planner(3, [], T0),
+  ]);
+  const doneOv = buildOverview(brain, at(T0) + 3000);
+  assert.equal(doneOv.status, 'done');
+  assert.deepEqual(doneOv.steps.map((s) => [s.text, s.status]), [
+    ['Inspect codebase', 'completed'],
+    ['Skipped step', 'skipped'],
+    ['Failed step', 'failed'],
+    ['Final step', 'completed'],
+  ]);
+
+  // 5. Next turn in planning pulls previous turn's native steps even if intent.json had no steps
+  const homePrev = mkdtempSync(join(tmpdir(), 'margin-native-prev-'));
+  const { brain: prevBrain, dirs: prevDirs } = makeBrain(homePrev, [
+    user(0, 'first native turn', T0),
+    planner(1, [
+      ['update_steps', {
+        steps: JSON.stringify([
+          { title: 'One', status: 'in_progress' },
+          { title: 'Two', status: 'skipped' },
+        ]),
+      }],
+    ], T0),
+    generic(2, T0),
+    planner(3, [], T0),
+  ]);
+  handleCall({
+    conversation_id: CONV,
+    wants: 'first native turn',
+    take: { stance: 'fine', label: 'clear' },
+  }, prevDirs);
+  makeBrain(homePrev, [
+    user(0, 'first native turn', T0),
+    planner(1, [
+      ['update_steps', {
+        steps: JSON.stringify([
+          { title: 'One', status: 'in_progress' },
+          { title: 'Two', status: 'skipped' },
+        ]),
+      }],
+    ], T0),
+    generic(2, T0),
+    planner(3, [], T0),
+    user(4, 'next turn', T1),
+  ]);
+  const prevOv = buildOverview(prevBrain, at(T1) + 1000);
+  assert.equal(prevOv.status, 'planning');
+  assert.ok(prevOv.previous);
+  assert.equal(prevOv.previous.wants, 'first native turn');
+  assert.deepEqual(prevOv.previous.steps.map((s) => [s.text, s.status]), [
+    ['One', 'completed'],
+    ['Two', 'skipped'],
+  ]);
+});
+
+test('workerAsk: parseAsk, extractUserPromptsWithSteps, missing = tolerance, precedence, working-state previous, and rule wording', () => {
+  const rows = [
+    user(0, 'Audit repo for hardcoded paths', T0),
+    planner(1, [['read_file', { Path: '"/repo/a.js"' }]], T0),
+    { step_index: 2, source: 'SYSTEM', type: 'USER_INPUT', status: 'DONE', created_at: T1, content: 'system msg' },
+    user(4, 'Scout margin update timing', T1),
+  ];
+  const { prompts, lastUserStep } = extractUserPromptsWithSteps(rows);
+  assert.deepEqual(prompts, ['Audit repo for hardcoded paths', 'Scout margin update timing']);
+  assert.equal(lastUserStep, 4);
+
+  const built = buildTopicsPrompt(prompts, { at: 1, summary: 'Audit repo portability.', topics: ['Audit hardcoded paths'] });
+  assert.ok(built.prompt.includes('"= "'));
+
+  // parseAsk handles leading "= " and ignores mid-line "="
+  assert.equal(parseAsk('foo = bar\n> Session line\n= "Scout margin timing"\n- Update margin timing'), 'Scout margin timing');
+  assert.equal(parseAsk('foo = bar\n> Session line\n- Update margin timing'), '');
+
+  // Missing "= " still returns ok: true and advances askUserStep so 1000ms polling does not loop
+  const noAskReply = applyTopicsReply(null, '> Audit repo portability.\n- Update margin timing', 2, built.mode, T1, 4);
+  assert.equal(noAskReply.ok, true);
+  assert.equal(noAskReply.state.ask, '');
+  assert.equal(noAskReply.state.askUserStep, 4);
+
+  // Full workerAsk -> working-state previous -> agent take override lifecycle
+  const home = mkdtempSync(join(tmpdir(), 'margin-worker-ask-'));
+  const { brain, dirs } = makeBrain(home, [
+    user(0, 'First prompt', T0),
+    planner(1, [['read_file', { Path: '"/repo/a.js"' }]], T0),
+    generic(2, T0),
+    planner(3, [], T0),
+  ]);
+  handleCall({
+    conversation_id: CONV,
+    wants: 'First goal',
+    take: { stance: 'fine', label: 'clear' },
+    steps: ['Check file', 'Finish'],
+    now: 2,
+  }, dirs);
+
+  // Turn 2 starts in planning before topics.json updates
+  makeBrain(home, [
+    user(0, 'First prompt', T0),
+    planner(1, [['read_file', { Path: '"/repo/a.js"' }]], T0),
+    generic(2, T0),
+    planner(3, [], T0),
+    user(4, 'Second prompt', T1),
+  ]);
+  const rBefore = resolveOverview({ conversationId: CONV }, dirs);
+  assert.equal(rBefore.overview.wants, '');
+  assert.equal(rBefore.overview.wantsSource, '');
+  assert.equal(rBefore.overview.previous.wants, 'First goal');
+  assert.equal(rBefore.overview.previous.take.label, 'clear');
+
+  // Stale worker ask from Turn 1 (askUserStep: 0) does NOT leak into Turn 2 (userStep: 4)
+  writeTopicsState(topicsPath(brain), {
+    at: 2,
+    summary: 'Two quick tasks.',
+    topics: ['First goal', 'Second goal'],
+    ask: 'Old turn ask',
+    askUserStep: 0,
+    running: false,
+    failed: false,
+    updatedAt: T1,
+  });
+  const staleWorkerOv = buildOverview(brain, at(T1) + 500);
+  assert.equal(staleWorkerOv.wants, '');
+  assert.equal(staleWorkerOv.wantsSource, '');
+
+  // Fresh worker ask for userStep: 4 updates ETag, shows wants, preserves previous.take, keeps reported: false
+  writeTopicsState(topicsPath(brain), {
+    at: 2,
+    summary: 'Two quick tasks.',
+    topics: ['First goal', 'Second goal'],
+    ask: 'Scout repo layout',
+    askUserStep: 4,
+    running: false,
+    failed: false,
+    updatedAt: T1,
+  });
+  const rWorker = resolveOverview({ conversationId: CONV, etag: rBefore.etag }, dirs);
+  assert.equal(rWorker.unchanged, undefined);
+  assert.equal(rWorker.overview.wants, 'Scout repo layout');
+  assert.equal(rWorker.overview.wantsSource, 'worker');
+  assert.equal(rWorker.overview.take, null);
+  assert.equal(rWorker.overview.reported, false);
+  assert.equal(rWorker.overview.previous.take.label, 'clear');
+
+  // Transition to working (agent ran read_file + update_steps before margin_intent): previous.take MUST remain available
+  makeBrain(home, [
+    user(0, 'First prompt', T0),
+    planner(1, [['read_file', { Path: '"/repo/a.js"' }]], T0),
+    generic(2, T0),
+    planner(3, [], T0),
+    user(4, 'Second prompt', T1),
+    planner(5, [
+      ['update_steps', { steps: JSON.stringify([{ title: 'Scout layout', status: 'in_progress' }]) }],
+      ['read_file', { Path: '"/repo/b.js"' }],
+    ], T1),
+    generic(6, T1),
+  ]);
+  const workingOv = buildOverview(brain, at(T1) + 1000);
+  assert.equal(workingOv.status, 'working');
+  assert.equal(workingOv.wants, 'Scout repo layout');
+  assert.equal(workingOv.wantsSource, 'worker');
+  assert.equal(workingOv.take, null);
+  assert.equal(workingOv.previous.take.label, 'clear');
+  assert.equal(workingOv.steps[0].text, 'Scout layout');
+  assert.equal(workingOv.used.files, 1);
+
+  // Main agent calls margin_intent with take only -> preserves workerAsk while clearing previous
+  handleCall({
+    conversation_id: CONV,
+    take: { stance: 'concern', label: 'check paths', why: 'two edge cases' },
+  }, dirs);
+  const takeOnlyOv = buildOverview(brain, at(T1) + 1500);
+  assert.equal(takeOnlyOv.wants, 'Scout repo layout');
+  assert.equal(takeOnlyOv.wantsSource, 'worker');
+  assert.equal(takeOnlyOv.take.label, 'check paths');
+  assert.equal(takeOnlyOv.previous, null);
+
+  // Main agent overrides wants -> agent wants wins
+  handleCall({
+    conversation_id: CONV,
+    wants: 'Refined ask',
+    take: { stance: 'concern', label: 'check paths', why: 'two edge cases' },
+  }, dirs);
+  const agentOv = buildOverview(brain, at(T1) + 2000);
+  assert.equal(agentOv.wants, 'Refined ask');
+  assert.equal(agentOv.wantsSource, 'agent');
+  assert.equal(agentOv.take.label, 'check paths');
+  assert.equal(agentOv.previous, null);
+
+  // UI + rules checks
+  const doc = appHtml({ sidecar: true });
+  assert.ok(doc.includes('is-stale-field'));
+  assert.equal(doc.includes('target.wants || target.ask'), false);
+  const agentsMd = readFileSync(new URL('../rules/AGENTS.md', import.meta.url), 'utf8');
+  const serverJs = readFileSync(new URL('../mcp/server.mjs', import.meta.url), 'utf8');
+  assert.equal(agentsMd.includes('Only re-call margin_intent if wants or take changes'), false);
+  assert.equal(serverJs.includes('Only re-call if wants or take changes'), false);
 });

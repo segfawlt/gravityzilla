@@ -4,7 +4,7 @@ import { dirname } from 'node:path';
 
 export const STANCES = ['fine', 'concern', 'against', 'unsure'];
 export const TAKE_MARKS = { fine: '✓', concern: '!', against: '✗', unsure: '?' };
-export const STEP_STATES = ['pending', 'in_progress', 'completed'];
+export const STEP_STATES = ['pending', 'in_progress', 'completed', 'skipped', 'failed'];
 const MAX = { wants: 160, label: 16, why: 60, step: 100, steps: 20, agents: 24 };
 
 function str(v, max) {
@@ -58,7 +58,7 @@ export function applyNow(steps, now) {
   if (idx >= steps.length) return steps;
   return steps.map((s, i) => ({
     ...s,
-    status: i < idx ? 'completed' : i === idx ? 'in_progress' : (s.status === 'completed' ? 'completed' : 'pending'),
+    status: i < idx ? 'completed' : i === idx ? 'in_progress' : (['completed', 'skipped', 'failed'].includes(s.status) ? s.status : 'pending'),
   }));
 }
 

@@ -26,10 +26,10 @@ When Margin previously moved its UI to an HTTP UI Sidecar (`sidecars/margin/`) b
 
 Strip all MCP App UI metadata and resource endpoints from data-only MCP servers whose UI lives in a right-pane sidecar:
 
-1. Remove `_meta` (`ui.resourceUri` and `'com.google.antigravity/ui'`) from `margin_intent` in [server.mjs](file:///home/domixi/Projects/gravityzilla/config/plugins/margin/mcp/server.mjs).
+1. Remove `_meta` (`ui.resourceUri` and `'com.google.antigravity/ui'`) from `margin_intent` in [server.mjs](../../../config/plugins/margin/mcp/server.mjs).
 2. Remove `OVERVIEW_TOOL` (`margin_overview`), `structuredContent` payloads, and `resources/list` / `resources/read` handlers, returning `capabilities: { tools: {} }` from `initialize`.
-3. Keep `appHtml()` exported for [main.mjs](file:///home/domixi/Projects/gravityzilla/config/plugins/margin/sidecars/margin/main.mjs), so the right-side Overview tab continues rendering cleanly without touching the chat stream.
-4. Assert `intent._meta === undefined` and `capabilities` equals `['tools']` in [margin.test.mjs](file:///home/domixi/Projects/gravityzilla/config/plugins/margin/tests/margin.test.mjs#L529-L567).
+3. Keep `appHtml()` exported for [main.mjs](../../../config/plugins/margin/sidecars/margin/main.mjs), so the right-side Overview tab continues rendering cleanly without touching the chat stream.
+4. Assert `intent._meta === undefined` and `capabilities` equals `['tools']` in [margin.test.mjs](../../../config/plugins/margin/tests/margin.test.mjs#L529-L567).
 
 ## Prevention
 
