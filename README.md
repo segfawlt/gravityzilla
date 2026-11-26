@@ -1,6 +1,7 @@
 # gravityzilla
 
 Antigravity setup with comfortable in mind. Supports both Antigravity Desktop and CLI. 
+Inspired by [claudzilla](https://github.com/HT0710/claudzilla)
 
 > **Alpha:** Expect rough edges — this is personal tooling, not a polished release. Tested on Linux; Windows is unsupported.
 
